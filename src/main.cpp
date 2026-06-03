@@ -25,19 +25,43 @@ extern "C" {
 }
 #endif
 
+// --- TRACKED FILE METADATA ---
+struct ImageFileInfo {
+    fs::path path;
+    std::string filename;
+    std::string extension;
+    float diskSizeMB = 0.0f;
+};
+
 // --- SYSTEM STATE & SETTINGS ---
-std::vector<fs::path> imageFiles;
+std::vector<ImageFileInfo> imageFiles;
 int currentIndex = 0;
 bool showOverlay = true;
 bool showSettings = false;
 int loopBehavior = 0; 
 
-// Sidebar & Cache Settings
+// Sidebar Layout Configs
 bool enableSidebar = true;
-float sidebarMultiplier = 0.22f; // Defaults to 22% of screen width
+float sidebarWidthMultiplier = 0.22f; 
+float sidebarHeightMultiplier = 1.0f; // Multiplier for thumbnail item height
+
+// Visibility Toggles for Metadata
+bool ovShowName = true;
+bool ovShowIndex = true;
+bool ovShowDim = true;
+bool ovShowSize = true;
+bool ovShowExt = true;
+
+bool sbShowName = false; // Kept off by default to save sidebar space
+bool sbShowIndex = true;
+bool sbShowDim = true;
+bool sbShowSize = true;
+bool sbShowExt = false;
+
 int cacheStrategy = 1; // 0 = Image Count, 1 = RAM Budget
 int cacheLimitCount = 5; 
 int cacheLimitRAM = 1024; // MB
+
 ImVec4 colorSuccess = ImVec4(0.2f, 0.8f, 0.2f, 1.0f); 
 ImVec4 colorError = ImVec4(0.8f, 0.2f, 0.2f, 1.0f); 
 
@@ -170,7 +194,7 @@ void UpdateCacheManager() {
     for (int idx : desiredIndices) {
         if (textureCache.find(idx) == textureCache.end()) {
             textureCache[idx] = {0, 0, 0, 0, CacheStatus::Loading};
-            loadingFutures.push_back(std::async(std::launch::async, DecodeImageBackground, idx, imageFiles[idx]));
+            loadingFutures.push_back(std::async(std::launch::async, DecodeImageBackground, idx, imageFiles[idx].path));
         }
     }
 }
@@ -197,8 +221,17 @@ int main(int argc, char* argv[]) {
         auto ext = entry.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
-            imageFiles.push_back(entry.path());
-            if (entry.path() == targetPath) currentIndex = imageFiles.size() - 1;
+            ImageFileInfo info;
+            info.path = entry.path();
+            info.filename = entry.path().stem().string();
+            info.extension = ext;
+            
+            std::error_code ec;
+            auto sizeBytes = fs::file_size(entry.path(), ec);
+            info.diskSizeMB = ec ? 0.0f : (float)sizeBytes / (1024.0f * 1024.0f);
+
+            imageFiles.push_back(info);
+            if (entry.path() == targetPath) currentIndex = (int)imageFiles.size() - 1;
         }
     }
     if (imageFiles.empty()) return -1;
@@ -253,11 +286,12 @@ int main(int argc, char* argv[]) {
         }
 
         // --- INPUT HANDLING ---
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) glfwSetWindowShouldClose(window, GLFW_TRUE); // Exit on ESC
         if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) Navigate(1);
         if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) Navigate(-1);
         
         if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-            if (MoveToRecycleBin(imageFiles[currentIndex])) {
+            if (MoveToRecycleBin(imageFiles[currentIndex].path)) {
                 imageFiles.erase(imageFiles.begin() + currentIndex);
                 if (imageFiles.empty()) break;
                 textureCache.clear(); currentRamUsage = 0; 
@@ -267,9 +301,9 @@ int main(int argc, char* argv[]) {
         for (int key = ImGuiKey_1; key <= ImGuiKey_9; ++key) {
             if (ImGui::IsKeyPressed((ImGuiKey)key)) {
                 std::string folderName = std::to_string(key - ImGuiKey_1 + 1);
-                fs::path targetDir = imageFiles[currentIndex].parent_path() / folderName;
+                fs::path targetDir = imageFiles[currentIndex].path.parent_path() / folderName;
                 fs::create_directories(targetDir);
-                fs::rename(imageFiles[currentIndex], targetDir / imageFiles[currentIndex].filename());
+                fs::rename(imageFiles[currentIndex].path, targetDir / imageFiles[currentIndex].path.filename());
                 imageFiles.erase(imageFiles.begin() + currentIndex);
                 if (imageFiles.empty()) break;
                 textureCache.clear(); currentRamUsage = 0;
@@ -285,14 +319,12 @@ int main(int argc, char* argv[]) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Dynamically calculate sidebar width based on the multiplier
-        float sidebarWidth = enableSidebar ? (io.DisplaySize.x * sidebarMultiplier) : 0.0f;
+        float sidebarWidth = enableSidebar ? (io.DisplaySize.x * sidebarWidthMultiplier) : 0.0f;
 
-        // 1. Main Image
+        // 1. Main Image Window
         ImGui::SetNextWindowPos(ImVec2(sidebarWidth, 0));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x - sidebarWidth, io.DisplaySize.y));
         
-        // ADDED: ImGuiWindowFlags_NoBringToFrontOnFocus prevents the image from hiding the overlay when clicked
         ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
                                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | 
                                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus;
@@ -332,6 +364,7 @@ int main(int argc, char* argv[]) {
 
             for (int idx : cachedIndices) {
                 auto& entry = textureCache[idx];
+                auto& fileMeta = imageFiles[idx];
                 
                 ImU32 shadowColor = IM_COL32(0,0,0,0);
                 if (entry.status == CacheStatus::Ready) shadowColor = ImGui::ColorConvertFloat4ToU32(colorSuccess);
@@ -340,9 +373,9 @@ int main(int argc, char* argv[]) {
 
                 ImGui::PushID(idx);
                 
-                // ADDED: Tighter layout calculations
+                // Scale structural box size using height multiplier
                 ImVec2 p_min = ImGui::GetCursorScreenPos();
-                float itemHeight = 100.0f;
+                float itemHeight = 100.0f * sidebarHeightMultiplier;
                 float padding = 8.0f;
                 ImVec2 p_max = ImVec2(p_min.x + sidebarWidth - 15.0f, p_min.y + itemHeight + (padding * 2));
                 
@@ -361,61 +394,94 @@ int main(int argc, char* argv[]) {
                     ImGui::Text("Loading...");
                 }
 
-                // File info shifted slightly left to accommodate tighter width if user scales it down
+                // Render dynamically selected metadata options inside the sidebar entry
                 ImGui::SameLine(itemHeight + (padding * 2) + 10.0f);
                 ImGui::BeginGroup();
-                ImGui::Text("ID: %d", idx);
-                ImGui::Text("%.1f MB", (float)entry.sizeBytes / (1024*1024));
+                if (sbShowIndex)     ImGui::Text("Index: %d", idx + 1);
+                if (sbShowName)      ImGui::Text("Name: %s", fileMeta.filename.c_str());
+                if (sbShowExt)       ImGui::Text("Ext: %s", fileMeta.extension.c_str());
+                if (sbShowSize)      ImGui::Text("Disk: %.2f MB", fileMeta.diskSizeMB);
+                if (sbShowDim && entry.status == CacheStatus::Ready) {
+                    ImGui::Text("Dim: %dx%d", entry.width, entry.height);
+                }
                 ImGui::EndGroup();
                 
                 if (idx == currentIndex) ImGui::SetScrollHereY(0.5f);
 
-                // ADDED: Absolute cursor positioning for perfectly tight spacing
                 ImGui::SetCursorScreenPos(ImVec2(p_min.x, p_max.y + 6.0f)); 
-                ImGui::Dummy(ImVec2(0.0f, 0.0f)); // Forces ImGui to register the new scroll boundary
+                ImGui::Dummy(ImVec2(0.0f, 0.0f)); 
                 ImGui::PopID();
             }
             ImGui::End();
             ImGui::PopStyleColor();
         }
 
-        // 3. Overlays & Settings
+        // 3. Info Overlay (Top-Right Canvas)
         if (showOverlay) {
-            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 200, 10), ImGuiCond_Always);
-            ImGui::SetNextWindowBgAlpha(0.5f);
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 280, 10), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.6f);
             ImGui::Begin("Overlay", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
-            ImGui::Text("%s", imageFiles[currentIndex].filename().string().c_str());
-            ImGui::Text("File %d of %zu", currentIndex + 1, imageFiles.size());
+            
+            auto& curFile = imageFiles[currentIndex];
+            if (ovShowName)  ImGui::Text("File: %s", curFile.filename.c_str());
+            if (ovShowExt)   ImGui::Text("Type: %s", curFile.extension.c_str());
+            if (ovShowIndex) ImGui::Text("Index: %d / %zu", currentIndex + 1, imageFiles.size());
+            if (ovShowSize)  ImGui::Text("Size: %.2f MB", curFile.diskSizeMB);
+            
+            if (ovShowDim && textureCache.count(currentIndex) && textureCache[currentIndex].status == CacheStatus::Ready) {
+                ImGui::Text("Res: %dx%d", textureCache[currentIndex].width, textureCache[currentIndex].height);
+            }
             ImGui::End();
         }
 
+        // 4. Centered Configurations Interface
         if (showSettings) {
-            // ADDED: Auto-Centering logic based on exact screen size
             ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
             ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
             
-            // ADDED: AlwaysAutoResize forces the window to wrap tightly around its controls
-            ImGui::Begin("Settings", &showSettings, ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::Begin("Settings & Layout Control", &showSettings, ImGuiWindowFlags_AlwaysAutoResize);
             
-            ImGui::Checkbox("Show Sidebar (Press 'B')", &enableSidebar);
-            if (enableSidebar) {
-                ImGui::SliderFloat("Sidebar Width", &sidebarMultiplier, 0.1f, 0.5f, "%.2f x");
+            if (ImGui::CollapsingHeader("Interface Layout", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Checkbox("Show Sidebar (Press 'B')", &enableSidebar);
+                if (enableSidebar) {
+                    ImGui::SliderFloat("Sidebar Width Scale", &sidebarWidthMultiplier, 0.10f, 0.50f, "%.2f x");
+                    ImGui::SliderFloat("Thumbnail Height Scale", &sidebarHeightMultiplier, 0.50f, 2.00f, "%.2f x");
+                }
+            }
+
+            if (ImGui::CollapsingHeader("Metadata Display Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Select information vectors to expose:");
+                
+                ImGui::Columns(3, "metaColumns", false);
+                ImGui::SetColumnWidth(0, 120); ImGui::SetColumnWidth(1, 100); ImGui::SetColumnWidth(2, 100);
+                
+                ImGui::NextColumn(); ImGui::Text("Top Overlay"); ImGui::NextColumn(); ImGui::Text("Sidebar"); ImGui::Separator();
+                
+                ImGui::NextColumn(); ImGui::Text("File Name"); ImGui::NextColumn(); ImGui::Checkbox("##ovName", &ovShowName); ImGui::NextColumn(); ImGui::Checkbox("##sbName", &sbShowName);
+                ImGui::NextColumn(); ImGui::Text("File Extension"); ImGui::NextColumn(); ImGui::Checkbox("##ovExt", &ovShowExt); ImGui::NextColumn(); ImGui::Checkbox("##sbExt", &sbShowExt);
+                ImGui::NextColumn(); ImGui::Text("Position Index"); ImGui::NextColumn(); ImGui::Checkbox("##ovIdx", &ovShowIndex); ImGui::NextColumn(); ImGui::Checkbox("##sbIdx", &sbShowIndex);
+                ImGui::NextColumn(); ImGui::Text("Disk File Size"); ImGui::NextColumn(); ImGui::Checkbox("##ovSize", &ovShowSize); ImGui::NextColumn(); ImGui::Checkbox("##sbSize", &sbShowSize);
+                ImGui::NextColumn(); ImGui::Text("Pixel Dimensions"); ImGui::NextColumn(); ImGui::Checkbox("##ovDim", &ovShowDim); ImGui::NextColumn(); ImGui::Checkbox("##sbDim", &sbShowDim);
+                
+                ImGui::Columns(1);
             }
             
-            ImGui::Separator();
-            ImGui::Text("Caching Strategy");
-            if (ImGui::RadioButton("By Image Count", &cacheStrategy, 0)) UpdateCacheManager();
-            if (ImGui::RadioButton("By RAM Limit", &cacheStrategy, 1)) UpdateCacheManager();
-            
-            if (cacheStrategy == 0) {
-                if (ImGui::SliderInt("Total Images", &cacheLimitCount, 1, 20)) UpdateCacheManager();
-            } else {
-                if (ImGui::SliderInt("RAM Limit (MB)", &cacheLimitRAM, 128, 8192)) UpdateCacheManager();
+            if (ImGui::CollapsingHeader("Caching Strategy Rules")) {
+                if (ImGui::RadioButton("By Image Count Loop Window", &cacheStrategy, 0)) UpdateCacheManager();
+                if (ImGui::RadioButton("By Restrictive RAM Limit", &cacheStrategy, 1)) UpdateCacheManager();
+                ImGui::Spacing();
+                if (cacheStrategy == 0) {
+                    if (ImGui::SliderInt("Total Images To Cache", &cacheLimitCount, 1, 20)) UpdateCacheManager();
+                } else {
+                    if (ImGui::SliderInt("Target Max RAM Budget (MB)", &cacheLimitRAM, 128, 8192)) UpdateCacheManager();
+                }
             }
             
-            ImGui::Separator();
-            ImGui::ColorEdit4("Success Border", (float*)&colorSuccess, ImGuiColorEditFlags_NoInputs);
-            ImGui::ColorEdit4("Error Border", (float*)&colorError, ImGuiColorEditFlags_NoInputs);
+            if (ImGui::CollapsingHeader("Visual Status Coloring")) {
+                ImGui::ColorEdit4("Successful Cache Outline", (float*)&colorSuccess, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Disk/Decode Error Outline", (float*)&colorError, ImGuiColorEditFlags_NoInputs);
+            }
+            
             ImGui::End();
         }
 
