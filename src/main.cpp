@@ -34,11 +34,12 @@ int loopBehavior = 0;
 
 // Sidebar & Cache Settings
 bool enableSidebar = true;
+float sidebarMultiplier = 0.22f; // Defaults to 22% of screen width
 int cacheStrategy = 1; // 0 = Image Count, 1 = RAM Budget
-int cacheLimitCount = 5; // Total images to hold
+int cacheLimitCount = 5; 
 int cacheLimitRAM = 1024; // MB
-ImVec4 colorSuccess = ImVec4(0.2f, 0.8f, 0.2f, 1.0f); // Green
-ImVec4 colorError = ImVec4(0.8f, 0.2f, 0.2f, 1.0f); // Red
+ImVec4 colorSuccess = ImVec4(0.2f, 0.8f, 0.2f, 1.0f); 
+ImVec4 colorError = ImVec4(0.8f, 0.2f, 0.2f, 1.0f); 
 
 // --- MULTI-THREADED CACHE MANAGER ---
 enum class CacheStatus { Loading, Ready, Error };
@@ -63,7 +64,6 @@ std::unordered_map<int, CacheEntry> textureCache;
 std::vector<std::future<RawImageData>> loadingFutures;
 size_t currentRamUsage = 0;
 
-// Win32 Recycle Bin
 bool MoveToRecycleBin(const fs::path& filePath) {
     std::wstring pathStr = filePath.wstring();
     pathStr.push_back(L'\0'); 
@@ -74,7 +74,6 @@ bool MoveToRecycleBin(const fs::path& filePath) {
     return SHFileOperationW(&fileOp) == 0;
 }
 
-// Background Worker
 RawImageData DecodeImageBackground(int index, fs::path filePath) {
     RawImageData result;
     result.index = index;
@@ -126,27 +125,22 @@ RawImageData DecodeImageBackground(int index, fs::path filePath) {
     return result;
 }
 
-// Logic to determine which images should be loaded
 void UpdateCacheManager() {
     if (imageFiles.empty()) return;
 
-    // 1. Determine Desired Cache Window
     std::vector<int> desiredIndices;
-    desiredIndices.push_back(currentIndex); // Always prioritize current
+    desiredIndices.push_back(currentIndex); 
 
     int step = 1;
     size_t estimatedRam = 0;
     size_t ramBudget = (size_t)cacheLimitRAM * 1024 * 1024;
-    
-    // Average estimated size (30MB per image) to prevent launching too many threads
     const size_t estimatedBytesPerImage = 30 * 1024 * 1024; 
 
     while (true) {
         if (cacheStrategy == 0 && desiredIndices.size() >= cacheLimitCount) break;
         if (cacheStrategy == 1 && (estimatedRam + estimatedBytesPerImage) >= ramBudget) break;
-        if (step > imageFiles.size()) break; // Searched everything
+        if (step > imageFiles.size()) break; 
 
-        // Look forward
         int forwardIndex = currentIndex + step;
         if (loopBehavior == 0) forwardIndex = forwardIndex % imageFiles.size();
         if (forwardIndex < imageFiles.size() && std::find(desiredIndices.begin(), desiredIndices.end(), forwardIndex) == desiredIndices.end()) {
@@ -154,7 +148,6 @@ void UpdateCacheManager() {
             estimatedRam += textureCache.count(forwardIndex) ? textureCache[forwardIndex].sizeBytes : estimatedBytesPerImage;
         }
 
-        // Look backward
         int backwardIndex = currentIndex - step;
         if (loopBehavior == 0) backwardIndex = (backwardIndex + imageFiles.size()) % imageFiles.size();
         if (backwardIndex >= 0 && std::find(desiredIndices.begin(), desiredIndices.end(), backwardIndex) == desiredIndices.end()) {
@@ -164,7 +157,6 @@ void UpdateCacheManager() {
         step++;
     }
 
-    // 2. Evict Old Images (Free VRAM)
     std::vector<int> toDelete;
     for (auto const& [index, entry] : textureCache) {
         if (std::find(desiredIndices.begin(), desiredIndices.end(), index) == desiredIndices.end()) {
@@ -175,12 +167,8 @@ void UpdateCacheManager() {
     }
     for (int index : toDelete) textureCache.erase(index);
 
-    // 3. Spawn New Decoders
     for (int idx : desiredIndices) {
         if (textureCache.find(idx) == textureCache.end()) {
-            // Check if it's already loading
-            bool isLoading = false;
-            // We can't easily peek inside std::future, so we mark it in the map immediately
             textureCache[idx] = {0, 0, 0, 0, CacheStatus::Loading};
             loadingFutures.push_back(std::async(std::launch::async, DecodeImageBackground, idx, imageFiles[idx]));
         }
@@ -272,7 +260,7 @@ int main(int argc, char* argv[]) {
             if (MoveToRecycleBin(imageFiles[currentIndex])) {
                 imageFiles.erase(imageFiles.begin() + currentIndex);
                 if (imageFiles.empty()) break;
-                textureCache.clear(); currentRamUsage = 0; // Hard reset cache
+                textureCache.clear(); currentRamUsage = 0; 
                 Navigate(0);
             }
         }
@@ -297,13 +285,19 @@ int main(int argc, char* argv[]) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        float sidebarWidth = enableSidebar ? 250.0f : 0.0f;
+        // Dynamically calculate sidebar width based on the multiplier
+        float sidebarWidth = enableSidebar ? (io.DisplaySize.x * sidebarMultiplier) : 0.0f;
 
         // 1. Main Image
         ImGui::SetNextWindowPos(ImVec2(sidebarWidth, 0));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x - sidebarWidth, io.DisplaySize.y));
-        ImGui::Begin("Image", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
         
+        // ADDED: ImGuiWindowFlags_NoBringToFrontOnFocus prevents the image from hiding the overlay when clicked
+        ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
+                                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | 
+                                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        
+        ImGui::Begin("Image", nullptr, imageFlags);
         if (textureCache.count(currentIndex) && textureCache[currentIndex].status == CacheStatus::Ready) {
             auto& img = textureCache[currentIndex];
             float aspect = (float)img.width / (float)img.height;
@@ -332,7 +326,6 @@ int main(int argc, char* argv[]) {
             ImGui::Text("RAM: %zu MB / %d MB", currentRamUsage / (1024*1024), cacheLimitRAM);
             ImGui::Separator();
 
-            // Extract sorted keys from the active cache map
             std::vector<int> cachedIndices;
             for (auto const& [key, val] : textureCache) cachedIndices.push_back(key);
             std::sort(cachedIndices.begin(), cachedIndices.end());
@@ -340,25 +333,27 @@ int main(int argc, char* argv[]) {
             for (int idx : cachedIndices) {
                 auto& entry = textureCache[idx];
                 
-                // Highlight color logic
                 ImU32 shadowColor = IM_COL32(0,0,0,0);
                 if (entry.status == CacheStatus::Ready) shadowColor = ImGui::ColorConvertFloat4ToU32(colorSuccess);
                 if (entry.status == CacheStatus::Error) shadowColor = ImGui::ColorConvertFloat4ToU32(colorError);
-                if (idx == currentIndex) shadowColor = IM_COL32(255, 255, 255, 255); // White for active
+                if (idx == currentIndex) shadowColor = IM_COL32(255, 255, 255, 255); 
 
                 ImGui::PushID(idx);
                 
-                // Draw shadow/border
+                // ADDED: Tighter layout calculations
                 ImVec2 p_min = ImGui::GetCursorScreenPos();
-                ImVec2 p_max = ImVec2(p_min.x + sidebarWidth - 30, p_min.y + 120);
+                float itemHeight = 100.0f;
+                float padding = 8.0f;
+                ImVec2 p_max = ImVec2(p_min.x + sidebarWidth - 15.0f, p_min.y + itemHeight + (padding * 2));
+                
                 ImGui::GetWindowDrawList()->AddRectFilled(p_min, p_max, IM_COL32(30,30,30,255));
                 ImGui::GetWindowDrawList()->AddRect(p_min, p_max, shadowColor, 0.0f, 0, idx == currentIndex ? 3.0f : 1.0f);
 
-                // Draw Thumbnail or Status
-                ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + 10, ImGui::GetCursorPosY() + 10));
+                ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + padding, ImGui::GetCursorPosY() + padding));
+                
                 if (entry.status == CacheStatus::Ready) {
                     float thumbAspect = (float)entry.width / (float)entry.height;
-                    ImVec2 thumbSize = thumbAspect > 1.0f ? ImVec2(100, 100/thumbAspect) : ImVec2(100*thumbAspect, 100);
+                    ImVec2 thumbSize = thumbAspect > 1.0f ? ImVec2(itemHeight, itemHeight/thumbAspect) : ImVec2(itemHeight*thumbAspect, itemHeight);
                     ImGui::Image((ImTextureID)(intptr_t)entry.textureID, thumbSize);
                 } else if (entry.status == CacheStatus::Error) {
                     ImGui::TextColored(colorError, "ERROR");
@@ -366,17 +361,18 @@ int main(int argc, char* argv[]) {
                     ImGui::Text("Loading...");
                 }
 
-                // File info
-                ImGui::SameLine(120);
+                // File info shifted slightly left to accommodate tighter width if user scales it down
+                ImGui::SameLine(itemHeight + (padding * 2) + 10.0f);
                 ImGui::BeginGroup();
                 ImGui::Text("ID: %d", idx);
                 ImGui::Text("%.1f MB", (float)entry.sizeBytes / (1024*1024));
                 ImGui::EndGroup();
                 
-                // Auto-scroll to center the active image
                 if (idx == currentIndex) ImGui::SetScrollHereY(0.5f);
 
-                ImGui::Dummy(ImVec2(0, 110)); // Space for next item
+                // ADDED: Absolute cursor positioning for perfectly tight spacing
+                ImGui::SetCursorScreenPos(ImVec2(p_min.x, p_max.y + 6.0f)); 
+                ImGui::Dummy(ImVec2(0.0f, 0.0f)); // Forces ImGui to register the new scroll boundary
                 ImGui::PopID();
             }
             ImGui::End();
@@ -394,8 +390,18 @@ int main(int argc, char* argv[]) {
         }
 
         if (showSettings) {
-            ImGui::Begin("Settings", &showSettings);
+            // ADDED: Auto-Centering logic based on exact screen size
+            ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+            ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            
+            // ADDED: AlwaysAutoResize forces the window to wrap tightly around its controls
+            ImGui::Begin("Settings", &showSettings, ImGuiWindowFlags_AlwaysAutoResize);
+            
             ImGui::Checkbox("Show Sidebar (Press 'B')", &enableSidebar);
+            if (enableSidebar) {
+                ImGui::SliderFloat("Sidebar Width", &sidebarMultiplier, 0.1f, 0.5f, "%.2f x");
+            }
+            
             ImGui::Separator();
             ImGui::Text("Caching Strategy");
             if (ImGui::RadioButton("By Image Count", &cacheStrategy, 0)) UpdateCacheManager();
@@ -423,7 +429,6 @@ int main(int argc, char* argv[]) {
         glfwSwapBuffers(window);
     }
 
-    // Cleanup Cache memory on exit
     for (auto const& [index, entry] : textureCache) {
         if (entry.status == CacheStatus::Ready) glDeleteTextures(1, &entry.textureID);
     }
