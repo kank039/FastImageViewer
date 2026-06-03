@@ -39,11 +39,15 @@ int currentIndex = 0;
 bool showOverlay = true;
 bool showSettings = false;
 int loopBehavior = 0; 
+bool closeOnEmpty = false; // New toggle for empty state behavior
 
 // Sidebar Layout Configs
 bool enableSidebar = true;
 float sidebarWidthMultiplier = 0.22f; 
-float sidebarHeightMultiplier = 1.0f; // Multiplier for thumbnail item height
+float sidebarHeightMultiplier = 1.0f; 
+
+// Overlay Configs
+int overlayPosition = 1; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
 
 // Visibility Toggles for Metadata
 bool ovShowName = true;
@@ -52,15 +56,16 @@ bool ovShowDim = true;
 bool ovShowSize = true;
 bool ovShowExt = true;
 
-bool sbShowName = false; // Kept off by default to save sidebar space
+bool sbShowName = false; 
 bool sbShowIndex = true;
 bool sbShowDim = true;
 bool sbShowSize = true;
 bool sbShowExt = false;
 
-int cacheStrategy = 1; // 0 = Image Count, 1 = RAM Budget
+// Cache Settings
+int cacheStrategy = 1; 
 int cacheLimitCount = 5; 
-int cacheLimitRAM = 1024; // MB
+int cacheLimitRAM = 1024; 
 
 ImVec4 colorSuccess = ImVec4(0.2f, 0.8f, 0.2f, 1.0f); 
 ImVec4 colorError = ImVec4(0.8f, 0.2f, 0.2f, 1.0f); 
@@ -234,7 +239,9 @@ int main(int argc, char* argv[]) {
             if (entry.path() == targetPath) currentIndex = (int)imageFiles.size() - 1;
         }
     }
-    if (imageFiles.empty()) return -1;
+    
+    // Safely boot even if empty, unless closeOnEmpty is true
+    if (imageFiles.empty() && closeOnEmpty) return -1;
 
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -286,30 +293,37 @@ int main(int argc, char* argv[]) {
         }
 
         // --- INPUT HANDLING ---
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) glfwSetWindowShouldClose(window, GLFW_TRUE); // Exit on ESC
-        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) Navigate(1);
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) Navigate(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) glfwSetWindowShouldClose(window, GLFW_TRUE); 
         
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-            if (MoveToRecycleBin(imageFiles[currentIndex].path)) {
-                imageFiles.erase(imageFiles.begin() + currentIndex);
-                if (imageFiles.empty()) break;
-                textureCache.clear(); currentRamUsage = 0; 
-                Navigate(0);
+        if (!imageFiles.empty()) { // Lock standard inputs if empty
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) Navigate(1);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) Navigate(-1);
+            
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+                if (MoveToRecycleBin(imageFiles[currentIndex].path)) {
+                    imageFiles.erase(imageFiles.begin() + currentIndex);
+                    textureCache.clear(); currentRamUsage = 0; 
+                    
+                    if (imageFiles.empty() && closeOnEmpty) break; // Auto-close
+                    if (!imageFiles.empty()) Navigate(0);
+                }
+            }
+            for (int key = ImGuiKey_1; key <= ImGuiKey_9; ++key) {
+                if (ImGui::IsKeyPressed((ImGuiKey)key)) {
+                    std::string folderName = std::to_string(key - ImGuiKey_1 + 1);
+                    fs::path targetDir = imageFiles[currentIndex].path.parent_path() / folderName;
+                    fs::create_directories(targetDir);
+                    fs::rename(imageFiles[currentIndex].path, targetDir / imageFiles[currentIndex].path.filename());
+                    
+                    imageFiles.erase(imageFiles.begin() + currentIndex);
+                    textureCache.clear(); currentRamUsage = 0;
+                    
+                    if (imageFiles.empty() && closeOnEmpty) break; 
+                    if (!imageFiles.empty()) Navigate(0);
+                }
             }
         }
-        for (int key = ImGuiKey_1; key <= ImGuiKey_9; ++key) {
-            if (ImGui::IsKeyPressed((ImGuiKey)key)) {
-                std::string folderName = std::to_string(key - ImGuiKey_1 + 1);
-                fs::path targetDir = imageFiles[currentIndex].path.parent_path() / folderName;
-                fs::create_directories(targetDir);
-                fs::rename(imageFiles[currentIndex].path, targetDir / imageFiles[currentIndex].path.filename());
-                imageFiles.erase(imageFiles.begin() + currentIndex);
-                if (imageFiles.empty()) break;
-                textureCache.clear(); currentRamUsage = 0;
-                Navigate(0);
-            }
-        }
+        
         if (ImGui::IsKeyPressed(ImGuiKey_O)) showOverlay = !showOverlay;
         if (ImGui::IsKeyPressed(ImGuiKey_S)) showSettings = !showSettings;
         if (ImGui::IsKeyPressed(ImGuiKey_B)) enableSidebar = !enableSidebar;
@@ -330,7 +344,14 @@ int main(int argc, char* argv[]) {
                                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus;
         
         ImGui::Begin("Image", nullptr, imageFlags);
-        if (textureCache.count(currentIndex) && textureCache[currentIndex].status == CacheStatus::Ready) {
+        if (imageFiles.empty()) {
+            // Draw Empty State Canvas
+            ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - sidebarWidth)/2 - 120, io.DisplaySize.y/2));
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "NO IMAGES REMAIN IN FOLDER");
+            ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - sidebarWidth)/2 - 90, io.DisplaySize.y/2 + 20));
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "Press 'S' for Settings");
+        } 
+        else if (textureCache.count(currentIndex) && textureCache[currentIndex].status == CacheStatus::Ready) {
             auto& img = textureCache[currentIndex];
             float aspect = (float)img.width / (float)img.height;
             float winAspect = (io.DisplaySize.x - sidebarWidth) / io.DisplaySize.y;
@@ -353,73 +374,90 @@ int main(int argc, char* argv[]) {
             ImGui::SetNextWindowPos(ImVec2(0, 0));
             ImGui::SetNextWindowSize(ImVec2(sidebarWidth, io.DisplaySize.y));
             ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.08f, 1.0f));
-            ImGui::Begin("Sidebar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
             
+            // Outer Sidebar Window (Non-Scrollable Header)
+            ImGui::Begin("Sidebar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
             ImGui::Text("RAM: %zu MB / %d MB", currentRamUsage / (1024*1024), cacheLimitRAM);
             ImGui::Separator();
 
-            std::vector<int> cachedIndices;
-            for (auto const& [key, val] : textureCache) cachedIndices.push_back(key);
-            std::sort(cachedIndices.begin(), cachedIndices.end());
+            // Inner Child Window (Scrollable List)
+            ImGui::BeginChild("SidebarScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_None);
+            
+            if (!imageFiles.empty()) {
+                std::vector<int> cachedIndices;
+                for (auto const& [key, val] : textureCache) cachedIndices.push_back(key);
+                std::sort(cachedIndices.begin(), cachedIndices.end());
 
-            for (int idx : cachedIndices) {
-                auto& entry = textureCache[idx];
-                auto& fileMeta = imageFiles[idx];
-                
-                ImU32 shadowColor = IM_COL32(0,0,0,0);
-                if (entry.status == CacheStatus::Ready) shadowColor = ImGui::ColorConvertFloat4ToU32(colorSuccess);
-                if (entry.status == CacheStatus::Error) shadowColor = ImGui::ColorConvertFloat4ToU32(colorError);
-                if (idx == currentIndex) shadowColor = IM_COL32(255, 255, 255, 255); 
+                for (int idx : cachedIndices) {
+                    auto& entry = textureCache[idx];
+                    auto& fileMeta = imageFiles[idx];
+                    
+                    ImU32 shadowColor = IM_COL32(0,0,0,0);
+                    if (entry.status == CacheStatus::Ready) shadowColor = ImGui::ColorConvertFloat4ToU32(colorSuccess);
+                    if (entry.status == CacheStatus::Error) shadowColor = ImGui::ColorConvertFloat4ToU32(colorError);
+                    if (idx == currentIndex) shadowColor = IM_COL32(255, 255, 255, 255); 
 
-                ImGui::PushID(idx);
-                
-                // Scale structural box size using height multiplier
-                ImVec2 p_min = ImGui::GetCursorScreenPos();
-                float itemHeight = 100.0f * sidebarHeightMultiplier;
-                float padding = 8.0f;
-                ImVec2 p_max = ImVec2(p_min.x + sidebarWidth - 15.0f, p_min.y + itemHeight + (padding * 2));
-                
-                ImGui::GetWindowDrawList()->AddRectFilled(p_min, p_max, IM_COL32(30,30,30,255));
-                ImGui::GetWindowDrawList()->AddRect(p_min, p_max, shadowColor, 0.0f, 0, idx == currentIndex ? 3.0f : 1.0f);
+                    ImGui::PushID(idx);
+                    
+                    ImVec2 p_min = ImGui::GetCursorScreenPos();
+                    float itemHeight = 100.0f * sidebarHeightMultiplier;
+                    float padding = 8.0f;
+                    // Dynamically ask ImGui for the exact remaining width inside the scroll region
+                    float availableWidth = ImGui::GetContentRegionAvail().x; 
+                    ImVec2 p_max = ImVec2(p_min.x + availableWidth, p_min.y + itemHeight + (padding * 2));
+                    
+                    ImGui::GetWindowDrawList()->AddRectFilled(p_min, p_max, IM_COL32(30,30,30,255));
+                    ImGui::GetWindowDrawList()->AddRect(p_min, p_max, shadowColor, 0.0f, 0, idx == currentIndex ? 3.0f : 1.0f);
 
-                ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + padding, ImGui::GetCursorPosY() + padding));
-                
-                if (entry.status == CacheStatus::Ready) {
-                    float thumbAspect = (float)entry.width / (float)entry.height;
-                    ImVec2 thumbSize = thumbAspect > 1.0f ? ImVec2(itemHeight, itemHeight/thumbAspect) : ImVec2(itemHeight*thumbAspect, itemHeight);
-                    ImGui::Image((ImTextureID)(intptr_t)entry.textureID, thumbSize);
-                } else if (entry.status == CacheStatus::Error) {
-                    ImGui::TextColored(colorError, "ERROR");
-                } else {
-                    ImGui::Text("Loading...");
+                    ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + padding, ImGui::GetCursorPosY() + padding));
+                    
+                    if (entry.status == CacheStatus::Ready) {
+                        float thumbAspect = (float)entry.width / (float)entry.height;
+                        ImVec2 thumbSize = thumbAspect > 1.0f ? ImVec2(itemHeight, itemHeight/thumbAspect) : ImVec2(itemHeight*thumbAspect, itemHeight);
+                        ImGui::Image((ImTextureID)(intptr_t)entry.textureID, thumbSize);
+                    } else if (entry.status == CacheStatus::Error) {
+                        ImGui::TextColored(colorError, "ERROR");
+                    } else {
+                        ImGui::Text("Loading...");
+                    }
+
+                    ImGui::SameLine(itemHeight + (padding * 2) + 10.0f);
+                    ImGui::BeginGroup();
+                    if (sbShowIndex)     ImGui::Text("Index: %d", idx + 1);
+                    if (sbShowName)      ImGui::Text("Name: %s", fileMeta.filename.c_str());
+                    if (sbShowExt)       ImGui::Text("Ext: %s", fileMeta.extension.c_str());
+                    if (sbShowSize)      ImGui::Text("Disk: %.2f MB", fileMeta.diskSizeMB);
+                    if (sbShowDim && entry.status == CacheStatus::Ready) {
+                        ImGui::Text("Dim: %dx%d", entry.width, entry.height);
+                    }
+                    ImGui::EndGroup();
+                    
+                    if (idx == currentIndex) ImGui::SetScrollHereY(0.5f);
+
+                    ImGui::SetCursorScreenPos(ImVec2(p_min.x, p_max.y + 6.0f)); 
+                    ImGui::Dummy(ImVec2(0.0f, 0.0f)); 
+                    ImGui::PopID();
                 }
-
-                // Render dynamically selected metadata options inside the sidebar entry
-                ImGui::SameLine(itemHeight + (padding * 2) + 10.0f);
-                ImGui::BeginGroup();
-                if (sbShowIndex)     ImGui::Text("Index: %d", idx + 1);
-                if (sbShowName)      ImGui::Text("Name: %s", fileMeta.filename.c_str());
-                if (sbShowExt)       ImGui::Text("Ext: %s", fileMeta.extension.c_str());
-                if (sbShowSize)      ImGui::Text("Disk: %.2f MB", fileMeta.diskSizeMB);
-                if (sbShowDim && entry.status == CacheStatus::Ready) {
-                    ImGui::Text("Dim: %dx%d", entry.width, entry.height);
-                }
-                ImGui::EndGroup();
-                
-                if (idx == currentIndex) ImGui::SetScrollHereY(0.5f);
-
-                ImGui::SetCursorScreenPos(ImVec2(p_min.x, p_max.y + 6.0f)); 
-                ImGui::Dummy(ImVec2(0.0f, 0.0f)); 
-                ImGui::PopID();
             }
+            ImGui::EndChild();
             ImGui::End();
             ImGui::PopStyleColor();
         }
 
-        // 3. Info Overlay (Top-Right Canvas)
-        if (showOverlay) {
-            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 280, 10), ImGuiCond_Always);
+        // 3. Info Overlay (Dynamic Corner Positioning)
+        if (showOverlay && !imageFiles.empty()) {
+            const float PAD = 10.0f;
+            ImVec2 window_pos, window_pos_pivot;
+            
+            // Calculate anchor coordinates based on settings layout choice
+            window_pos.x = (overlayPosition == 1 || overlayPosition == 3) ? (io.DisplaySize.x - PAD) : (sidebarWidth + PAD);
+            window_pos.y = (overlayPosition == 2 || overlayPosition == 3) ? (io.DisplaySize.y - PAD) : PAD;
+            window_pos_pivot.x = (overlayPosition == 1 || overlayPosition == 3) ? 1.0f : 0.0f;
+            window_pos_pivot.y = (overlayPosition == 2 || overlayPosition == 3) ? 1.0f : 0.0f;
+
+            ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot);
             ImGui::SetNextWindowBgAlpha(0.6f);
+            
             ImGui::Begin("Overlay", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
             
             auto& curFile = imageFiles[currentIndex];
@@ -442,27 +480,29 @@ int main(int argc, char* argv[]) {
             ImGui::Begin("Settings & Layout Control", &showSettings, ImGuiWindowFlags_AlwaysAutoResize);
             
             if (ImGui::CollapsingHeader("Interface Layout", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Checkbox("Close Application When Folder is Empty", &closeOnEmpty);
+                ImGui::Separator();
+                
                 ImGui::Checkbox("Show Sidebar (Press 'B')", &enableSidebar);
                 if (enableSidebar) {
                     ImGui::SliderFloat("Sidebar Width Scale", &sidebarWidthMultiplier, 0.10f, 0.50f, "%.2f x");
                     ImGui::SliderFloat("Thumbnail Height Scale", &sidebarHeightMultiplier, 0.50f, 2.00f, "%.2f x");
                 }
+                ImGui::Spacing();
+                ImGui::Combo("Top Overlay Anchor", &overlayPosition, "Top-Left\0Top-Right\0Bottom-Left\0Bottom-Right\0");
             }
 
             if (ImGui::CollapsingHeader("Metadata Display Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::Text("Select information vectors to expose:");
-                
                 ImGui::Columns(3, "metaColumns", false);
                 ImGui::SetColumnWidth(0, 120); ImGui::SetColumnWidth(1, 100); ImGui::SetColumnWidth(2, 100);
                 
-                ImGui::NextColumn(); ImGui::Text("Top Overlay"); ImGui::NextColumn(); ImGui::Text("Sidebar"); ImGui::Separator();
+                ImGui::NextColumn(); ImGui::Text("Overlay"); ImGui::NextColumn(); ImGui::Text("Sidebar"); ImGui::Separator();
                 
                 ImGui::NextColumn(); ImGui::Text("File Name"); ImGui::NextColumn(); ImGui::Checkbox("##ovName", &ovShowName); ImGui::NextColumn(); ImGui::Checkbox("##sbName", &sbShowName);
-                ImGui::NextColumn(); ImGui::Text("File Extension"); ImGui::NextColumn(); ImGui::Checkbox("##ovExt", &ovShowExt); ImGui::NextColumn(); ImGui::Checkbox("##sbExt", &sbShowExt);
-                ImGui::NextColumn(); ImGui::Text("Position Index"); ImGui::NextColumn(); ImGui::Checkbox("##ovIdx", &ovShowIndex); ImGui::NextColumn(); ImGui::Checkbox("##sbIdx", &sbShowIndex);
-                ImGui::NextColumn(); ImGui::Text("Disk File Size"); ImGui::NextColumn(); ImGui::Checkbox("##ovSize", &ovShowSize); ImGui::NextColumn(); ImGui::Checkbox("##sbSize", &sbShowSize);
-                ImGui::NextColumn(); ImGui::Text("Pixel Dimensions"); ImGui::NextColumn(); ImGui::Checkbox("##ovDim", &ovShowDim); ImGui::NextColumn(); ImGui::Checkbox("##sbDim", &sbShowDim);
-                
+                ImGui::NextColumn(); ImGui::Text("Extension"); ImGui::NextColumn(); ImGui::Checkbox("##ovExt", &ovShowExt); ImGui::NextColumn(); ImGui::Checkbox("##sbExt", &sbShowExt);
+                ImGui::NextColumn(); ImGui::Text("Index"); ImGui::NextColumn(); ImGui::Checkbox("##ovIdx", &ovShowIndex); ImGui::NextColumn(); ImGui::Checkbox("##sbIdx", &sbShowIndex);
+                ImGui::NextColumn(); ImGui::Text("Disk Size"); ImGui::NextColumn(); ImGui::Checkbox("##ovSize", &ovShowSize); ImGui::NextColumn(); ImGui::Checkbox("##sbSize", &sbShowSize);
+                ImGui::NextColumn(); ImGui::Text("Dimensions"); ImGui::NextColumn(); ImGui::Checkbox("##ovDim", &ovShowDim); ImGui::NextColumn(); ImGui::Checkbox("##sbDim", &sbShowDim);
                 ImGui::Columns(1);
             }
             
@@ -481,7 +521,6 @@ int main(int argc, char* argv[]) {
                 ImGui::ColorEdit4("Successful Cache Outline", (float*)&colorSuccess, ImGuiColorEditFlags_NoInputs);
                 ImGui::ColorEdit4("Disk/Decode Error Outline", (float*)&colorError, ImGuiColorEditFlags_NoInputs);
             }
-            
             ImGui::End();
         }
 
