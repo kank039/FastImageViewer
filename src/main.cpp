@@ -1,5 +1,8 @@
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <stdlib.h>
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
@@ -14,6 +17,11 @@
 #include <wrl/client.h>
 #include <future>
 #include <unordered_map>
+#include <atomic>
+#include <thread>
+#include <dwmapi.h>
+
+#pragma comment(lib, "dwmapi.lib")
 
 namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
@@ -25,7 +33,38 @@ extern "C" {
 }
 #endif
 
-// --- TRACKED FILE METADATA ---
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMSBT_MAINWINDOW
+#define DWMSBT_MAINWINDOW 2
+#endif
+
+// --- FORMAT & CODEC TRACKING ---
+struct ImageFormat {
+    std::string displayName;
+    std::vector<std::string> extensions;
+    bool enabled;
+    bool requiresExtension;
+    bool isInstalled;
+    std::string storeUrl;
+};
+
+std::vector<ImageFormat> appFormats = {
+    {"JPEG", {".jpg", ".jpeg"}, true, false, true, ""},
+    {"PNG", {".png"}, true, false, true, ""},
+    {"BMP", {".bmp"}, true, false, true, ""},
+    {"GIF", {".gif"}, true, false, true, ""},
+    {"TIFF", {".tiff", ".tif"}, true, false, true, ""},
+    {"WebP", {".webp"}, true, true, false, "ms-windows-store://pdp/?ProductId=9PG2DK419DRG"},
+    {"HEIC / iPhone", {".heic", ".heif"}, true, true, false, "ms-windows-store://pdp/?ProductId=9NMZLZ57R3T7"},
+    {"AVIF", {".avif"}, true, true, false, "ms-windows-store://pdp/?ProductId=9MVZQVXJBQ9V"}
+};
+
+// --- SYSTEM STATE & SETTINGS ---
 struct ImageFileInfo {
     fs::path path;
     std::string filename;
@@ -33,76 +72,109 @@ struct ImageFileInfo {
     float diskSizeMB = 0.0f;
 };
 
-// --- SYSTEM STATE & SETTINGS ---
 std::vector<ImageFileInfo> imageFiles;
 int currentIndex = 0;
+fs::path targetDirectory; 
+
+std::atomic<bool> dirNeedsRefresh{false};
+std::atomic<bool> isWatching{true};
+std::thread dirWatcherThread;
+
 bool showOverlay = true;
 bool showSettings = false;
 int loopBehavior = 0; 
-bool closeOnEmpty = false; // New toggle for empty state behavior
+bool closeOnEmpty = false; 
 
-// Sidebar Layout Configs
 bool enableSidebar = true;
 float sidebarWidthMultiplier = 0.22f; 
 float sidebarHeightMultiplier = 1.0f; 
+int overlayPosition = 1; 
 
-// Overlay Configs
-int overlayPosition = 1; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
+bool ovShowName = true; bool ovShowIndex = true; bool ovShowDim = true; bool ovShowSize = true; bool ovShowExt = true;
+bool sbShowName = false; bool sbShowIndex = true; bool sbShowDim = true; bool sbShowSize = true; bool sbShowExt = false;
 
-// Visibility Toggles for Metadata
-bool ovShowName = true;
-bool ovShowIndex = true;
-bool ovShowDim = true;
-bool ovShowSize = true;
-bool ovShowExt = true;
-
-bool sbShowName = false; 
-bool sbShowIndex = true;
-bool sbShowDim = true;
-bool sbShowSize = true;
-bool sbShowExt = false;
-
-// Cache Settings
 int cacheStrategy = 1; 
 int cacheLimitCount = 5; 
 int cacheLimitRAM = 1024; 
-
 ImVec4 colorSuccess = ImVec4(0.2f, 0.8f, 0.2f, 1.0f); 
 ImVec4 colorError = ImVec4(0.8f, 0.2f, 0.2f, 1.0f); 
 
-// --- MULTI-THREADED CACHE MANAGER ---
+// --- CACHE MANAGER ---
 enum class CacheStatus { Loading, Ready, Error };
-
-struct RawImageData {
-    int index = -1;
-    int width = 0;
-    int height = 0;
-    std::vector<BYTE> pixels;
-    bool success = false;
-};
-
-struct CacheEntry {
-    GLuint textureID = 0;
-    int width = 0;
-    int height = 0;
-    size_t sizeBytes = 0;
-    CacheStatus status = CacheStatus::Loading;
-};
+struct RawImageData { int index = -1; int width = 0; int height = 0; std::vector<BYTE> pixels; bool success = false; };
+struct CacheEntry { GLuint textureID = 0; int width = 0; int height = 0; size_t sizeBytes = 0; CacheStatus status = CacheStatus::Loading; };
 
 std::unordered_map<int, CacheEntry> textureCache;
 std::vector<std::future<RawImageData>> loadingFutures;
 size_t currentRamUsage = 0;
 
-bool MoveToRecycleBin(const fs::path& filePath) {
-    std::wstring pathStr = filePath.wstring();
-    pathStr.push_back(L'\0'); 
-    SHFILEOPSTRUCTW fileOp = {0};
-    fileOp.wFunc = FO_DELETE;
-    fileOp.pFrom = pathStr.c_str();
-    fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-    return SHFileOperationW(&fileOp) == 0;
+// --- DYNAMIC CODEC DETECTION ---
+bool CheckExtensionSupport(IWICImagingFactory* pFactory, const std::wstring& searchExt) {
+    ComPtr<IEnumUnknown> pEnum;
+    if (FAILED(pFactory->CreateComponentEnumerator(WICDecoder, WICComponentEnumerateDefault, &pEnum))) return false;
+    
+    ULONG cbActual;
+    ComPtr<IUnknown> pUnk;
+    while (pEnum->Next(1, &pUnk, &cbActual) == S_OK) {
+        ComPtr<IWICBitmapDecoderInfo> pInfo;
+        if (SUCCEEDED(pUnk.As(&pInfo))) {
+            UINT cch = 0;
+            if (SUCCEEDED(pInfo->GetFileExtensions(0, nullptr, &cch)) && cch > 0) {
+                std::vector<WCHAR> exts(cch);
+                if (SUCCEEDED(pInfo->GetFileExtensions(cch, exts.data(), &cch))) {
+                    std::wstring supportedExts(exts.data());
+                    if (supportedExts.find(searchExt) != std::wstring::npos) return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
+void DetectInstalledCodecs() {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return;
+    
+    { // <--- NEW SCOPE BLOCK: Forces ComPtrs to release before CoUninitialize
+        ComPtr<IWICImagingFactory> pFactory;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory)))) {
+            for (auto& fmt : appFormats) {
+                if (fmt.requiresExtension) {
+                    std::wstring wExt(fmt.extensions[0].begin(), fmt.extensions[0].end());
+                    fmt.isInstalled = CheckExtensionSupport(pFactory.Get(), wExt);
+                    if (!fmt.isInstalled) fmt.enabled = false;
+                }
+            }
+        }
+    } // <--- END SCOPE BLOCK
+    
+    CoUninitialize();
+}
+
+bool IsFormatEnabled(const std::string& ext) {
+    for (const auto& fmt : appFormats) {
+        if (fmt.enabled && std::find(fmt.extensions.begin(), fmt.extensions.end(), ext) != fmt.extensions.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- DIRECTORY KERNEL WATCHER ---
+void WatchDirectoryBackground(std::wstring targetPath) {
+    HANDLE hChange = FindFirstChangeNotificationW(targetPath.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE);
+    if (hChange == INVALID_HANDLE_VALUE) return;
+    while (isWatching) {
+        DWORD waitStatus = WaitForSingleObject(hChange, 250); 
+        if (waitStatus == WAIT_OBJECT_0) {
+            dirNeedsRefresh = true;
+            FindNextChangeNotification(hChange);
+        }
+    }
+    FindCloseChangeNotification(hChange);
+}
+
+// --- CORE LOGIC ---
 RawImageData DecodeImageBackground(int index, fs::path filePath) {
     RawImageData result;
     result.index = index;
@@ -123,25 +195,27 @@ RawImageData DecodeImageBackground(int index, fs::path filePath) {
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr)) return result;
 
-    ComPtr<IWICImagingFactory> pFactory;
-    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory)))) {
-        ComPtr<IWICStream> pStream;
-        if (SUCCEEDED(pFactory->CreateStream(&pStream))) {
-            if (SUCCEEDED(pStream->InitializeFromMemory(fileBuffer.data(), (DWORD)fileBuffer.size()))) {
-                ComPtr<IWICBitmapDecoder> pDecoder;
-                if (SUCCEEDED(pFactory->CreateDecoderFromStream(pStream.Get(), NULL, WICDecodeMetadataCacheOnDemand, &pDecoder))) {
-                    ComPtr<IWICBitmapFrameDecode> pFrame;
-                    if (SUCCEEDED(pDecoder->GetFrame(0, &pFrame))) {
-                        ComPtr<IWICFormatConverter> pConverter;
-                        if (SUCCEEDED(pFactory->CreateFormatConverter(&pConverter))) {
-                            if (SUCCEEDED(pConverter->Initialize(pFrame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) {
-                                UINT width, height;
-                                pConverter->GetSize(&width, &height);
-                                result.pixels.resize(width * height * 4);
-                                if (SUCCEEDED(pConverter->CopyPixels(NULL, width * 4, (UINT)result.pixels.size(), result.pixels.data()))) {
-                                    result.width = width;
-                                    result.height = height;
-                                    result.success = true;
+    { // <--- NEW SCOPE BLOCK
+        ComPtr<IWICImagingFactory> pFactory;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory)))) {
+            ComPtr<IWICStream> pStream;
+            if (SUCCEEDED(pFactory->CreateStream(&pStream))) {
+                if (SUCCEEDED(pStream->InitializeFromMemory(fileBuffer.data(), (DWORD)fileBuffer.size()))) {
+                    ComPtr<IWICBitmapDecoder> pDecoder;
+                    if (SUCCEEDED(pFactory->CreateDecoderFromStream(pStream.Get(), NULL, WICDecodeMetadataCacheOnDemand, &pDecoder))) {
+                        ComPtr<IWICBitmapFrameDecode> pFrame;
+                        if (SUCCEEDED(pDecoder->GetFrame(0, &pFrame))) {
+                            ComPtr<IWICFormatConverter> pConverter;
+                            if (SUCCEEDED(pFactory->CreateFormatConverter(&pConverter))) {
+                                if (SUCCEEDED(pConverter->Initialize(pFrame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) {
+                                    UINT width, height;
+                                    pConverter->GetSize(&width, &height);
+                                    result.pixels.resize(width * height * 4);
+                                    if (SUCCEEDED(pConverter->CopyPixels(NULL, width * 4, (UINT)result.pixels.size(), result.pixels.data()))) {
+                                        result.width = width;
+                                        result.height = height;
+                                        result.success = true;
+                                    }
                                 }
                             }
                         }
@@ -149,7 +223,8 @@ RawImageData DecodeImageBackground(int index, fs::path filePath) {
                 }
             }
         }
-    }
+    } // <--- END SCOPE BLOCK
+    
     CoUninitialize();
     return result;
 }
@@ -163,25 +238,30 @@ void UpdateCacheManager() {
     int step = 1;
     size_t estimatedRam = 0;
     size_t ramBudget = (size_t)cacheLimitRAM * 1024 * 1024;
-    const size_t estimatedBytesPerImage = 30 * 1024 * 1024; 
 
     while (true) {
         if (cacheStrategy == 0 && desiredIndices.size() >= cacheLimitCount) break;
-        if (cacheStrategy == 1 && (estimatedRam + estimatedBytesPerImage) >= ramBudget) break;
+        if (cacheStrategy == 1 && estimatedRam >= ramBudget) break;
         if (step > imageFiles.size()) break; 
 
         int forwardIndex = currentIndex + step;
         if (loopBehavior == 0) forwardIndex = forwardIndex % imageFiles.size();
         if (forwardIndex < imageFiles.size() && std::find(desiredIndices.begin(), desiredIndices.end(), forwardIndex) == desiredIndices.end()) {
+            size_t dynamicEstimate = (size_t)(imageFiles[forwardIndex].diskSizeMB * 5.0f * 1024.0f * 1024.0f);
+            if (dynamicEstimate < (10 * 1024 * 1024)) dynamicEstimate = 10 * 1024 * 1024;
+            if (cacheStrategy == 1 && (estimatedRam + (textureCache.count(forwardIndex) ? textureCache[forwardIndex].sizeBytes : dynamicEstimate)) > ramBudget) break;
             desiredIndices.push_back(forwardIndex);
-            estimatedRam += textureCache.count(forwardIndex) ? textureCache[forwardIndex].sizeBytes : estimatedBytesPerImage;
+            estimatedRam += textureCache.count(forwardIndex) ? textureCache[forwardIndex].sizeBytes : dynamicEstimate;
         }
 
         int backwardIndex = currentIndex - step;
         if (loopBehavior == 0) backwardIndex = (backwardIndex + imageFiles.size()) % imageFiles.size();
         if (backwardIndex >= 0 && std::find(desiredIndices.begin(), desiredIndices.end(), backwardIndex) == desiredIndices.end()) {
+            size_t dynamicEstimate = (size_t)(imageFiles[backwardIndex].diskSizeMB * 5.0f * 1024.0f * 1024.0f);
+            if (dynamicEstimate < (10 * 1024 * 1024)) dynamicEstimate = 10 * 1024 * 1024;
+            if (cacheStrategy == 1 && (estimatedRam + (textureCache.count(backwardIndex) ? textureCache[backwardIndex].sizeBytes : dynamicEstimate)) > ramBudget) break;
             desiredIndices.push_back(backwardIndex);
-            estimatedRam += textureCache.count(backwardIndex) ? textureCache[backwardIndex].sizeBytes : estimatedBytesPerImage;
+            estimatedRam += textureCache.count(backwardIndex) ? textureCache[backwardIndex].sizeBytes : dynamicEstimate;
         }
         step++;
     }
@@ -204,6 +284,47 @@ void UpdateCacheManager() {
     }
 }
 
+void RefreshFileList() {
+    std::string currentFilename = imageFiles.empty() ? "" : imageFiles[currentIndex].filename;
+    imageFiles.clear();
+    
+    std::error_code ec;
+    if (targetDirectory.empty() || !fs::exists(targetDirectory, ec) || !fs::is_directory(targetDirectory, ec)) return;
+
+    for (const auto& entry : fs::directory_iterator(targetDirectory, ec)) {
+        if (ec) continue; 
+        
+        auto ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        
+        if (IsFormatEnabled(ext)) {
+            ImageFileInfo info;
+            info.path = entry.path();
+            info.filename = entry.path().stem().string();
+            info.extension = ext;
+            auto sizeBytes = fs::file_size(entry.path(), ec);
+            info.diskSizeMB = ec ? 0.0f : (float)sizeBytes / (1024.0f * 1024.0f);
+            imageFiles.push_back(info);
+        }
+    }
+
+    currentIndex = 0;
+    if (!currentFilename.empty()) {
+        for (size_t i = 0; i < imageFiles.size(); i++) {
+            if (imageFiles[i].filename == currentFilename) {
+                currentIndex = (int)i; break;
+            }
+        }
+    }
+
+    for (auto const& [index, entry] : textureCache) {
+        if (entry.status == CacheStatus::Ready) glDeleteTextures(1, &entry.textureID);
+    }
+    textureCache.clear();
+    currentRamUsage = 0;
+    UpdateCacheManager();
+}
+
 void Navigate(int direction) {
     if (imageFiles.empty()) return;
     currentIndex += direction;
@@ -212,38 +333,90 @@ void Navigate(int direction) {
     UpdateCacheManager();
 }
 
-int main(int argc, char* argv[]) {
+bool MoveToRecycleBin(const fs::path& filePath) {
+    std::wstring pathStr = filePath.wstring();
+    pathStr.push_back(L'\0'); 
+    SHFILEOPSTRUCTW fileOp = {0};
+    fileOp.wFunc = FO_DELETE;
+    fileOp.pFrom = pathStr.c_str();
+    fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    return SHFileOperationW(&fileOp) == 0;
+}
+
+// THE NATIVE WINDOWS GUI ENTRY POINT
+int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // 1. Force clear any garbage error codes left by the Windows OS boot sequence
+    SetLastError(0); 
+
+    // 2. Safely create a local mutex
+    HANDLE hMutex = CreateMutexA(NULL, FALSE, "Local\\FastImageViewer_Mutex");
+    if (hMutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+        return 0; // ONLY exit if we genuinely proved another instance owns this exact mutex
+    }
+
+    // 3. Resume normal OS error suppression
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
-    HANDLE hMutex = CreateMutexA(NULL, FALSE, "Global\\KILLSWITCH_FastImageViewer_Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0; 
+    
+    // --- THE MASTER SAFETY NET ---
+    try {
+        DetectInstalledCodecs();
 
-    fs::path targetPath;
-    if (argc > 1) targetPath = fs::u8path(argv[1]);
-    else { std::cerr << "Usage: FastImageViewer.exe <path_to_image>" << std::endl; return -1; }
-
-    fs::path searchDir = fs::is_directory(targetPath) ? targetPath : targetPath.parent_path();
-    for (const auto& entry : fs::directory_iterator(searchDir)) {
-        auto ext = entry.path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
-            ImageFileInfo info;
-            info.path = entry.path();
-            info.filename = entry.path().stem().string();
-            info.extension = ext;
-            
-            std::error_code ec;
-            auto sizeBytes = fs::file_size(entry.path(), ec);
-            info.diskSizeMB = ec ? 0.0f : (float)sizeBytes / (1024.0f * 1024.0f);
-
-            imageFiles.push_back(info);
-            if (entry.path() == targetPath) currentIndex = (int)imageFiles.size() - 1;
+        std::error_code ec;
+        fs::path targetPath;
+        
+        // THE REAL FIX: KERNEL PARSER RETURNED (No more NULL pointers)
+        int wargc;
+        LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        
+        if (wargv != NULL && wargc > 1) {
+            targetPath = fs::absolute(fs::path(wargv[1]), ec);
+        } else {
+            targetPath = fs::current_path(ec); 
         }
+        
+        if (wargv != NULL) LocalFree(wargv);
+
+        // Safely resolve the working directory
+        if (fs::is_directory(targetPath, ec)) {
+            targetDirectory = targetPath;
+        } else if (targetPath.has_parent_path()) {
+            targetDirectory = targetPath.parent_path();
+        } else {
+            targetDirectory = fs::current_path(ec);
+        }
+
+        // Double check existence to prevent silent C++ aborts
+        if (!fs::exists(targetDirectory, ec)) targetDirectory = fs::current_path(ec);
+
+        RefreshFileList();
+        
+        // Hardware-level path matching
+        if (!fs::is_directory(targetPath, ec)) {
+            for (size_t i = 0; i < imageFiles.size(); i++) {
+                if (fs::equivalent(imageFiles[i].path, targetPath, ec)) { 
+                    currentIndex = (int)i; 
+                    break; 
+                }
+            }
+            UpdateCacheManager();
+        }
+
+        if (imageFiles.empty() && closeOnEmpty) return -1;
+
+    } catch (const std::exception& e) {
+        MessageBoxA(NULL, e.what(), "FATAL C++ EXCEPTION", MB_OK | MB_ICONERROR);
+        return -1;
+    } catch (...) {
+        MessageBoxA(NULL, "An unknown error occurred during boot.", "FATAL C++ EXCEPTION", MB_OK | MB_ICONERROR);
+        return -1;
+    }
+
+    if (!glfwInit()) {
+        MessageBoxA(NULL, "GLFW Failed to Initialize! Check if glfw3.dll is in the folder.", "FATAL CRASH", MB_OK | MB_ICONERROR);
+        return -1;
     }
     
-    // Safely boot even if empty, unless closeOnEmpty is true
-    if (imageFiles.empty() && closeOnEmpty) return -1;
-
-    if (!glfwInit()) return -1;
+    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -252,6 +425,14 @@ int main(int argc, char* argv[]) {
     glfwSwapInterval(1);
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) return -1;
 
+    HWND hwnd = glfwGetWin32Window(window);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    DWORD backdrop = DWMSBT_MAINWINDOW;
+    DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+
+    dirWatcherThread = std::thread(WatchDirectoryBackground, targetDirectory.wstring());
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -259,12 +440,14 @@ int main(int argc, char* argv[]) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    UpdateCacheManager();
-
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // --- UPLOAD FINISHED TEXTURES TO GPU ---
+        if (dirNeedsRefresh) {
+            dirNeedsRefresh = false;
+            RefreshFileList();
+        }
+
         for (auto it = loadingFutures.begin(); it != loadingFutures.end(); ) {
             if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 RawImageData data = it->get();
@@ -292,21 +475,14 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // --- INPUT HANDLING ---
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) glfwSetWindowShouldClose(window, GLFW_TRUE); 
         
-        if (!imageFiles.empty()) { // Lock standard inputs if empty
+        if (!imageFiles.empty()) {
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) Navigate(1);
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) Navigate(-1);
             
             if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-                if (MoveToRecycleBin(imageFiles[currentIndex].path)) {
-                    imageFiles.erase(imageFiles.begin() + currentIndex);
-                    textureCache.clear(); currentRamUsage = 0; 
-                    
-                    if (imageFiles.empty() && closeOnEmpty) break; // Auto-close
-                    if (!imageFiles.empty()) Navigate(0);
-                }
+                if (MoveToRecycleBin(imageFiles[currentIndex].path)) {}
             }
             for (int key = ImGuiKey_1; key <= ImGuiKey_9; ++key) {
                 if (ImGui::IsKeyPressed((ImGuiKey)key)) {
@@ -314,12 +490,6 @@ int main(int argc, char* argv[]) {
                     fs::path targetDir = imageFiles[currentIndex].path.parent_path() / folderName;
                     fs::create_directories(targetDir);
                     fs::rename(imageFiles[currentIndex].path, targetDir / imageFiles[currentIndex].path.filename());
-                    
-                    imageFiles.erase(imageFiles.begin() + currentIndex);
-                    textureCache.clear(); currentRamUsage = 0;
-                    
-                    if (imageFiles.empty() && closeOnEmpty) break; 
-                    if (!imageFiles.empty()) Navigate(0);
                 }
             }
         }
@@ -328,7 +498,6 @@ int main(int argc, char* argv[]) {
         if (ImGui::IsKeyPressed(ImGuiKey_S)) showSettings = !showSettings;
         if (ImGui::IsKeyPressed(ImGuiKey_B)) enableSidebar = !enableSidebar;
 
-        // --- RENDERING ---
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -338,14 +507,10 @@ int main(int argc, char* argv[]) {
         // 1. Main Image Window
         ImGui::SetNextWindowPos(ImVec2(sidebarWidth, 0));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x - sidebarWidth, io.DisplaySize.y));
-        
-        ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
-                                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | 
-                                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus;
         
         ImGui::Begin("Image", nullptr, imageFlags);
         if (imageFiles.empty()) {
-            // Draw Empty State Canvas
             ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - sidebarWidth)/2 - 120, io.DisplaySize.y/2));
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "NO IMAGES REMAIN IN FOLDER");
             ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - sidebarWidth)/2 - 90, io.DisplaySize.y/2 + 20));
@@ -369,18 +534,16 @@ int main(int argc, char* argv[]) {
         }
         ImGui::End();
 
-        // 2. Sidebar (Cache Visualizer)
+        // 2. Sidebar
         if (enableSidebar) {
             ImGui::SetNextWindowPos(ImVec2(0, 0));
             ImGui::SetNextWindowSize(ImVec2(sidebarWidth, io.DisplaySize.y));
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.08f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.08f, 0.65f));
             
-            // Outer Sidebar Window (Non-Scrollable Header)
             ImGui::Begin("Sidebar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
             ImGui::Text("RAM: %zu MB / %d MB", currentRamUsage / (1024*1024), cacheLimitRAM);
             ImGui::Separator();
 
-            // Inner Child Window (Scrollable List)
             ImGui::BeginChild("SidebarScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_None);
             
             if (!imageFiles.empty()) {
@@ -402,11 +565,10 @@ int main(int argc, char* argv[]) {
                     ImVec2 p_min = ImGui::GetCursorScreenPos();
                     float itemHeight = 100.0f * sidebarHeightMultiplier;
                     float padding = 8.0f;
-                    // Dynamically ask ImGui for the exact remaining width inside the scroll region
                     float availableWidth = ImGui::GetContentRegionAvail().x; 
                     ImVec2 p_max = ImVec2(p_min.x + availableWidth, p_min.y + itemHeight + (padding * 2));
                     
-                    ImGui::GetWindowDrawList()->AddRectFilled(p_min, p_max, IM_COL32(30,30,30,255));
+                    ImGui::GetWindowDrawList()->AddRectFilled(p_min, p_max, IM_COL32(30, 30, 30, 180));
                     ImGui::GetWindowDrawList()->AddRect(p_min, p_max, shadowColor, 0.0f, 0, idx == currentIndex ? 3.0f : 1.0f);
 
                     ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + padding, ImGui::GetCursorPosY() + padding));
@@ -444,16 +606,13 @@ int main(int argc, char* argv[]) {
             ImGui::PopStyleColor();
         }
 
-        // 3. Info Overlay (Dynamic Corner Positioning)
+        // 3. Info Overlay
         if (showOverlay && !imageFiles.empty()) {
             const float PAD = 10.0f;
-            ImVec2 window_pos, window_pos_pivot;
-            
-            // Calculate anchor coordinates based on settings layout choice
+            ImVec2 window_pos;
             window_pos.x = (overlayPosition == 1 || overlayPosition == 3) ? (io.DisplaySize.x - PAD) : (sidebarWidth + PAD);
             window_pos.y = (overlayPosition == 2 || overlayPosition == 3) ? (io.DisplaySize.y - PAD) : PAD;
-            window_pos_pivot.x = (overlayPosition == 1 || overlayPosition == 3) ? 1.0f : 0.0f;
-            window_pos_pivot.y = (overlayPosition == 2 || overlayPosition == 3) ? 1.0f : 0.0f;
+            ImVec2 window_pos_pivot = ImVec2((overlayPosition == 1 || overlayPosition == 3) ? 1.0f : 0.0f, (overlayPosition == 2 || overlayPosition == 3) ? 1.0f : 0.0f);
 
             ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot);
             ImGui::SetNextWindowBgAlpha(0.6f);
@@ -472,32 +631,53 @@ int main(int argc, char* argv[]) {
             ImGui::End();
         }
 
-        // 4. Centered Configurations Interface
+        // 4. Settings
         if (showSettings) {
             ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
             ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::Begin("Settings & Controls", &showSettings, ImGuiWindowFlags_AlwaysAutoResize);
             
-            ImGui::Begin("Settings & Layout Control", &showSettings, ImGuiWindowFlags_AlwaysAutoResize);
-            
-            if (ImGui::CollapsingHeader("Interface Layout", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::CollapsingHeader("Supported File Formats", ImGuiTreeNodeFlags_DefaultOpen)) {
+                bool formatsChanged = false;
+                for (auto& fmt : appFormats) {
+                    if (!fmt.requiresExtension || fmt.isInstalled) {
+                        if (ImGui::Checkbox(fmt.displayName.c_str(), &fmt.enabled)) formatsChanged = true;
+                    } else {
+                        ImGui::BeginDisabled();
+                        bool dummy = false;
+                        ImGui::Checkbox(fmt.displayName.c_str(), &dummy);
+                        ImGui::EndDisabled();
+                        
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "[Missing System Codec]");
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                            ImGui::SetTooltip("Click to download the official codec from the Microsoft Store");
+                            if (ImGui::IsItemClicked()) {
+                                ShellExecuteA(NULL, "open", fmt.storeUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                            }
+                        }
+                    }
+                }
+                if (formatsChanged) RefreshFileList();
+            }
+
+            if (ImGui::CollapsingHeader("Interface Layout")) {
                 ImGui::Checkbox("Close Application When Folder is Empty", &closeOnEmpty);
                 ImGui::Separator();
-                
                 ImGui::Checkbox("Show Sidebar (Press 'B')", &enableSidebar);
                 if (enableSidebar) {
-                    ImGui::SliderFloat("Sidebar Width Scale", &sidebarWidthMultiplier, 0.10f, 0.50f, "%.2f x");
-                    ImGui::SliderFloat("Thumbnail Height Scale", &sidebarHeightMultiplier, 0.50f, 2.00f, "%.2f x");
+                    ImGui::SliderFloat("Sidebar Width", &sidebarWidthMultiplier, 0.10f, 0.50f, "%.2f x");
+                    ImGui::SliderFloat("Thumbnail Height", &sidebarHeightMultiplier, 0.50f, 2.00f, "%.2f x");
                 }
                 ImGui::Spacing();
                 ImGui::Combo("Top Overlay Anchor", &overlayPosition, "Top-Left\0Top-Right\0Bottom-Left\0Bottom-Right\0");
             }
 
-            if (ImGui::CollapsingHeader("Metadata Display Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::CollapsingHeader("Metadata Display")) {
                 ImGui::Columns(3, "metaColumns", false);
                 ImGui::SetColumnWidth(0, 120); ImGui::SetColumnWidth(1, 100); ImGui::SetColumnWidth(2, 100);
-                
                 ImGui::NextColumn(); ImGui::Text("Overlay"); ImGui::NextColumn(); ImGui::Text("Sidebar"); ImGui::Separator();
-                
                 ImGui::NextColumn(); ImGui::Text("File Name"); ImGui::NextColumn(); ImGui::Checkbox("##ovName", &ovShowName); ImGui::NextColumn(); ImGui::Checkbox("##sbName", &sbShowName);
                 ImGui::NextColumn(); ImGui::Text("Extension"); ImGui::NextColumn(); ImGui::Checkbox("##ovExt", &ovShowExt); ImGui::NextColumn(); ImGui::Checkbox("##sbExt", &sbShowExt);
                 ImGui::NextColumn(); ImGui::Text("Index"); ImGui::NextColumn(); ImGui::Checkbox("##ovIdx", &ovShowIndex); ImGui::NextColumn(); ImGui::Checkbox("##sbIdx", &sbShowIndex);
@@ -506,7 +686,7 @@ int main(int argc, char* argv[]) {
                 ImGui::Columns(1);
             }
             
-            if (ImGui::CollapsingHeader("Caching Strategy Rules")) {
+            if (ImGui::CollapsingHeader("Caching Limits")) {
                 if (ImGui::RadioButton("By Image Count Loop Window", &cacheStrategy, 0)) UpdateCacheManager();
                 if (ImGui::RadioButton("By Restrictive RAM Limit", &cacheStrategy, 1)) UpdateCacheManager();
                 ImGui::Spacing();
@@ -516,23 +696,22 @@ int main(int argc, char* argv[]) {
                     if (ImGui::SliderInt("Target Max RAM Budget (MB)", &cacheLimitRAM, 128, 8192)) UpdateCacheManager();
                 }
             }
-            
-            if (ImGui::CollapsingHeader("Visual Status Coloring")) {
-                ImGui::ColorEdit4("Successful Cache Outline", (float*)&colorSuccess, ImGuiColorEditFlags_NoInputs);
-                ImGui::ColorEdit4("Disk/Decode Error Outline", (float*)&colorError, ImGuiColorEditFlags_NoInputs);
-            }
             ImGui::End();
         }
 
         ImGui::Render();
-        int display_w, display_h;
+        int display_w = 0, display_h = 0;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
-        glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+        
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+    isWatching = false;
+    if (dirWatcherThread.joinable()) dirWatcherThread.join();
 
     for (auto const& [index, entry] : textureCache) {
         if (entry.status == CacheStatus::Ready) glDeleteTextures(1, &entry.textureID);

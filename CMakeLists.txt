@@ -8,7 +8,7 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(glad CONFIG REQUIRED)
 
-add_executable(FastImageViewer src/main.cpp)
+add_executable(FastImageViewer WIN32 src/main.cpp)
 
 target_link_libraries(FastImageViewer PRIVATE
     glfw
