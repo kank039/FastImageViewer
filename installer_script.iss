@@ -1,11 +1,18 @@
 ; Inno Setup script for Fast Image Viewer v3.
 ; Build the "release" CMake preset first; paths are relative to this script.
+; CI passes the version: iscc /DAppVersion=3.2.0 installer_script.iss
 
-#define AppVersion "3.0"
+#ifndef AppVersion
+  #define AppVersion "3.2"
+#endif
+#ifndef NumericVersion
+  #define NumericVersion "3.2"
+#endif
 
 [Setup]
 AppName=Fast Image Viewer
 AppVersion={#AppVersion}
+VersionInfoVersion={#NumericVersion}
 AppPublisher=KILLSWITCH
 AppPublisherURL=https://github.com/killswitch
 DefaultDirName={autopf}\FastImageViewer
@@ -20,6 +27,10 @@ MinVersion=10.0
 SetupIconFile=app_icon.ico
 UninstallDisplayIcon={app}\FastImageViewer.exe
 ChangesAssociations=yes
+; Installs for the current user without administrator rights by default;
+; "Install for all users" is offered in the setup dialog.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 
 [Files]
 ; v3 is a single statically linked executable: no DLLs to ship.

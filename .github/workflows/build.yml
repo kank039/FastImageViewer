@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write  # only used by the release step on version tags
+
 jobs:
   core-tests:
     name: Core unit tests (Linux, sanitizers)
@@ -18,14 +21,29 @@ jobs:
           ctest --preset core-tests
 
   windows:
-    name: Windows (MSVC, static exe)
+    name: Windows (MSVC, static exe, installer)
     runs-on: windows-latest
+    env:
+      # Optional code signing: add these repository secrets to sign the exe
+      # and the installer (Authenticode, SHA-256, RFC 3161 timestamp).
+      SIGNING_CERT: ${{ secrets.SIGNING_CERT_PFX_BASE64 }}
+      SIGNING_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: lukka/get-cmake@latest
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $v = $env:GITHUB_REF_NAME.Substring(1) }
+          else { $v = "3.2-dev." + $env:GITHUB_SHA.Substring(0, 7) }
+          $n = ([regex]::Match($v, '^\d+(\.\d+){0,3}')).Value
+          if (-not $n) { $n = '3.2' }
+          "value=$v" >> $env:GITHUB_OUTPUT
+          "numeric=$n" >> $env:GITHUB_OUTPUT
       - name: Configure (vcpkg, x64-windows-static)
         shell: pwsh
         run: |
@@ -35,7 +53,49 @@ jobs:
         run: cmake --build --preset release
       - name: Core tests
         run: ctest --test-dir build/release --output-on-failure
+      - name: Sign the executable
+        if: env.SIGNING_CERT != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT))
+          signtool sign /f $pfx /p $env:SIGNING_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 build/release/FastImageViewer.exe
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /DAppVersion=${{ steps.version.outputs.value }} /DNumericVersion=${{ steps.version.outputs.numeric }} installer_script.iss
+      - name: Sign the installer
+        if: env.SIGNING_CERT != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          Get-ChildItem installer\*.exe | ForEach-Object {
+            signtool sign /f $pfx /p $env:SIGNING_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+          }
+          Remove-Item $pfx
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item build/release/FastImageViewer.exe, README.md, GETTING_STARTED.md, scripts/install.ps1 portable/
+          Compress-Archive -Path portable/* -DestinationPath FastImageViewer_${{ steps.version.outputs.value }}_portable.zip
       - uses: actions/upload-artifact@v4
         with:
           name: FastImageViewer
-          path: build/release/FastImageViewer.exe
+          path: |
+            build/release/FastImageViewer.exe
+            installer/*.exe
+            FastImageViewer_*_portable.zip
+      - name: Publish the release (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/*.exe
+            FastImageViewer_*_portable.zip
+          generate_release_notes: true
