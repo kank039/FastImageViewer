@@ -57,9 +57,9 @@ void CompanionKinds(const FileEntry& f, bool& raw, bool& xmp) {
 }
 
 // Draws a texture into [pmin, pmax] turned `rot` quarter turns clockwise.
-void AddRotatedImage(ImDrawList* dl, ImTextureID tex, ImVec2 pmin, ImVec2 pmax, int rot) {
+void AddRotatedImage(ImDrawList* dl, ImTextureID tex, ImVec2 pmin, ImVec2 pmax, int rot, ImVec2 uvMax = ImVec2(1, 1)) {
     if ((rot & 3) == 0) {
-        dl->AddImage(tex, pmin, pmax);
+        dl->AddImage(tex, pmin, pmax, ImVec2(0, 0), uvMax);
         return;
     }
     // Texture coordinates shown at the top-left, top-right, bottom-right and bottom-left corners.
@@ -67,7 +67,8 @@ void AddRotatedImage(ImDrawList* dl, ImTextureID tex, ImVec2 pmin, ImVec2 pmax, 
                                      {{0, 1}, {0, 0}, {1, 0}, {1, 1}},
                                      {{1, 1}, {0, 1}, {0, 0}, {1, 0}},
                                      {{1, 0}, {1, 1}, {0, 1}, {0, 0}}};
-    const ImVec2* uv = kUv[rot & 3];
+    ImVec2 uv[4];
+    for (int i = 0; i < 4; ++i) uv[i] = ImVec2(kUv[rot & 3][i].x * uvMax.x, kUv[rot & 3][i].y * uvMax.y);
     dl->AddImageQuad(tex, pmin, ImVec2(pmax.x, pmin.y), pmax, ImVec2(pmin.x, pmax.y), uv[0], uv[1], uv[2], uv[3]);
 }
 
@@ -190,7 +191,7 @@ void App::DrawImage() {
             dl->PushClipRect(g.viewMin, g.viewMax, false);
             if (point) dl->AddCallback(SetPointSampler, &gpu_);
             if (peaking && shown == tex) dl->AddCallback(SetPeakingShader, &gpu_);
-            AddRotatedImage(dl, ToTex(shown->srv.Get()), pmin, pmax, rot);
+            AddRotatedImage(dl, ToTex(shown->srv.Get()), pmin, pmax, rot, shown->uvMax);
             if (point || (peaking && shown == tex)) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
             // The 1:1 detail of a huge image, over the part it covers.
             auto detail = textures_.find({f.id, core::Variant::Detail});
@@ -425,7 +426,7 @@ void App::DrawSidebar() {
                 const int rot = RotationOf(e);
                 ImVec2 o0, o1;
                 FitInBox(Turned(t->size, rot), b0, box, o0, o1);
-                AddRotatedImage(dl, ToTex(t->srv.Get()), o0, o1, rot);
+                AddRotatedImage(dl, ToTex(t->srv.Get()), o0, o1, rot, t->uvMax);
             } else {
                 ImVec4 c(0.18f, 0.18f, 0.20f, 1);
                 if (sched_.IsDecoding({e.id, core::Variant::Fit}) || sched_.IsProbing(e.id)) c = ImVec4(0.45f, 0.36f, 0.15f, 1);
@@ -528,7 +529,7 @@ void App::DrawGrid() {
                     const int rot = RotationOf(e);
                     ImVec2 o0, o1;
                     FitInBox(Turned(t->size, rot), ImVec2(p.x + gap * 0.5f, p.y + gap * 0.5f), cell - gap, o0, o1);
-                    AddRotatedImage(dl, ToTex(t->srv.Get()), o0, o1, rot);
+                    AddRotatedImage(dl, ToTex(t->srv.Get()), o0, o1, rot, t->uvMax);
                 } else {
                     const char* msg = !e.error.empty() ? "Cannot open" : e.CloudOnly() && settings_.skipCloudFiles ? "Online only" : "";
                     if (*msg) {
@@ -588,7 +589,9 @@ void App::DrawSettings() {
             ImGui::SeparatorText("Window");
             cache |= ImGui::SliderInt("Prefetch ahead", &settings_.ahead, 0, core::kMaxAhead, "%d images", ImGuiSliderFlags_AlwaysClamp);
             HelpMarker("Images decoded in advance in the direction you are browsing, so they appear instantly.");
-            cache |= ImGui::SliderInt("Keep behind", &settings_.behind, 0, core::kMaxBehind, "%d images", ImGuiSliderFlags_AlwaysClamp);
+            cache |= ImGui::SliderInt("Keep behind", &settings_.behind, 0,
+                                      settings_.compactHistory ? core::kMaxBehindCompact : core::kMaxBehind, "%d images",
+                                      ImGuiSliderFlags_AlwaysClamp);
             HelpMarker("Images you just viewed stay in memory so stepping back never touches the disk.");
 
             ImGui::SeparatorText("Memory budget");
@@ -628,6 +631,10 @@ void App::DrawSettings() {
             cache |= ImGui::Combo("Resolution", &settings_.decodeMode, modes, 2);
             HelpMarker("Fit to screen decodes each image at your monitor's resolution. Zooming in past that loads the "
                        "full-resolution version of the current image only.");
+            cache |= ImGui::Checkbox("Keep images you have seen compressed (8x smaller)", &settings_.compactHistory);
+            HelpMarker("Images behind you are stored as BC1 textures: up to 48 can be kept for going back. Going back "
+                       "shows the compressed copy instantly (slightly softer gradients) while the full-quality version "
+                       "is decoded again. Images with transparency are kept uncompressed.");
             cache |= ImGui::Checkbox("Release cache when minimized", &settings_.releaseWhenMinimized);
             HelpMarker("Ten seconds after minimizing, everything except the current image is released.");
             cache |= ImGui::Checkbox("Don't prefetch online-only (OneDrive) files", &settings_.skipCloudFiles);
@@ -1057,6 +1064,7 @@ void App::DrawCacheMap(float height) {
         ImVec4 c(0.25f, 0.25f, 0.27f, 1);
         if (sched_.IsProbing(e.id) || sched_.IsDecoding(k)) c = kAmber;
         if (sched_.IsResident(k)) c = kGreen;
+        else if (sched_.IsResident({e.id, core::Variant::Compact})) c = ImVec4(0.30f, 0.65f, 0.60f, 1);
         if (sched_.IsFailed(k) || (e.probed && FAILED(e.probeHr))) c = kRed;
         if (e.CloudOnly() && !sched_.IsResident(k)) c = kBlue;
         dl->AddRectFilled(pos, ImVec2(pos.x + cell, pos.y + cell), ImGui::ColorConvertFloat4ToU32(c), 2 * dpiScale_);
@@ -1077,7 +1085,7 @@ void App::DrawStats() {
     const ProcessMemory pm = QueryProcessMemory();
     ImGui::Text("Cache map  (%s ahead)", direction_ > 0 ? "right" : "left");
     DrawCacheMap(12 * dpiScale_);
-    TextDim("green ready  amber loading  red failed  blue online-only  grey not loaded");
+    TextDim("green ready  teal compressed  amber loading  red failed  blue online-only  grey not loaded");
     ImGui::Separator();
     if (caps_.unified) {
         ImGui::Text("Images: %s / %s (shared RAM)", FormatBytes(sched_.ResidentGpu()).c_str(), FormatBytes(limits_.ram).c_str());

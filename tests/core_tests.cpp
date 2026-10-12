@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "../src/core/Animation.h"
+#include "../src/core/Bc1.h"
 #include "../src/core/CacheWindow.h"
 #include "../src/core/DecodePlan.h"
 #include "../src/core/Exif.h"
@@ -819,6 +820,60 @@ static void TestRegion() {
     CHECK(q != p);
 }
 
+static void TestBc1() {
+    std::puts("bc1");
+    CHECK((BlockPadded({5, 8}) == Size{8, 8}) && Bc1LevelBytes({5, 8}) == 32 && Bc1LevelBytes({1, 1}) == 8);
+    // A screen-sized plan compresses to an eighth (plus padding).
+    PlanRequest r;
+    r.source = {6000, 4000};
+    r.target = {1920, 1080};
+    const DecodePlan fit = PlanDecode(r), c = PlanCompact(fit);
+    CHECK(c.valid() && c.compressed && c.size == fit.size && c != fit);
+    CHECK(c.gpuBytes * 7 < fit.gpuBytes && c.gpuBytes * 9 > fit.gpuBytes);
+    // Its transient memory includes the BGRA chain it is built from.
+    TransientRequest tq;
+    tq.stored = {6000, 4000};
+    tq.plan = c;
+    tq.readIntoMemory = false;
+    CHECK(TransientBytes(tq) > MipChainBytes(fit.size, fit.mipLevels));
+
+    // Round trip: flat colours come back almost exactly, a gradient within a
+    // few levels, and a two-colour block keeps both colours.
+    const Size s{10, 7};  // not a multiple of 4
+    std::vector<uint8_t> img(size_t(s.w) * s.h * 4), back(img.size()), blocks(Bc1LevelBytes(s));
+    for (uint32_t y = 0; y < s.h; ++y)
+        for (uint32_t x = 0; x < s.w; ++x) {
+            uint8_t* p = &img[(y * s.w + x) * 4];
+            p[0] = uint8_t(40 + x * 12);  // B gradient
+            p[1] = 128;
+            p[2] = uint8_t(200 - y * 10);
+            p[3] = 255;
+        }
+    EncodeBc1(img.data(), s, blocks.data());
+    DecodeBc1(blocks.data(), s, back.data());
+    int worst = 0, sum = 0;
+    for (size_t i = 0; i < img.size(); ++i) {
+        const int d = std::abs(int(img[i]) - int(back[i]));
+        worst = std::max(worst, d);
+        sum += d;
+    }
+    std::printf("  bc1 gradient error: mean %.2f, worst %d\n", double(sum) / double(img.size()), worst);
+    CHECK(sum <= int(img.size()) * 5 && worst <= 32);  // BC1 is lossy: a 2D gradient within a block is approximated
+    std::vector<uint8_t> two(16 * 4);
+    for (int i = 0; i < 16; ++i) {
+        const bool white = (i & 1) != 0;
+        two[i * 4 + 0] = two[i * 4 + 1] = two[i * 4 + 2] = white ? 255 : 0;
+        two[i * 4 + 3] = 255;
+    }
+    std::vector<uint8_t> twoBack(two.size()), twoBlocks(8);
+    EncodeBc1(two.data(), {4, 4}, twoBlocks.data());
+    DecodeBc1(twoBlocks.data(), {4, 4}, twoBack.data());
+    CHECK(twoBack == two);
+    CHECK(!HasAlpha(img.data(), s));
+    img[3] = 200;
+    CHECK(HasAlpha(img.data(), s));
+}
+
 static void TestKeys() {
     std::puts("keys");
     for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
@@ -872,6 +927,7 @@ int main() {
     TestGroups();
     TestExifInfo();
     TestHistogram();
+    TestBc1();
     TestRegion();
     TestAnimation();
     TestOrganize();

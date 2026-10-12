@@ -23,6 +23,7 @@ add_library(fiv_core STATIC
     src/core/Marks.cpp
     src/core/Organize.cpp
     src/core/Animation.cpp
+    src/core/Bc1.cpp
     src/core/MemoryLimits.cpp
     src/core/Pixels.cpp
     src/core/Scheduler.cpp

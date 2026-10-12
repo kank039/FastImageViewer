@@ -44,9 +44,10 @@ struct DecodePlan {
     uint32_t mipLevels = 0;
     uint64_t gpuBytes = 0;  // texture memory including the mip chain
     Rect region;            // detail decode: this part of the (oriented) image at 1:1; empty = all of it
+    bool compressed = false;  // BC1 (see Bc1.h): mips of the image padded to whole 4x4 blocks
     bool valid() const { return !size.empty() && mipLevels > 0; }
     bool operator==(const DecodePlan& o) const {
-        return size == o.size && mipLevels == o.mipLevels && region == o.region;
+        return size == o.size && mipLevels == o.mipLevels && region == o.region && compressed == o.compressed;
     }
     bool operator!=(const DecodePlan& o) const { return !(*this == o); }
 };

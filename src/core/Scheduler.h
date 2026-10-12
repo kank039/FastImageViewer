@@ -18,8 +18,9 @@
 namespace fiv::core {
 
 // Fit: screen-sized; Full: full resolution when zoomed in; Thumb: grid and
-// sidebar thumbnails; Detail: the visible part of a huge image at 1:1.
-enum class Variant : uint8_t { Fit = 0, Full = 1, Thumb = 2, Detail = 3 };
+// sidebar thumbnails; Detail: the visible part of a huge image at 1:1;
+// Compact: a BC1-compressed screen-sized copy of an image already seen.
+enum class Variant : uint8_t { Fit = 0, Full = 1, Thumb = 2, Detail = 3, Compact = 4 };
 
 struct EntryKey {
     uint64_t item = 0;  // file version id (changes when the file changes)
@@ -28,7 +29,7 @@ struct EntryKey {
 };
 
 struct EntryKeyHash {
-    size_t operator()(const EntryKey& k) const { return std::hash<uint64_t>()(k.item * 4 + uint64_t(k.variant)); }
+    size_t operator()(const EntryKey& k) const { return std::hash<uint64_t>()(k.item * 8 + uint64_t(k.variant)); }
 };
 
 struct Want {

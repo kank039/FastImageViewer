@@ -28,6 +28,7 @@ struct Settings {
     int decodeMode = int(DecodeMode::FitScreen);
     bool releaseWhenMinimized = true;
     bool skipCloudFiles = true;
+    bool compactHistory = false;  // images behind you are kept BC1-compressed (8x smaller)
 
     // Display
     int backdrop = int(Backdrop::Mica);
@@ -79,6 +80,7 @@ struct Settings {
 
 constexpr int kMaxAhead = 16;
 constexpr int kMaxBehind = 16;
+constexpr int kMaxBehindCompact = 48;  // with compressed history (8x smaller each)
 constexpr uint32_t kMinBudgetMB = 64;
 
 // Clamps every field to its legal range; budgets are limited to the hardware caps.

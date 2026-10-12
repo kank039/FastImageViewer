@@ -49,6 +49,18 @@ private:
         std::shared_ptr<const core::Histogram> histogram;
         bool hdr = false, colorConverted = false;
         core::Rect region;  // Detail textures: the part of the image they hold
+        ImVec2 uvMax{1, 1};  // compressed textures are padded to whole 4x4 blocks
+    };
+    // A screen-sized texture being copied back for compression (Compact variant).
+    struct Readback {
+        uint64_t job = 0;
+        core::EntryKey key;
+        core::DecodePlan plan;
+        ComPtr<ID3D11Texture2D> staging;
+        std::shared_ptr<const core::Histogram> histogram;
+        uint64_t gen = 0;
+        int rank = 0;
+        bool cancelled = false;
     };
     // Animated GIF of the image on screen: one job at a time composites the
     // next frame; its RAM and VRAM are reserved from the budget while it plays.
@@ -116,6 +128,8 @@ private:
     void MarkSettingsDirty() { settingsDirtyAt_ = NowMs(); }
     void OnCacheSettingsChanged();
     void FlushCache();  // drop every decoded image (colour settings changed)
+    void StartTranscode(uint64_t job, const core::EntryKey& key, const core::DecodePlan& plan, const Texture& from, int rank);
+    void PumpReadbacks();
     // Animation
     void UpdateAnimation();
     void StopAnimation();
@@ -326,6 +340,7 @@ private:
     int sidebarFirst_ = 0, sidebarLast_ = -1;  // view positions drawn in the sidebar
     bool peaking_ = false;
     Animation anim_;
+    std::vector<Readback> readbacks_;
     // Detail for huge images: requested once the view has been still briefly.
     uint64_t viewChangedAt_ = 0;
     uint64_t detailCheckAt_ = 0;

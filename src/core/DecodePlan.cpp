@@ -135,8 +135,14 @@ uint64_t TransientBytes(const TransientRequest& r) {
         }
     }
     if (r.reorients) total += level0;  // pre-rotation scratch
-    total += r.plan.gpuBytes;          // CPU mip chain handed to the GPU
-    total += r.plan.gpuBytes;          // driver upload copy (short-lived)
+    if (r.plan.compressed) {
+        // Decoded image, its block-padded BGRA mip chain, the BC1 chain and its upload copy.
+        const Size pad{(r.plan.size.w + 3) / 4 * 4, (r.plan.size.h + 3) / 4 * 4};
+        total += level0 + MipChainBytes(pad, r.plan.mipLevels) + 2 * r.plan.gpuBytes;
+    } else {
+        total += r.plan.gpuBytes;  // CPU mip chain handed to the GPU
+        total += r.plan.gpuBytes;  // driver upload copy (short-lived)
+    }
     // Codec working memory, proportional to the stored image: about 2 bytes per
     // pixel in general, up to 6 for progressive JPEG (a 16-bit coefficient per
     // sample for every block, 4:4:4 worst case), which DCT scaling does not reduce.

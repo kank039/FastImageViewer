@@ -66,6 +66,12 @@ struct DecodeResult {
 DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate, const DecodeRequest& req,
                          const CancelFlag& cancel);
 
+// BC1 texture (plan.compressed) from a decoded BGRA image of plan.size, e.g.
+// read back from a texture that is leaving the screen. E_NOTIMPL for images
+// with transparency. Memory: the padded BGRA mip chain plus the BC1 chain.
+DecodeResult CompressImage(ID3D11Device* device, const uint8_t* level0, const core::DecodePlan& plan,
+                           const CancelFlag& cancel);
+
 // Lower-case extensions (".jpg") that installed WIC decoders claim.
 std::set<std::wstring> InstalledDecoderExtensions();
 

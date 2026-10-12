@@ -12,7 +12,7 @@ static uint32_t ToMB(uint64_t bytes) { return uint32_t(bytes / kMiB); }
 
 void Validate(Settings& s, const MemoryCaps& caps) {
     s.ahead = std::clamp(s.ahead, 0, kMaxAhead);
-    s.behind = std::clamp(s.behind, 0, kMaxBehind);
+    s.behind = std::clamp(s.behind, 0, s.compactHistory ? kMaxBehindCompact : kMaxBehind);
     s.overlayCorner = std::clamp(s.overlayCorner, 0, 3);
     s.sidebarWidth = std::clamp(s.sidebarWidth, 160, 900);
     s.thumbHeight = std::clamp(s.thumbHeight, 32, 240);
@@ -64,6 +64,7 @@ std::vector<Field> Fields(Settings& s) {
         {"decodeMode", Field::Int, &s.decodeMode},
         {"releaseWhenMinimized", Field::Bool, &s.releaseWhenMinimized},
         {"skipCloudFiles", Field::Bool, &s.skipCloudFiles},
+        {"compactHistory", Field::Bool, &s.compactHistory},
         {"backdrop", Field::Int, &s.backdrop},
         {"upscaleSmall", Field::Bool, &s.upscaleSmall},
         {"pixelatedZoom", Field::Bool, &s.pixelatedZoom},

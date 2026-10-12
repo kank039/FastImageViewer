@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "../core/Bc1.h"
 #include "../platform/FileOps.h"
 #include "../platform/Shell.h"
 
@@ -127,6 +128,7 @@ void App::Shutdown() {
         completions_.clear();  // drops any textures produced after shutdown began
     }
     textures_.clear();
+    readbacks_.clear();
     preview_ = {};
     if (ImGui::GetCurrentContext()) {
         ImGui_ImplDX11_Shutdown();
@@ -225,6 +227,17 @@ void App::RecreateDevice() {
     StopAnimation();
     suspended_ = true;
     ++deviceGen_;  // anything still running finishes on the old device and is discarded
+    for (const Readback& rb : readbacks_) {
+        const uint64_t job = rb.job, gen = rb.gen;
+        const core::EntryKey key = rb.key;
+        const core::DecodePlan plan = rb.plan;
+        Post([this, job, key, plan, gen] {
+            DecodeResult r;
+            r.hr = E_ABORT;
+            OnDecodeResult(job, key, plan, r, 0, gen);
+        });
+    }
+    readbacks_.clear();
     jobs_.CancelAll();
     DrainCompletions();
     sched_.Clear();
@@ -1388,10 +1401,36 @@ std::vector<core::Want> App::BuildWants() {
             addWant(visible[t], int(t), true, int(t));
             covered[size_t(visible[t])] = true;
         }
+        // Compressed history: images behind you are kept as BC1 copies (an eighth
+        // of the memory). The full copy stays until the compressed one exists, so
+        // it is transcoded on the GPU's copy instead of being read again.
+        auto addCompact = [&](int index, int rank, bool keepOnly) {
+            FileEntry& f = FileAt(index);
+            const core::EntryKey ck{f.id, core::Variant::Compact}, fk{f.id, core::Variant::Fit};
+            if (!(f.probed && SUCCEEDED(f.probeHr)) || sched_.IsFailed(ck)) return false;
+            if (keepOnly && !sched_.IsResident(ck)) return false;
+            const core::DecodePlan plan = core::PlanCompact(PlanFor(f, core::Variant::Fit, PerImageCap()));
+            if (!plan.valid()) return false;
+            core::Want w;
+            w.key = ck;
+            w.rank = rank;
+            w.sizeKnown = true;
+            w.plan = plan;
+            w.transientBytes = TransientFor(f, plan);
+            w.mayLoad = f.retryAt <= now && !(settings_.skipCloudFiles && f.CloudOnly());
+            out.push_back(w);
+            if (!keepOnly && !sched_.IsResident(ck) && (sched_.IsResident(fk) || sched_.IsDecoding(fk)))
+                addWant(index, rank, false, 0);
+            return true;
+        };
+        if (settings_.compactHistory)  // the image on screen keeps its compressed copy until the full one is back
+            for (size_t t = 0; t < visible.size(); ++t)
+                if (!sched_.IsResident({FileAt(visible[t]).id, core::Variant::Fit})) addCompact(visible[t], tiles, true);
         for (const core::WindowSlot& slot : core::ComputeWindow(p)) {
             if (covered[size_t(slot.index)]) continue;
-            addWant(slot.index, 2 * tiles + slot.rank, false, 0);
             covered[size_t(slot.index)] = true;
+            const bool behind = settings_.compactHistory && slot.offset * direction_ < 0;
+            if (!behind || !addCompact(slot.index, 2 * tiles + slot.rank, false)) addWant(slot.index, 2 * tiles + slot.rank, false, 0);
         }
         nextRank = 2 * tiles + p.ahead + p.behind + 1;
         // Sidebar rows outside the prefetch window get small thumbnails, after everything else.
@@ -1577,6 +1616,13 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen
 }
 
 void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::DecodePlan& plan, int rank) {
+    if (key.variant == core::Variant::Compact) {
+        auto fit = textures_.find({key.item, core::Variant::Fit});
+        if (fit != textures_.end() && fit->second.size == plan.size && fit->second.srv) {
+            StartTranscode(job, key, plan, fit->second, rank);
+            return;
+        }
+    }
     const FileEntry* f = folder_.FindById(key.item);
     if (!f) {
         Post([this, job, key, plan] {
@@ -1627,7 +1673,12 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
     const bool keep = sched_.OnDecodeDone(job, outcome);
     const uint64_t curId = Current() ? Current()->id : 0;
     if (keep) {
-        textures_[key] = {r.srv, plan.size, r.histogram, r.hdr, r.colorConverted, plan.region};
+        ImVec2 uvMax(1, 1);
+        if (plan.compressed) {
+            const core::Size pad = core::BlockPadded(plan.size);
+            uvMax = ImVec2(float(plan.size.w) / float(pad.w), float(plan.size.h) / float(pad.h));
+        }
+        textures_[key] = {r.srv, plan.size, r.histogram, r.hdr, r.colorConverted, plan.region, uvMax};
         ++decodes_;
         lastDecodeMs_ = r.ms;
         if (bytesRead) {
@@ -1642,7 +1693,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
     }
     if (FileEntry* f = folder_.FindById(key.item)) {
         if (keep && r.sharpness >= 0) f->sharpness = r.sharpness;
-        if (outcome == core::Outcome::Failed) f->error = DescribeError(r.hr);
+        if (outcome == core::Outcome::Failed && key.variant != core::Variant::Compact) f->error = DescribeError(r.hr);
         if (outcome == core::Outcome::Retry) {
             f->retryAt = NowMs() + kRetryMs;
             if (r.hr == HRESULT_FROM_WIN32(ERROR_FILE_INVALID)) {
@@ -1663,7 +1714,94 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
     if (gpu_.Context()) gpu_.Context()->Flush();
 }
 
-void App::CancelJob(uint64_t job) { jobs_.Cancel(job); }
+void App::CancelJob(uint64_t job) {
+    jobs_.Cancel(job);
+    for (auto& rb : readbacks_)
+        if (rb.job == job) rb.cancelled = true;
+}
+
+void App::StartTranscode(uint64_t job, const core::EntryKey& key, const core::DecodePlan& plan, const Texture& from,
+                         int rank) {
+    auto fail = [&](HRESULT hr) {
+        const uint64_t gen = deviceGen_;
+        Post([this, job, key, plan, hr, gen] {
+            DecodeResult r;
+            r.hr = hr;
+            r.retry = hr == E_OUTOFMEMORY;
+            OnDecodeResult(job, key, plan, r, 0, gen);
+        });
+    };
+    ComPtr<ID3D11Resource> res;
+    from.srv->GetResource(&res);
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = plan.size.w;
+    d.Height = plan.size.h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging;
+    if (!res || FAILED(gpu_.Device()->CreateTexture2D(&d, nullptr, &staging))) {
+        fail(E_OUTOFMEMORY);
+        return;
+    }
+    // Level 0 only: the mips are rebuilt for the padded size anyway.
+    gpu_.Context()->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, res.Get(), 0, nullptr);
+    gpu_.Context()->Flush();
+    readbacks_.push_back({job, key, plan, staging, from.histogram, deviceGen_, rank, false});
+}
+
+// Copies finished GPU readbacks to RAM (never waiting on the GPU) and hands
+// them to a worker for BC1 compression.
+void App::PumpReadbacks() {
+    for (auto it = readbacks_.begin(); it != readbacks_.end();) {
+        Readback& rb = *it;
+        HRESULT hr = rb.cancelled ? E_ABORT : S_OK;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(hr)) {
+            hr = gpu_.Context()->Map(rb.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+                ++it;
+                continue;
+            }
+        }
+        std::shared_ptr<uint8_t[]> pixels;
+        if (SUCCEEDED(hr)) {
+            const uint32_t w = rb.plan.size.w, h = rb.plan.size.h;
+            pixels.reset(new (std::nothrow) uint8_t[size_t(w) * h * 4]);
+            if (pixels)
+                for (uint32_t y = 0; y < h; ++y)
+                    std::memcpy(pixels.get() + size_t(y) * w * 4, static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch,
+                                size_t(w) * 4);
+            else
+                hr = E_OUTOFMEMORY;
+            gpu_.Context()->Unmap(rb.staging.Get(), 0);
+        }
+        const uint64_t job = rb.job, gen = rb.gen;
+        const core::EntryKey key = rb.key;
+        const core::DecodePlan plan = rb.plan;
+        auto histogram = rb.histogram;
+        if (FAILED(hr)) {
+            Post([this, job, key, plan, hr, gen] {
+                DecodeResult r;
+                r.hr = hr;
+                r.retry = hr == E_OUTOFMEMORY;
+                OnDecodeResult(job, key, plan, r, 0, gen);
+            });
+        } else {
+            ComPtr<ID3D11Device> device = gpu_.Device();
+            jobs_.Submit(job, rb.rank, [this, job, key, plan, pixels, histogram, device, gen](WorkerContext&, const CancelFlag& cancel) {
+                BackgroundMode bg(true);
+                DecodeResult r = CompressImage(device.Get(), pixels.get(), plan, cancel);
+                if (histogram) r.histogram = histogram;
+                Post([this, job, key, plan, r, gen] { OnDecodeResult(job, key, plan, r, 0, gen); });
+            });
+        }
+        it = readbacks_.erase(it);
+    }
+}
 
 void App::SetJobPriority(uint64_t job, int rank) {
     jobs_.SetPriority(job, rank);
@@ -1679,7 +1817,7 @@ void App::ReleaseEntry(const core::EntryKey& key) {
 }
 
 const App::Texture* App::ThumbFor(uint64_t item) const {
-    for (core::Variant v : {core::Variant::Thumb, core::Variant::Fit, core::Variant::Full}) {
+    for (core::Variant v : {core::Variant::Thumb, core::Variant::Fit, core::Variant::Full, core::Variant::Compact}) {
         auto it = textures_.find({item, v});
         if (it != textures_.end()) return &it->second;
     }
@@ -1691,6 +1829,8 @@ const App::Texture* App::TextureFor(uint64_t item) const {
     if (full != textures_.end()) return &full->second;
     auto fit = textures_.find({item, core::Variant::Fit});
     if (fit != textures_.end()) return &fit->second;
+    auto compact = textures_.find({item, core::Variant::Compact});
+    if (compact != textures_.end()) return &compact->second;
     return nullptr;
 }
 
@@ -2053,6 +2193,7 @@ void App::Tick() {
         trimmed_ = true;
         UpdateCache();
     }
+    if (!readbacks_.empty() && gpu_.Alive() && !suspended_) PumpReadbacks();
     if (detailCheckAt_ && now >= detailCheckAt_) {
         detailCheckAt_ = 0;
         UpdateCache();  // the view settled: maybe a sharper detail is due
@@ -2100,6 +2241,7 @@ void App::Tick() {
     if (burstWaitStart_ >= 0) consider(burstWaitUntil_);
     if (anim_.playing && !anim_.busy && !minimized_) consider(anim_.nextAt);
     if (detailCheckAt_) consider(detailCheckAt_);
+    if (!readbacks_.empty()) consider(now + 2);  // the GPU copy finishes within a frame or two
     wakeAt_ = w;
 }
 

@@ -1,5 +1,6 @@
 #include "WicCodec.h"
 
+#include "../core/Bc1.h"
 #include "../core/Organize.h"
 
 #include <propidl.h>
@@ -89,6 +90,31 @@ HRESULT CreateTexture(ID3D11Device* device, const uint8_t* chain, Size size, uin
         init[i].pSysMem = p;
         init[i].SysMemPitch = l.w * 4;
         p += size_t(l.w) * l.h * 4;
+    }
+    ComPtr<ID3D11Texture2D> tex;
+    HRESULT hr = device->CreateTexture2D(&d, init.data(), &tex);
+    if (SUCCEEDED(hr)) hr = device->CreateShaderResourceView(tex.Get(), nullptr, &out);
+    return hr;
+}
+
+HRESULT CreateBc1Texture(ID3D11Device* device, const uint8_t* blocks, Size padded, uint32_t levels,
+                         ComPtr<ID3D11ShaderResourceView>& out) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = padded.w;
+    d.Height = padded.h;
+    d.MipLevels = levels;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_BC1_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_IMMUTABLE;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<D3D11_SUBRESOURCE_DATA> init(levels);
+    const uint8_t* p = blocks;
+    for (uint32_t i = 0; i < levels; ++i) {
+        const Size l = core::MipLevelSize(padded, i);
+        init[i].pSysMem = p;
+        init[i].SysMemPitch = (l.w + 3) / 4 * 8;
+        p += core::Bc1LevelBytes(l);
     }
     ComPtr<ID3D11Texture2D> tex;
     HRESULT hr = device->CreateTexture2D(&d, init.data(), &tex);
@@ -378,6 +404,61 @@ ProbeResult ProbeImage(WorkerContext& ctx, ID3D11Device* thumbDevice, const std:
     return r;
 }
 
+DecodeResult CompressImage(ID3D11Device* device, const uint8_t* level0, const core::DecodePlan& plan,
+                           const CancelFlag& cancel) {
+    DecodeResult res;
+    const Size s = plan.size, pad = core::BlockPadded(s);
+    if (!plan.compressed || !plan.valid()) {
+        res.hr = E_INVALIDARG;
+        return res;
+    }
+    if (core::HasAlpha(level0, s)) {  // BC1 cannot keep it: stays uncompressed
+        res.hr = E_NOTIMPL;
+        return res;
+    }
+    // Block-padded BGRA mip chain (edges repeated), then BC1 level by level.
+    std::unique_ptr<uint8_t[]> chain = Alloc(core::MipChainBytes(pad, plan.mipLevels));
+    std::unique_ptr<uint8_t[]> blocks = Alloc(plan.gpuBytes);
+    if (!chain || !blocks) {
+        res.hr = E_OUTOFMEMORY;
+        res.retry = true;
+        return res;
+    }
+    for (uint32_t y = 0; y < pad.h; ++y) {
+        const uint8_t* src = level0 + size_t(std::min(y, s.h - 1)) * s.w * 4;
+        uint8_t* dst = chain.get() + size_t(y) * pad.w * 4;
+        std::memcpy(dst, src, size_t(s.w) * 4);
+        for (uint32_t x = s.w; x < pad.w; ++x) std::memcpy(dst + size_t(x) * 4, src + size_t(s.w - 1) * 4, 4);
+    }
+    core::GenerateMips(chain.get(), pad, plan.mipLevels);
+    if (cancel) {
+        res.hr = E_ABORT;
+        return res;
+    }
+    {
+        const uint32_t level = core::HistogramLevel(pad, plan.mipLevels);
+        auto h = std::make_shared<core::Histogram>();
+        core::ComputeHistogram(chain.get() + core::MipChainBytes(pad, level), core::MipLevelSize(pad, level), *h);
+        res.histogram = std::move(h);
+    }
+    const uint8_t* in = chain.get();
+    uint8_t* out = blocks.get();
+    for (uint32_t i = 0; i < plan.mipLevels; ++i) {
+        const Size l = core::MipLevelSize(pad, i);
+        core::EncodeBc1(in, l, out);
+        in += size_t(l.w) * l.h * 4;
+        out += core::Bc1LevelBytes(l);
+    }
+    chain.reset();
+    if (cancel) {
+        res.hr = E_ABORT;
+        return res;
+    }
+    res.hr = CreateBc1Texture(device, blocks.get(), pad, plan.mipLevels, res.srv);
+    if (res.hr == E_OUTOFMEMORY) res.retry = true;
+    return res;
+}
+
 DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate, const DecodeRequest& req,
                          const CancelFlag& cancel) {
     DecodeResult res;
@@ -562,7 +643,9 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
     }
 
     // 4. Pull pixels in bands so a cancelled job stops within milliseconds.
-    std::unique_ptr<uint8_t[]> chain = Alloc(req.plan.gpuBytes);
+    // A compressed plan first decodes just level 0 (BGRA); CompressImage does the rest.
+    std::unique_ptr<uint8_t[]> chain =
+        Alloc(req.plan.compressed ? uint64_t(req.plan.size.w) * req.plan.size.h * 4 : req.plan.gpuBytes);
     if (!chain) return fail(E_OUTOFMEMORY, true);
     std::unique_ptr<uint8_t[]> scratch;
     uint8_t* dst = chain.get();
@@ -611,6 +694,12 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         core::ApplyOrientation(reinterpret_cast<const uint32_t*>(scratch.get()), want, req.orientation,
                                reinterpret_cast<uint32_t*>(chain.get()));
         scratch.reset();
+    }
+    if (req.plan.compressed) {
+        DecodeResult c = CompressImage(device, chain.get(), req.plan, cancel);
+        QueryPerformanceCounter(&t1);
+        c.ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
+        return c;
     }
     core::GenerateMips(chain.get(), req.plan.size, req.plan.mipLevels);
     if (!region) {  // Histogram from a <=512 px mip level: ~4 KB, no extra decoding.
