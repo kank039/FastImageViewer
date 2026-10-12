@@ -49,6 +49,10 @@ Workflow (v3.2)
     [x] Animated GIF, 1:1 detail for huge images, BC1 compressed history
     [x] CI installer, optional code signing, releases on tags
 
+Discoverability & safety (v3.3)
+    [x] Command palette, context menu, welcome card with presets
+    [x] Quit guard for unapplied marks, undo button and undo history
+
 Ideas for later
     [ ] Animated WebP playback
     [ ] True HDR output (scRGB swap chain) on HDR monitors

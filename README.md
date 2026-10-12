@@ -14,6 +14,8 @@ Tech: C++20, Win32, Direct3D 11 + DirectComposition (Mica), WIC (Windows Imaging
 
 Open an image from Explorer ("Open with"), drag one onto the window, or press **Ctrl+O**. A second launch hands the file to the open window. Every key below can be changed in **Settings → Controls**; **H** shows the current list.
 
+Don't remember a key? Press **Ctrl+K** and type what you want ("rotate", "burst", "move to keepers", "sort by date"), or **right-click** the image for a menu. The first launch shows a short welcome with a *browsing* or *culling* preset.
+
 | Keys (defaults) | Action |
 |---|---|
 | → ↓ Space / ← ↑ Backspace | Next / previous |
@@ -31,7 +33,8 @@ Open an image from Explorer ("Open with"), drag one onto the window, or press **
 | Ctrl+F | Show: all, picks, rated, unmarked, rejects |
 | Shift+P | Marks panel: counts, filter, batch move / delete / copy paths |
 | Delete, 1 … 9 | Recycle Bin / move to destination 1 … 9, together with its RAW/XMP |
-| Ctrl+Z | Undo the last delete or move, including whole batches (up to 50) |
+| Ctrl+Z, Ctrl+H | Undo the last delete or move, including whole batches (up to 50) / undo history. The message after a move also has an Undo button |
+| Ctrl+K | Command palette: find and run any command by name |
 | L | Slideshow |
 | Ctrl+C / Ctrl+Shift+C | Copy the image / its path |
 | Ctrl+E / E | Show in Explorer / open in your editor (or "Open with") |
@@ -42,7 +45,7 @@ Touch screens: pinch to zoom, drag to pan, swipe sideways for the next image, tw
 
 ### Culling workflow
 
-- **Mark as you go:** **P** picks, **X** rejects, **Ctrl+1–5** rates; the next image follows automatically (optional). Marks live in memory for this session only: nothing is written to your files. **Ctrl+F** narrows the view to picks, rated, unmarked or rejects; prefetching follows the filtered order.
+- **Mark as you go:** **P** picks, **X** rejects, **Ctrl+1–5** rates; the next image follows automatically (optional). Marks live in memory for this session only: nothing is written to your files. If you try to quit with marks you haven't applied, the viewer asks first. **Ctrl+F** narrows the view to picks, rated, unmarked or rejects; prefetching follows the filtered order.
 - **Apply in one go:** **Shift+P** opens the marks panel. Move all picks to destination 2, send all rejects to the Recycle Bin, or copy their paths. A batch is one Windows operation and one **Ctrl+Z**.
 - **Bursts:** shots from one camera within 2 s (adjustable) get a coloured bar in the sidebar and grid. **Shift+C** shows the burst side by side and marks the sharpest (a focus score of the decoded image). **K** shows focus peaking on any image.
 - **Compare** any images with **C**. Zoom into the eyes on one and every tile follows.

@@ -1,3 +1,11 @@
+Fast Image Viewer – v3.3 "discoverable"
+
+    Command palette (Ctrl+K): fuzzy search over every command with its current key, destinations by name, sort orders, filters, common settings and the browsing / culling presets.
+    Right-click menu on the image, grid and sidebar.
+    First-run welcome card with the essential keys and a browsing or culling preset.
+    Quitting with marks you haven't applied asks first (marks are still session only); the question can be turned off.
+    The message after a delete or move has an Undo button, and Ctrl+H shows the undo history, where any step can be undone along with everything newer.
+
 Fast Image Viewer – v3.2 "workflow"
 
 Culling
