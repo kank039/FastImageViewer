@@ -11,6 +11,7 @@
 #include <cmath>
 
 #include "../platform/FileOps.h"
+#include "../platform/Shell.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -116,6 +117,7 @@ int App::Run(HINSTANCE inst, const std::wstring& initialPath) {
 
 void App::Shutdown() {
     if (!hwnd_ && !gpu_.Alive()) return;
+    StopSlideshow();
     if (settingsDirtyAt_ || hwnd_) SaveSettingsNow();
     watcher_.Stop();
     jobs_.Stop();
@@ -255,6 +257,21 @@ void App::LoadSettings() {
         core::Deserialize(text, settings_);
         lastSavedSettings_ = text;
     }
+    RebuildKeyMap();
+}
+
+void App::RebuildKeyMap() { keymap_.Build(settings_.keyBindings); }
+
+void App::SetBindings(core::Action a, const std::vector<core::Chord>& chords) {
+    const core::ActionInfo& info = core::InfoFor(a);
+    std::vector<core::Chord> defaults;
+    core::ParseChords(info.defaults, defaults);
+    if (chords == defaults)
+        settings_.keyBindings.erase(info.id);
+    else
+        settings_.keyBindings[info.id] = core::ChordsToString(chords);
+    RebuildKeyMap();
+    MarkSettingsDirty();
 }
 
 void App::SaveSettingsNow() {
@@ -407,6 +424,7 @@ void App::JumpTo(int index, int direction) {
     lastNavMs_ = NowMs();
     settleArmed_ = true;
     scrollSidebarToCurrent_ = true;
+    slideShownAt_ = 0;  // a slide's time starts when it appears
     activeTile_ = std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1));
     if (compareCount_ == 1)
         ResetView();
@@ -722,6 +740,108 @@ void App::ToggleFullscreen() {
     }
     ResetView();
     RequestFrames();
+}
+
+// ---- Rotation, slideshow, clipboard ------------------------------------------------
+
+int App::RotationOf(const FileEntry& f) const {
+    if (rotation_.empty()) return 0;
+    auto it = rotation_.find(ToLower(f.path));
+    return it == rotation_.end() ? 0 : it->second;
+}
+
+void App::Rotate(int quarterTurns) {
+    const FileEntry* f = Active();
+    if (!f) return;
+    const int r = (RotationOf(*f) + quarterTurns) & 3;
+    if (r == 0)
+        rotation_.erase(ToLower(f->path));
+    else
+        rotation_[ToLower(f->path)] = r;
+    if (compareCount_ == 1) ResetView();
+    static const char* kAngles[] = {"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
+    Toast(std::string("Rotated to ") + kAngles[r] + "  \xC2\xB7  view only, the file is not changed");
+    RequestFrames();
+}
+
+void App::ToggleSlideshow() {
+    if (slideshow_) {
+        StopSlideshow();
+        Toast("Slideshow stopped");
+        return;
+    }
+    if (folder_.Count() < 2) return;
+    if (compareCount_ > 1) SetCompare(1);
+    slideshow_ = true;
+    slideShownAt_ = 0;
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);  // no screen saver while it runs
+    Toast("Slideshow: " + std::to_string(settings_.slideshowSeconds) + " s per image  \xC2\xB7  L or Esc stops");
+}
+
+void App::StopSlideshow() {
+    if (!slideshow_) return;
+    slideshow_ = false;
+    SetThreadExecutionState(ES_CONTINUOUS);
+    RequestFrames();
+}
+
+void App::CopyActivePath() {
+    const FileEntry* f = Active();
+    if (!f) return;
+    Toast(CopyTextToClipboard(hwnd_, f->path) ? "Copied the file path" : "Could not open the clipboard");
+}
+
+void App::CopyActiveImage() {
+    const FileEntry* f = Active();
+    if (!f) return;
+    if (copying_) {
+        Toast("Still copying the previous image...");
+        return;
+    }
+    // Three buffers of the image exist at once (decoded, rotated, clipboard copy):
+    // all of it is reserved from the decode budget first, so the cache makes room.
+    // Larger images are scaled down to fit (at most 256 MB, a 64-megapixel image).
+    const uint64_t need = f->probed && SUCCEEDED(f->probeHr) ? uint64_t(f->stored.w) * f->stored.h * 4 : 0;
+    uint64_t perBuffer = std::min<uint64_t>(sched_.TransientRoom(limits_) / 3, 256 * core::kMiB);
+    if (need) perBuffer = std::min(perBuffer, need);
+    if (perBuffer < std::min<uint64_t>(need ? need : 4 * core::kMiB, 4 * core::kMiB)) {
+        Toast("Not enough free memory to copy the image right now");
+        return;
+    }
+    const uint64_t reserve = perBuffer * 3;
+    sched_.ReserveTransient(reserve);
+    copying_ = true;
+    const uint64_t job = nextOwnJob_++;
+    copyJob_ = job;
+    const std::wstring path = f->path;
+    const int orientation = f->orientation, rotation = RotationOf(*f);
+    const std::string name = ToUtf8(f->name);
+    jobs_.Submit(job, 2, [this, path, orientation, rotation, perBuffer, reserve, name](WorkerContext& ctx,
+                                                                                         const CancelFlag& cancel) {
+        ClipboardImage img;
+        img.hr = E_ABORT;
+        if (!cancel) {
+            IoGateLock io(gate_, 2, cancel);
+            if (io.held()) img = BuildClipboardImage(ctx.wic, path, orientation, rotation, perBuffer);
+        }
+        Post([this, img, reserve, name]() mutable {
+            sched_.ReleaseTransient(reserve);
+            copying_ = false;
+            if (SUCCEEDED(img.hr)) {
+                const uint32_t w = img.width, h = img.height;
+                const bool scaled = img.scaled;
+                if (PutClipboardImage(hwnd_, img))
+                    Toast("Copied " + name + " (" + std::to_string(w) + " x " + std::to_string(h) +
+                          (scaled ? ", reduced to fit in memory)" : ")"));
+                else
+                    Toast("Could not open the clipboard");
+            } else {
+                FreeClipboardImage(img);
+                if (img.hr != E_ABORT) Toast("Could not copy " + name + ": " + DescribeError(img.hr));
+            }
+            UpdateCache();
+        });
+    });
 }
 
 void App::UpdateTitle() {
@@ -1159,7 +1279,9 @@ App::ViewGeometry App::GeometryFor(int index, ImVec2 mn, ImVec2 mx) const {
     g.viewMin = mn;
     g.viewMax = mx;
     if (index < 0 || index >= folder_.Count()) return g;
-    g.source = SourceSize(folder_.Files()[size_t(index)]);
+    const FileEntry& file = folder_.Files()[size_t(index)];
+    g.source = SourceSize(file);
+    if (RotationOf(file) & 1) std::swap(g.source.w, g.source.h);  // view rotation
     if (g.source.empty()) return g;
     const float vw = std::max(1.0f, mx.x - mn.x), vh = std::max(1.0f, mx.y - mn.y);
     const float sw = float(g.source.w), sh = float(g.source.h);
@@ -1315,6 +1437,23 @@ void App::Tick() {
         pendingOpen_ = 0;
         ShowOpenDialog(folder);
     }
+    if (pendingEditorPick_) {
+        pendingEditorPick_ = false;
+        ComPtr<IFileOpenDialog> dlg;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+            COMDLG_FILTERSPEC filters[] = {{L"Programs", L"*.exe"}};
+            dlg->SetFileTypes(1, filters);
+            ComPtr<IShellItem> item;
+            PWSTR path = nullptr;
+            if (SUCCEEDED(dlg->Show(hwnd_)) && SUCCEEDED(dlg->GetResult(&item)) &&
+                SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                settings_.editorPath = ToUtf8(path);
+                MarkSettingsDirty();
+            }
+            CoTaskMemFree(path);
+            RequestFrames();
+        }
+    }
     if (pendingDestPick_) {
         const int key = pendingDestPick_;
         pendingDestPick_ = 0;
@@ -1342,6 +1481,24 @@ void App::Tick() {
         trimmed_ = true;
         UpdateCache();
     }
+    if (slideshow_) {
+        // Each slide gets its full time once it is on screen (a slow decode never shortens it).
+        const FileEntry* f = Current();
+        const bool ready = f && (TextureFor(f->id) || sched_.IsFailed({f->id, core::Variant::Fit}) ||
+                                 (f->probed && FAILED(f->probeHr)));
+        if (!f) {
+            StopSlideshow();
+        } else if (ready && slideShownAt_ == 0) {
+            slideShownAt_ = now;
+        } else if (ready && now >= slideShownAt_ + uint64_t(settings_.slideshowSeconds) * 1000) {
+            if (!settings_.wrapAround && current_ >= folder_.Count() - 1) {
+                StopSlideshow();
+                Toast("Slideshow finished");
+            } else {
+                Navigate(+1);
+            }
+        }
+    }
     if (!toasts_.empty() && toasts_.front().until <= now) {
         while (!toasts_.empty() && toasts_.front().until <= now) toasts_.pop_front();
         RequestFrames(1);
@@ -1357,6 +1514,7 @@ void App::Tick() {
     if (minimized_ && settings_.releaseWhenMinimized && !trimmed_) consider(minimizedAt_ + kTrimAfterMs);
     if (!toasts_.empty()) consider(toasts_.front().until);
     if (settingsDirtyAt_) consider(settingsDirtyAt_ + kSaveDelayMs);
+    if (slideshow_ && slideShownAt_) consider(slideShownAt_ + uint64_t(settings_.slideshowSeconds) * 1000);
     wakeAt_ = w;
 }
 
@@ -1372,6 +1530,7 @@ void App::RenderFrame() {
     DrawOverlay();
     DrawToasts();
     if (showSettings_) DrawSettings();
+    if (!showSettings_) recordingAction_ = -1;  // closed while waiting for a key
     if (settings_.showStats) DrawStats();
     if (settings_.showInfo) DrawInfo();
     if (showHelp_) DrawHelp();
@@ -1404,81 +1563,194 @@ LRESULT CALLBACK App::StaticWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
+    (void)sys;
     const bool repeat = (lp & (1 << 30)) != 0;
-    const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    if (core::IsModifierKey(uint16_t(vk))) return false;
+    const core::Chord chord{uint16_t(vk), GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0, GetKeyState(VK_MENU) < 0};
+    const bool plain = !chord.ctrl && !chord.shift && !chord.alt;
+
+    if (recordingAction_ >= 0) {  // Settings > Controls is waiting for a new key
+        if (repeat) return true;
+        const core::Action target = core::Action(recordingAction_);
+        recordingAction_ = -1;
+        RequestFrames();
+        if (vk == VK_ESCAPE && plain) return true;  // cancelled
+        // A key does one thing: take it away from whatever had it.
+        for (const core::Action other : keymap_.Conflicts(target, {chord})) {
+            auto chords = keymap_.Bindings(other);
+            chords.erase(std::remove(chords.begin(), chords.end(), chord), chords.end());
+            SetBindings(other, chords);
+            Toast(core::ChordToString(chord) + " no longer does \"" + core::InfoFor(other).label + "\"");
+        }
+        auto chords = keymap_.Bindings(target);
+        if (std::find(chords.begin(), chords.end(), chord) == chords.end()) chords.push_back(chord);
+        SetBindings(target, chords);
+        return true;
+    }
+
+    // Esc is fixed, so a bad key map can never lock you in.
+    if (vk == VK_ESCAPE && plain) {
+        if (repeat) return true;
+        if (showHelp_) showHelp_ = false;
+        else if (showSettings_) showSettings_ = false;
+        else if (slideshow_) StopSlideshow();
+        else if (compareCount_ > 1) SetCompare(1);
+        else if (fullscreen_) ToggleFullscreen();
+        else PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        RequestFrames();
+        return true;
+    }
+    const core::Action a = keymap_.Lookup(chord);
+    if (a == core::Action::None) return false;  // unbound: Alt+F4, Alt+Space etc. reach Windows
+    if (!repeat || core::InfoFor(a).repeats) Execute(a, repeat);
+    return true;
+}
+
+void App::Execute(core::Action a, bool repeat) {
+    using A = core::Action;
+    (void)repeat;
     const ViewGeometry g = Geometry();
     const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
-
-    if (sys) {
-        if (vk == VK_RETURN && !repeat) {
-            ToggleFullscreen();
-            return true;
-        }
-        return false;
-    }
-    auto fit = [&] {
-        zoomMode_ = ZoomMode::Fit;
-        cmpZoomRel_ = 1.0f;
-        cmpCenter_ = ImVec2(0.5f, 0.5f);
+    const int page = std::max(1, TileCount());
+    auto toggle = [&](bool& flag) {
+        flag = !flag;
+        MarkSettingsDirty();
         RequestFrames();
     };
-    const int page = std::max(1, TileCount());
-    switch (vk) {
-        case VK_RIGHT: case VK_DOWN: case VK_SPACE: Navigate(+1); return true;
-        case VK_LEFT: case VK_UP: case VK_BACK: Navigate(-1); return true;
-        case VK_NEXT: Navigate(+page); return true;   // in compare mode: the next set
-        case VK_PRIOR: Navigate(-page); return true;
-        case VK_HOME: JumpTo(0, 1); return true;
-        case VK_END: JumpTo(std::max(0, folder_.Count() - page), -1); return true;
-        case VK_DELETE: if (!repeat) RecycleActive(); return true;
-        case VK_TAB:
+    switch (a) {
+        case A::Next: Navigate(+1); break;
+        case A::Prev: Navigate(-1); break;
+        case A::NextSet: Navigate(+page); break;  // in compare mode: the next set
+        case A::PrevSet: Navigate(-page); break;
+        case A::First: JumpTo(0, 1); break;
+        case A::Last: JumpTo(std::max(0, folder_.Count() - page), -1); break;
+        case A::ZoomIn: ZoomAt(1.25f, vc); break;
+        case A::ZoomOut: ZoomAt(0.8f, vc); break;
+        case A::Fit:
+            zoomMode_ = ZoomMode::Fit;
+            cmpZoomRel_ = 1.0f;
+            cmpCenter_ = ImVec2(0.5f, 0.5f);
+            RequestFrames();
+            break;
+        case A::ActualSize: ToggleActualSize(vc); break;
+        case A::Fullscreen: ToggleFullscreen(); break;
+        case A::RotateCW: Rotate(1); break;
+        case A::RotateCCW: Rotate(3); break;
+        case A::Compare: SetCompare(compareCount_ == 1 ? 2 : compareCount_ == 2 ? 4 : 1); break;
+        case A::NextTile:
+        case A::PrevTile:
             if (VisibleTiles() > 1) {
-                activeTile_ = (activeTile_ + (shift ? VisibleTiles() - 1 : 1)) % VisibleTiles();
+                activeTile_ = (activeTile_ + (a == A::PrevTile ? VisibleTiles() - 1 : 1)) % VisibleTiles();
                 UpdateTitle();
                 RequestFrames();
             }
-            return true;
-        case VK_ESCAPE:
-            if (showHelp_) showHelp_ = false;
-            else if (showSettings_) showSettings_ = false;
-            else if (compareCount_ > 1) SetCompare(1);
-            else if (fullscreen_) ToggleFullscreen();
-            else PostMessageW(hwnd_, WM_CLOSE, 0, 0);
-            RequestFrames();
-            return true;
-        case VK_F1: showHelp_ = !showHelp_; RequestFrames(); return true;
-        case VK_F3: settings_.showStats = !settings_.showStats; MarkSettingsDirty(); RequestFrames(); return true;
-        case VK_F5: ReloadFolder(); return true;
-        case VK_F11: if (!repeat) ToggleFullscreen(); return true;
-        case VK_ADD: case VK_OEM_PLUS: ZoomAt(1.25f, vc); return true;
-        case VK_SUBTRACT: case VK_OEM_MINUS: ZoomAt(0.8f, vc); return true;
-        case VK_NUMPAD0: fit(); return true;
+            break;
+        case A::Delete: RecycleActive(); break;
+        case A::Move1: case A::Move2: case A::Move3: case A::Move4: case A::Move5:
+        case A::Move6: case A::Move7: case A::Move8: case A::Move9:
+            MoveActive(int(a) - int(A::Move1) + 1);
+            break;
+        case A::Undo: Undo(); break;
+        case A::Slideshow: ToggleSlideshow(); break;
+        case A::CopyImage: CopyActiveImage(); break;
+        case A::CopyPath: CopyActivePath(); break;
+        case A::ShowInExplorer:
+            if (const FileEntry* f = Active(); f && !ShowInExplorer(f->path)) Toast("Could not open Explorer");
+            break;
+        case A::OpenInEditor:
+            if (const FileEntry* f = Active(); f && !OpenInEditor(hwnd_, f->path, FromUtf8(settings_.editorPath)))
+                Toast(settings_.editorPath.empty() ? "Could not open the \"Open with\" window"
+                                                   : "Could not start " + settings_.editorPath);
+            break;
+        case A::ToggleOverlay: toggle(settings_.showOverlay); break;
+        case A::ToggleSidebar:
+            scrollSidebarToCurrent_ = true;
+            toggle(settings_.showSidebar);
+            break;
+        case A::ToggleInfo: toggle(settings_.showInfo); break;
+        case A::ToggleStats: toggle(settings_.showStats); break;
+        case A::Settings: showSettings_ = !showSettings_; RequestFrames(); break;
+        case A::Help: showHelp_ = !showHelp_; RequestFrames(); break;
+        case A::OpenFile: ShowOpenDialog(false); break;
+        case A::OpenFolder: ShowOpenDialog(true); break;
+        case A::Rescan: ReloadFolder(); break;
         default: break;
     }
-    if (vk >= '1' && vk <= '9' && !ctrl) {
-        if (!repeat) MoveActive(int(vk - '0'));
-        return true;
+}
+
+bool App::ZoomedIn() const {
+    if (compareCount_ > 1) return cmpZoomRel_ > 1.001f;
+    const ViewGeometry g = Geometry();
+    return !g.source.empty() && (float(g.source.w) * g.zoom > g.viewMax.x - g.viewMin.x + 0.5f ||
+                                 float(g.source.h) * g.zoom > g.viewMax.y - g.viewMin.y + 0.5f);
+}
+
+void App::OnWheel(int delta, bool horizontal, bool ctrl, ImVec2 screen) {
+    const uint64_t now = NowMs();
+    if (horizontal) {
+        // Tilt wheel or a two-finger sideways swipe: pans a zoomed image, otherwise
+        // turns one page per gesture (touchpads send a stream of small steps).
+        if (ZoomedIn() && compareCount_ == 1) {
+            PanBy(-float(delta), 0);
+            return;
+        }
+        if (now < lastWheelNavMs_ + 250) {  // same gesture still running
+            lastWheelNavMs_ = now;
+            hwheelAccum_ = 0;
+            return;
+        }
+        hwheelAccum_ += delta;
+        if (std::abs(hwheelAccum_) >= WHEEL_DELTA) {
+            Navigate(hwheelAccum_ > 0 ? +1 : -1);
+            hwheelAccum_ = 0;
+            lastWheelNavMs_ = now;
+        }
+        return;
     }
-    if (repeat) return false;
-    switch (vk) {
-        case '0': fit(); return true;
-        case 'C': if (!ctrl) SetCompare(compareCount_ == 1 ? 2 : compareCount_ == 2 ? 4 : 1); return true;
-        case 'O':
-            if (ctrl) ShowOpenDialog(shift);
-            else { settings_.showOverlay = !settings_.showOverlay; MarkSettingsDirty(); }
-            RequestFrames();
-            return true;
-        case 'S': showSettings_ = !showSettings_; RequestFrames(); return true;
-        case 'B': settings_.showSidebar = !settings_.showSidebar; scrollSidebarToCurrent_ = true; MarkSettingsDirty(); RequestFrames(); return true;
-        case 'I': settings_.showInfo = !settings_.showInfo; MarkSettingsDirty(); RequestFrames(); return true;
-        case 'H': showHelp_ = !showHelp_; RequestFrames(); return true;
-        case 'F': ToggleFullscreen(); return true;
-        case 'Z':
-            if (ctrl) Undo();
-            else ToggleActualSize(vc);
-            return true;
-        default: return false;
+    if (settings_.wheelNavigates && !ctrl) {  // touchpad pinch arrives as Ctrl+wheel: still zooms
+        wheelAccum_ += delta;
+        const int steps = wheelAccum_ / WHEEL_DELTA;
+        if (steps) {
+            wheelAccum_ -= steps * WHEEL_DELTA;
+            Navigate(-steps);  // wheel down = next
+        }
+        return;
     }
+    ZoomAt(std::pow(1.2f, float(delta) / WHEEL_DELTA), screen);
+}
+
+void App::OnGesture(HGESTUREINFO h) {
+    GESTUREINFO gi{};
+    gi.cbSize = sizeof gi;
+    if (!GetGestureInfo(h, &gi)) return;
+    POINT pt{gi.ptsLocation.x, gi.ptsLocation.y};
+    ScreenToClient(hwnd_, &pt);
+    const ImVec2 at(float(pt.x), float(pt.y));
+    switch (gi.dwID) {
+        case GID_ZOOM:  // pinch: ullArguments is the distance between the fingers
+            if (!(gi.dwFlags & GF_BEGIN) && gestureZoomLast_ && gi.ullArguments)
+                ZoomAt(float(double(gi.ullArguments) / double(gestureZoomLast_)), at);
+            gestureZoomLast_ = gi.ullArguments;
+            break;
+        case GID_PAN:
+            if (gi.dwFlags & GF_BEGIN) {
+                gestureSwipe_ = 0;
+                dragStart_ = pt;
+            } else if (ZoomedIn()) {
+                PanBy(float(pt.x - gestureLast_.x), float(pt.y - gestureLast_.y));
+            } else if (!(gi.dwFlags & GF_INERTIA)) {
+                gestureSwipe_ += pt.x - gestureLast_.x;  // swipe sideways to change image
+            }
+            gestureLast_ = pt;
+            if ((gi.dwFlags & GF_END) && std::abs(gestureSwipe_) > int(60 * dpiScale_)) {
+                Navigate(gestureSwipe_ < 0 ? +1 : -1);
+                gestureSwipe_ = 0;
+            }
+            break;
+        case GID_TWOFINGERTAP: ToggleActualSize(at); break;
+        default: break;
+    }
+    RequestFrames();
 }
 
 LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1518,13 +1790,32 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
             RequestFrames();
             if (!uiMouse) {
                 POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                 ScreenToClient(hwnd, &pt);
-                ZoomAt(std::pow(1.2f, float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA), ImVec2(float(pt.x), float(pt.y)));
+                OnWheel(GET_WHEEL_DELTA_WPARAM(wp), msg == WM_MOUSEHWHEEL, (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) != 0,
+                        ImVec2(float(pt.x), float(pt.y)));
             }
             return 0;
+        case WM_GESTURENOTIFY: {
+            // Pan in every direction with one finger (no "gutter"), with inertia.
+            GESTURECONFIG cfg[] = {{GID_ZOOM, GC_ZOOM, 0},
+                                   {GID_PAN, GC_PAN | GC_PAN_WITH_SINGLE_FINGER_VERTICALLY |
+                                                 GC_PAN_WITH_SINGLE_FINGER_HORIZONTALLY | GC_PAN_WITH_INERTIA,
+                                    GC_PAN_WITH_GUTTER},
+                                   {GID_TWOFINGERTAP, GC_TWOFINGERTAP, 0}};
+            SetGestureConfig(hwnd, 0, UINT(std::size(cfg)), cfg, sizeof(GESTURECONFIG));
+            break;
+        }
+        case WM_GESTURE:
+            if (!uiMouse && (wp == GID_ZOOM || wp == GID_PAN || wp == GID_TWOFINGERTAP)) {
+                OnGesture(reinterpret_cast<HGESTUREINFO>(lp));
+                CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(lp));
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN:
             RequestFrames();
             if (!uiMouse) {

@@ -89,7 +89,7 @@ void Scheduler::Pump(const std::vector<Want>& wants, const Limits& limits, bool 
 
     // 3. Dispatch admitted work while decode slots and transient RAM allow.
     int running = int(zombies_.size());
-    uint64_t transient = 0, committed = 0;
+    uint64_t transient = extraTransient_, committed = 0;
     for (const auto& [job, z] : zombies_) {
         transient += z.transient;
         committed += z.gpu;
@@ -187,8 +187,14 @@ uint64_t Scheduler::CommittedGpu() const {
     return t;
 }
 
+uint64_t Scheduler::TransientRoom(const Limits& limits) const {
+    uint64_t used = TransientInUse();
+    if (limits.unified) used += CommittedGpu();
+    return limits.ram > used ? limits.ram - used : 0;
+}
+
 uint64_t Scheduler::TransientInUse() const {
-    uint64_t t = 0;
+    uint64_t t = extraTransient_;
     for (const auto& [k, e] : entries_)
         if (e.state == EntryState::Decoding) t += e.transient;
     for (const auto& [j, z] : zombies_) t += z.transient;

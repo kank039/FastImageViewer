@@ -18,6 +18,7 @@ void Validate(Settings& s, const MemoryCaps& caps) {
     s.thumbHeight = std::clamp(s.thumbHeight, 32, 240);
     s.decodeMode = std::clamp(s.decodeMode, 0, 1);
     s.backdrop = std::clamp(s.backdrop, 0, 2);
+    s.slideshowSeconds = std::clamp(s.slideshowSeconds, 1, 120);
 
     const uint32_t maxRam = std::max(kMinBudgetMB, ToMB(caps.maxRam));
     const uint32_t maxVram = std::max(kMinBudgetMB, ToMB(caps.maxVram));
@@ -82,6 +83,9 @@ std::vector<Field> Fields(Settings& s) {
         {"showInfo", Field::Bool, &s.showInfo},
         {"pairRawJpeg", Field::Bool, &s.pairRawJpeg},
         {"renameOnConflict", Field::Bool, &s.renameOnConflict},
+        {"wheelNavigates", Field::Bool, &s.wheelNavigates},
+        {"slideshowSeconds", Field::Int, &s.slideshowSeconds},
+        {"editorPath", Field::Str, &s.editorPath},
     };
     for (int i = 0; i < 9; ++i) f.push_back({kDest[i], Field::Str, &s.destinations[size_t(i)]});
     return f;
@@ -110,6 +114,7 @@ std::string Serialize(const Settings& in) {
         }
         o << '\n';
     }
+    for (const auto& [id, chords] : s.keyBindings) o << "key." << id << '=' << chords << '\n';
     o << "disabledFormats=";
     for (size_t i = 0; i < s.disabledFormats.size(); ++i) o << (i ? "," : "") << s.disabledFormats[i];
     o << '\n';
@@ -129,6 +134,10 @@ void Deserialize(const std::string& text, Settings& s) {
         if (eq == std::string::npos) continue;
         const std::string key = Trim(line.substr(0, eq));
         const std::string val = Trim(line.substr(eq + 1));
+        if (key.rfind("key.", 0) == 0 && key.size() > 4) {
+            s.keyBindings[key.substr(4)] = val;
+            continue;
+        }
         if (key == "disabledFormats") {
             s.disabledFormats.clear();
             std::istringstream list(val);

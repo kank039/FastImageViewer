@@ -9,6 +9,7 @@
 #include "../src/core/Exif.h"
 #include "../src/core/FileGroups.h"
 #include "../src/core/Histogram.h"
+#include "../src/core/Keys.h"
 #include "../src/core/MemoryLimits.h"
 #include "../src/core/Pixels.h"
 #include "../src/core/Scheduler.h"
@@ -429,6 +430,23 @@ static void TestScheduler() {
     CompleteAll(s7, h, Outcome::Failed);
     s7.Pump(w7, lim, true);
     CHECK(h.started.empty() && s7.IsFailed({400, Variant::Fit}));
+
+    // One-off reservations (clipboard copy) count as transient RAM.
+    Scheduler s8(h);
+    h.started.clear();
+    const Limits l8{100 * kMiB, 1000 * kMiB, false};
+    CHECK(s8.TransientRoom(l8) == 100 * kMiB);
+    s8.ReserveTransient(70 * kMiB);
+    CHECK(s8.TransientRoom(l8) == 30 * kMiB && s8.TransientInUse() == 70 * kMiB);
+    // Each needs 20 MiB of transient RAM.
+    std::vector<Want> w9{MakeWant(501, 1, 10), MakeWant(502, 2, 10)};
+    s8.Pump(w9, l8, true);
+    CHECK(h.started.size() == 1);  // the second would need 40 of the 30 left
+    s8.ReleaseTransient(70 * kMiB);
+    s8.ReleaseTransient(1);  // never underflows
+    CHECK(s8.TransientInUse() == 20 * kMiB);
+    s8.Pump(w9, l8, true);
+    CHECK(h.started.size() == 2);
 }
 
 static void TestSettings() {
@@ -652,6 +670,47 @@ static void TestHistogram() {
     CHECK(HistogramLevel({300, 200}, FullMipLevels({300, 200})) == 0);
 }
 
+static void TestKeys() {
+    std::puts("keys");
+    for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
+    CHECK(int(AllActions().size()) == kActionCount);
+    Chord c;
+    CHECK(ParseChord("Ctrl+Shift+Z", c) && c.vk == 'Z' && c.ctrl && c.shift && !c.alt);
+    CHECK(ChordToString(c) == "Ctrl+Shift+Z");
+    CHECK(ParseChord("ctrl + num+", c) && c.vk == 0x6B && c.ctrl);
+    CHECK(ParseChord("F11", c) && c.vk == 0x7A);
+    CHECK(ParseChord("pgdn", c) && c.vk == 0x22 && ChordToString(c) == "PgDn");
+    CHECK(!ParseChord("Ctrl+", c) && !ParseChord("Hyper+X", c) && !ParseChord("", c) && !ParseChord("Shift", c));
+    std::vector<Chord> list;
+    CHECK(ParseChords("Right, Down, Space", list) && list.size() == 3 && ChordsToString(list) == "Right, Down, Space");
+    CHECK(ParseChords("", list) && list.empty());  // explicitly unbound
+    CHECK(!ParseChords("Right, Nope", list));
+    // Every default binding parses, and defaults have no duplicates between actions.
+    KeyMap km;
+    km.Build({});
+    for (const auto& info : AllActions()) {
+        std::vector<Chord> d;
+        CHECK(ParseChords(info.defaults, d) && !d.empty());
+        CHECK(km.Conflicts(info.action, d).empty());
+    }
+    Chord ctrlZ;
+    ParseChord("Ctrl+Z", ctrlZ);
+    CHECK(km.Lookup(ctrlZ) == Action::Undo);
+    // Overrides replace defaults; invalid overrides are ignored.
+    km.Build({{"Undo", "Ctrl+Y"}, {"Next", "garbage+"}});
+    CHECK(km.Lookup(ctrlZ) == Action::None);
+    Chord right;
+    ParseChord("Right", right);
+    CHECK(km.Lookup(right) == Action::Next);
+
+    Settings s;
+    s.keyBindings["Undo"] = "Ctrl+Y, Ctrl+Z";
+    s.editorPath = "C:\\Program Files\\GIMP\\gimp.exe";
+    Settings back;
+    Deserialize(Serialize(s), back);
+    CHECK(back.keyBindings.size() == 1 && back.keyBindings["Undo"] == "Ctrl+Y, Ctrl+Z" && back.editorPath == s.editorPath);
+}
+
 int main() {
     TestWindow();
     TestPlan();
@@ -664,6 +723,7 @@ int main() {
     TestGroups();
     TestExifInfo();
     TestHistogram();
+    TestKeys();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -82,6 +82,13 @@ public:
     uint64_t TransientInUse() const;    // RAM reserved by running decodes
     int RunningDecodes() const;
     int RunningProbes() const { return int(probes_.size()); }
+
+    // RAM for one-off work outside the cache (copying an image to the
+    // clipboard, a sharpness pass). It counts as transient, so decodes leave
+    // room for it until it is released.
+    uint64_t TransientRoom(const Limits& limits) const;  // what a reservation may take now
+    void ReserveTransient(uint64_t bytes) { extraTransient_ += bytes; }
+    void ReleaseTransient(uint64_t bytes) { extraTransient_ -= bytes < extraTransient_ ? bytes : extraTransient_; }
     bool HasWork() const { return RunningDecodes() > 0 || !probes_.empty(); }
 
     struct EntryView {
@@ -119,6 +126,7 @@ private:
     std::unordered_map<uint64_t, Zombie> zombies_;    // cancelled decodes still running
     std::unordered_map<uint64_t, uint64_t> probes_;   // job -> item
     std::unordered_map<uint64_t, uint64_t> probeItems_;  // item -> job
+    uint64_t extraTransient_ = 0;
 };
 
 }  // namespace fiv::core

@@ -19,6 +19,7 @@ add_library(fiv_core STATIC
     src/core/Exif.cpp
     src/core/FileGroups.cpp
     src/core/Histogram.cpp
+    src/core/Keys.cpp
     src/core/MemoryLimits.cpp
     src/core/Pixels.cpp
     src/core/Scheduler.cpp
@@ -52,6 +53,7 @@ if(WIN32)
         src/platform/FileStream.cpp
         src/platform/Folder.cpp
         src/platform/Formats.cpp
+        src/platform/Shell.cpp
         src/platform/Gpu.cpp
         src/platform/Jobs.cpp
         src/platform/System.cpp

@@ -11,6 +11,7 @@
 
 #include "../core/CacheWindow.h"
 #include "../core/Histogram.h"
+#include "../core/Keys.h"
 #include "../core/Scheduler.h"
 #include "../core/Settings.h"
 #include "../platform/Folder.h"
@@ -74,6 +75,9 @@ private:
     static LRESULT CALLBACK StaticWndProc(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
     bool HandleKey(WPARAM vk, LPARAM lp, bool sys);
+    void Execute(core::Action a, bool repeat);
+    void OnWheel(int delta, bool horizontal, bool ctrl, ImVec2 screen);
+    void OnGesture(HGESTUREINFO h);
 
     // Setup / teardown
     bool CreateMainWindow(HINSTANCE inst);
@@ -109,6 +113,18 @@ private:
     std::wstring PickFolder();
     void ShowOpenDialog(bool pickFolder);
     void ToggleFullscreen();
+    // View rotation (session only, files are never rewritten)
+    int RotationOf(const FileEntry& f) const;  // quarter turns clockwise, 0..3
+    void Rotate(int quarterTurns);
+    // Slideshow
+    void ToggleSlideshow();
+    void StopSlideshow();
+    // Clipboard, Explorer, editor
+    void CopyActiveImage();
+    void CopyActivePath();
+    // Key bindings
+    void RebuildKeyMap();
+    void SetBindings(core::Action a, const std::vector<core::Chord>& chords);
     void UpdateTitle();
     void UpdateMonitor();
     void CheckEmpty();
@@ -146,6 +162,7 @@ private:
     void ToggleActualSize(ImVec2 screen);
     void PanBy(float dx, float dy);
     void SetCompare(int count);
+    bool ZoomedIn() const;  // the active image is larger than its view (pan instead of swipe)
 
     // Frame
     void Tick();
@@ -168,6 +185,7 @@ private:
     void DrawInfo();
     void DrawHistogram(const core::Histogram& h, ImVec2 size);
     void DrawSortingTab();
+    void DrawControlsTab();
 
     // --- state ---
     HINSTANCE inst_ = nullptr;
@@ -232,8 +250,29 @@ private:
     float cmpZoomRel_ = 1.0f;   // compare zoom relative to each tile's fit (synced across tiles)
     ImVec2 cmpCenter_{0.5f, 0.5f};  // compare centre in normalized image coordinates
 
+    // Rotation chosen in this session, by lower-case path.
+    std::unordered_map<std::wstring, int> rotation_;
+
+    core::KeyMap keymap_;
+    int recordingAction_ = -1;  // Settings > Controls is waiting for a key for this action
+
+    bool slideshow_ = false;
+    uint64_t slideShownAt_ = 0;  // when the current slide appeared (0 = still loading)
+
+    bool copying_ = false;           // a clipboard copy is being prepared
+    uint64_t copyJob_ = 0;
+    uint64_t nextOwnJob_ = 1ull << 62;  // job ids outside the scheduler's range
+
+    int wheelAccum_ = 0;             // touchpads send many small wheel steps
+    int hwheelAccum_ = 0;
+    uint64_t lastWheelNavMs_ = 0;
+    POINT gestureLast_{};
+    ULONGLONG gestureZoomLast_ = 0;
+    int gestureSwipe_ = 0;           // horizontal travel of a pan gesture at fit zoom
+
     std::deque<UndoOp> undo_;   // newest at the back
     int pendingDestPick_ = 0;   // 1..9: folder picker for that key (run outside the ImGui frame)
+    bool pendingEditorPick_ = false;
 
     int pendingOpen_ = 0;  // 1 file dialog, 2 folder dialog (run outside the ImGui frame)
     bool showSettings_ = false;

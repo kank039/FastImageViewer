@@ -3,6 +3,7 @@
 // key=value text format. File I/O lives in the platform layer.
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,12 @@ struct Settings {
     // Keys 1..9: destination folder (UTF-8). Empty = subfolder "1".."9" of the
     // current folder; a relative path is relative to the current folder.
     std::array<std::string, 9> destinations{};
+
+    // Input & tools
+    bool wheelNavigates = false;   // wheel = previous/next (Ctrl+wheel zooms) instead of zoom
+    int slideshowSeconds = 4;
+    std::string editorPath;        // "Open in editor"; empty = Windows "Open with" chooser
+    std::map<std::string, std::string> keyBindings;  // action id -> chords, only where changed
 
     // Camera RAW is off by default: RAW+JPEG pairs would otherwise show every photo twice.
     std::vector<std::string> disabledFormats = {"Camera RAW"};

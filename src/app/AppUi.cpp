@@ -53,6 +53,23 @@ void CompanionKinds(const FileEntry& f, bool& raw, bool& xmp) {
     }
 }
 
+// Draws a texture into [pmin, pmax] turned `rot` quarter turns clockwise.
+void AddRotatedImage(ImDrawList* dl, ImTextureID tex, ImVec2 pmin, ImVec2 pmax, int rot) {
+    if ((rot & 3) == 0) {
+        dl->AddImage(tex, pmin, pmax);
+        return;
+    }
+    // Texture coordinates shown at the top-left, top-right, bottom-right and bottom-left corners.
+    static const ImVec2 kUv[4][4] = {{{0, 0}, {1, 0}, {1, 1}, {0, 1}},
+                                     {{0, 1}, {0, 0}, {1, 0}, {1, 1}},
+                                     {{1, 1}, {0, 1}, {0, 0}, {1, 0}},
+                                     {{1, 0}, {1, 1}, {0, 1}, {0, 0}}};
+    const ImVec2* uv = kUv[rot & 3];
+    dl->AddImageQuad(tex, pmin, ImVec2(pmax.x, pmin.y), pmax, ImVec2(pmin.x, pmax.y), uv[0], uv[1], uv[2], uv[3]);
+}
+
+core::Size Turned(core::Size s, int rot) { return rot & 1 ? core::Size{s.h, s.w} : s; }
+
 void SetPointSampler(const ImDrawList*, const ImDrawCmd* cmd) {
     auto* gpu = static_cast<Gpu*>(cmd->UserCallbackData);
     ID3D11SamplerState* s = gpu->PointSampler();
@@ -78,20 +95,22 @@ void App::DrawImage() {
 
         const Texture* tex = TextureFor(f.id);
         const Texture* shown = tex ? tex : (previewItem_ == f.id && preview_.srv ? &preview_ : nullptr);
+        const int rot = RotationOf(f);
         if (shown && !g.source.empty()) {
             const ImVec2 size(float(g.source.w) * g.zoom, float(g.source.h) * g.zoom);
             const ImVec2 pmin(std::round(vc.x - g.center.x * g.zoom), std::round(vc.y - g.center.y * g.zoom));
             const ImVec2 pmax(pmin.x + size.x, pmin.y + size.y);
-            const float texelScale = size.x / float(std::max(1u, shown->size.w));  // screen pixels per texel
+            const core::Size texSize = Turned(shown->size, rot);  // as displayed
+            const float texelScale = size.x / float(std::max(1u, texSize.w));  // screen pixels per texel
             const bool point = settings_.pixelatedZoom && shown != &preview_ && texelScale > 1.01f;
             dl->PushClipRect(g.viewMin, g.viewMax, false);
             if (point) dl->AddCallback(SetPointSampler, &gpu_);
-            dl->AddImage(ToTex(shown->srv.Get()), pmin, pmax);
+            AddRotatedImage(dl, ToTex(shown->srv.Get()), pmin, pmax, rot);
             if (point) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
             dl->PopClipRect();
 
             // Zoomed past the screen-sized texture: fetch full-resolution versions of the visible images.
-            if (tex && !wantFull_ && texelScale > 1.02f && tex->size.w < g.source.w &&
+            if (tex && !wantFull_ && texelScale > 1.02f && Turned(tex->size, rot).w < g.source.w &&
                 settings_.decodeMode == int(core::DecodeMode::FitScreen)) {
                 wantFull_ = true;
                 UpdateCache();
@@ -182,6 +201,7 @@ void App::DrawOverlay() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
     if (TileCount() > 1) ImGui::TextColored(kBlue, "Compare %d  \xC2\xB7  tile %d", TileCount(), activeTile_ + 1);
+    if (slideshow_) ImGui::TextColored(kBlue, "Slideshow  \xC2\xB7  %d s", settings_.slideshowSeconds);
     if (settings_.ovName) ImGui::TextUnformatted(ToUtf8(f->name).c_str());
     if (!f->companions.empty()) {
         bool raw = false, xmp = false;
@@ -196,6 +216,7 @@ void App::DrawOverlay() {
     if (settings_.ovSize) TextDim("%s", FormatBytes(f->size).c_str());
     if (settings_.ovDims && f->probed && SUCCEEDED(f->probeHr)) TextDim("%u x %u", f->Oriented().w, f->Oriented().h);
     if (settings_.ovZoom && !g.source.empty()) TextDim("%.0f%%", g.zoom * 100.0f);
+    if (const int rot = RotationOf(*f)) TextDim("Rotated %d\xC2\xB0 (view only)", rot * 90);
     if (f->CloudOnly()) ImGui::TextColored(kBlue, "Online-only file");
     ImGui::End();
 }
@@ -263,10 +284,12 @@ void App::DrawSidebar() {
 
             const ImVec2 b0(p.x + pad, p.y + pad), b1(b0.x + box, b0.y + box);
             if (const Texture* t = TextureFor(e.id)) {
-                const float a = float(t->size.w) / float(std::max(1u, t->size.h));
+                const int rot = RotationOf(e);
+                const core::Size ts = Turned(t->size, rot);
+                const float a = float(ts.w) / float(std::max(1u, ts.h));
                 const ImVec2 s = a >= 1 ? ImVec2(box, box / a) : ImVec2(box * a, box);
                 const ImVec2 o(b0.x + (box - s.x) * 0.5f, b0.y + (box - s.y) * 0.5f);
-                dl->AddImage(ToTex(t->srv.Get()), o, ImVec2(o.x + s.x, o.y + s.y));
+                AddRotatedImage(dl, ToTex(t->srv.Get()), o, ImVec2(o.x + s.x, o.y + s.y), rot);
             } else {
                 ImVec4 c(0.18f, 0.18f, 0.20f, 1);
                 if (sched_.IsDecoding({e.id, core::Variant::Fit}) || sched_.IsProbing(e.id)) c = ImVec4(0.45f, 0.36f, 0.15f, 1);
@@ -300,9 +323,10 @@ void App::DrawSidebar() {
 // ---- Settings --------------------------------------------------------------------------
 
 void App::DrawSettings() {
-    ImGui::SetNextWindowSize(ImVec2(600 * dpiScale_, 0), ImGuiCond_Appearing);
     RECT rc{};
     GetClientRect(hwnd_, &rc);
+    ImGui::SetNextWindowSize(ImVec2(std::round(620 * dpiScale_), std::min(std::round(580 * dpiScale_), float(rc.bottom) * 0.9f)),
+                             ImGuiCond_Appearing);
     ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, float(rc.bottom) * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::Begin("Settings", &showSettings_, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -400,6 +424,12 @@ void App::DrawSettings() {
         if (ImGui::BeginTabItem("Sorting")) {
             DrawSortingTab();
             ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Controls")) {
+            DrawControlsTab();
+            ImGui::EndTabItem();
+        } else if (recordingAction_ >= 0) {
+            recordingAction_ = -1;  // left the tab while it was waiting for a key
         }
         if (ImGui::BeginTabItem("Formats")) {
             bool changed = false;
@@ -662,43 +692,131 @@ void App::DrawHelp() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, float(rc.bottom) * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, float(rc.bottom) * 0.85f));
     ImGui::Begin("Keyboard & mouse", &showHelp_, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
-    static const char* rows[][2] = {
-        {"Right / Down / Space / PgDn", "Next image"},
-        {"Left / Up / Backspace / PgUp", "Previous image"},
-        {"Home / End", "First / last image"},
-        {"Mouse back / forward", "Previous / next"},
-        {"Mouse wheel, + / -", "Zoom at cursor"},
-        {"Drag", "Pan"},
-        {"Double-click, Z", "Toggle 100% / fit"},
-        {"C", "Compare 2 / 4 images side by side (synced zoom)"},
-        {"Tab, click", "Pick the active image in compare mode"},
-        {"0", "Fit to window"},
-        {"F, F11, Alt+Enter", "Fullscreen"},
-        {"Delete", "Move to Recycle Bin (with RAW/XMP pair)"},
-        {"1 ... 9", "Move to destination 1 ... 9 (Settings > Sorting)"},
-        {"Ctrl+Z", "Undo the last delete / move"},
-        {"Ctrl+O / Ctrl+Shift+O", "Open image / folder"},
-        {"F5", "Rescan folder"},
-        {"O", "Overlay"},
-        {"B", "Sidebar"},
-        {"S", "Settings"},
-        {"I", "Info: camera data and histogram"},
-        {"F3", "Stats"},
-        {"H, F1", "This help"},
-        {"Esc", "Close panel / leave compare / leave fullscreen / quit"},
+    TextDim("Keys can be changed in Settings > Controls.");
+    static const char* mouse[][2] = {
+        {"Mouse back / forward", "Previous / next image"},
+        {"Wheel", "Zoom at the cursor (or change image: Settings > Controls)"},
+        {"Ctrl+wheel, pinch", "Zoom"},
+        {"Tilt wheel, two-finger swipe", "Previous / next (pans when zoomed in)"},
+        {"Drag, one-finger drag", "Pan"},
+        {"Double-click, two-finger tap", "Toggle 100% / fit"},
+        {"Click a tile", "Pick the active image in compare mode"},
+        {"Esc", "Close panel / stop slideshow / leave compare / leave fullscreen / quit"},
     };
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-        for (const auto& r : rows) {
+        auto row = [](const char* keys, const char* what, bool dim) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(r[0]);
+            if (dim)
+                TextDim("%s", keys);
+            else
+                ImGui::TextUnformatted(keys);
             ImGui::TableSetColumnIndex(1);
-            TextDim("%s", r[1]);
+            TextDim("%s", what);
+        };
+        for (const auto& r : mouse) row(r[0], r[1], false);
+        for (const auto& info : core::AllActions()) {
+            const auto& chords = keymap_.Bindings(info.action);
+            const std::string keys = chords.empty() ? std::string("(none)") : core::ChordsToString(chords);
+            row(keys.c_str(), info.label, chords.empty());
         }
         ImGui::EndTable();
     }
     ImGui::End();
+}
+
+void App::DrawControlsTab() {
+    bool changed = false;
+    ImGui::SeparatorText("Mouse, touchpad & touch");
+    int wheel = settings_.wheelNavigates ? 1 : 0;
+    changed |= ImGui::RadioButton("Wheel zooms", &wheel, 0);
+    ImGui::SameLine();
+    changed |= ImGui::RadioButton("Wheel changes image", &wheel, 1);
+    settings_.wheelNavigates = wheel == 1;
+    HelpMarker("Ctrl+wheel and touchpad pinch always zoom. Tilting the wheel or swiping sideways with two fingers "
+               "changes the image (or pans when zoomed in). On a touch screen: pinch to zoom, swipe sideways to change "
+               "image, drag to pan, two-finger tap for 100%.");
+
+    ImGui::SeparatorText("Slideshow");
+    changed |= ImGui::SliderInt("Seconds per image", &settings_.slideshowSeconds, 1, 120, "%d s", ImGuiSliderFlags_AlwaysClamp);
+    HelpMarker("Each image gets its full time once it is on screen. Stops at the last image unless wrap-around is on.");
+
+    ImGui::SeparatorText("External editor");
+    char buf[1025];
+    std::snprintf(buf, sizeof buf, "%s", settings_.editorPath.c_str());
+    ImGui::SetNextItemWidth(-std::round(150 * dpiScale_));
+    if (ImGui::InputTextWithHint("##editor", "Windows \"Open with\" chooser", buf, sizeof buf)) {
+        settings_.editorPath = buf;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) pendingEditorPick_ = true;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(settings_.editorPath.empty());
+    if (ImGui::Button("Clear##editor")) {
+        settings_.editorPath.clear();
+        changed = true;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SeparatorText("Keys");
+    TextDim("+ then press a key, with Ctrl / Shift / Alt if you like. Esc cancels; Esc itself is fixed.");
+    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    // Fill the rest of the window, leaving room for the button below.
+    const float tableH = std::max(std::round(160 * dpiScale_),
+                                  ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing());
+    if (ImGui::BeginTable("##keymap", 3, flags, ImVec2(0, tableH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+        ImGui::TableSetupColumn("Keys", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+        ImGui::TableSetupColumn("##edit", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableHeadersRow();
+        for (const auto& info : core::AllActions()) {
+            const core::Action a = info.action;
+            const auto& chords = keymap_.Bindings(a);
+            ImGui::PushID(int(a));
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(info.label);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::AlignTextToFramePadding();
+            if (recordingAction_ == int(a))
+                ImGui::TextColored(kBlue, "Press a key...");
+            else if (chords.empty())
+                TextDim("none");
+            else
+                ImGui::TextUnformatted(core::ChordsToString(chords).c_str());
+            const auto clash = keymap_.Conflicts(a, chords);
+            if (!clash.empty()) ImGui::TextColored(kAmber, "also \"%s\" (the first in this list wins)", core::InfoFor(clash[0]).label);
+            ImGui::TableSetColumnIndex(2);
+            if (ImGui::SmallButton("+")) recordingAction_ = int(a);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(chords.empty());
+            if (ImGui::SmallButton("Clear")) SetBindings(a, {});
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!settings_.keyBindings.count(info.id));
+            if (ImGui::SmallButton("Default")) {
+                settings_.keyBindings.erase(info.id);
+                RebuildKeyMap();
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::BeginDisabled(settings_.keyBindings.empty());
+    if (ImGui::Button("Restore all default keys")) {
+        settings_.keyBindings.clear();
+        RebuildKeyMap();
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    if (changed) MarkSettingsDirty();
 }
 
 }  // namespace fiv
