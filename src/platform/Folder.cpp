@@ -48,6 +48,7 @@ void ResetProbe(FileEntry& e) {
     e.stored = {};
     e.orientation = 1;
     e.canPrescale = false;
+    e.progressive = false;
     e.error.clear();
     e.retryAt = 0;
 }

@@ -167,16 +167,15 @@ static void SetEcoQoS(bool on) {
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &s, sizeof s);  // no-op before Win10 1709
 }
 
-BackgroundMode::BackgroundMode(bool enable) {
-    if (!enable) return;
-    active_ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
-    SetEcoQoS(true);
-}
-
-BackgroundMode::~BackgroundMode() {
-    if (active_) {
+void BackgroundMode::Set(bool enable) {
+    if (enable == active_) return;
+    if (enable) {
+        active_ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
+        if (active_) SetEcoQoS(true);
+    } else {
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         SetEcoQoS(false);
+        active_ = false;
     }
 }
 

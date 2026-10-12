@@ -2,6 +2,8 @@
 // Image probing and decoding through the Windows Imaging Component.
 #include <d3d11.h>
 
+#include <atomic>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -16,6 +18,7 @@ struct ProbeResult {
     core::Size stored;       // pixel size as stored in the file
     int orientation = 1;     // EXIF orientation to apply (1 = none)
     bool canPrescale = false;
+    bool progressive = false;
     ComPtr<ID3D11ShaderResourceView> thumb;  // embedded preview, if requested and present
     core::Size thumbSize;
 };
@@ -32,8 +35,10 @@ struct DecodeRequest {
     int orientation = 1;
     bool canPrescale = false;
     core::DecodePlan plan;
-    int priority = 0;
-    bool background = false;
+    // Live priority (rank), updated by the UI thread when the user navigates.
+    // Rank <= 1 is the image on screen: normal I/O and CPU priority.
+    std::shared_ptr<std::atomic<int>> priority = std::make_shared<std::atomic<int>>(0);
+    int Priority() const { return priority->load(std::memory_order_relaxed); }
 };
 
 struct DecodeResult {

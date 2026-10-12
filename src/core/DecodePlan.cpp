@@ -96,9 +96,10 @@ uint64_t TransientBytes(const TransientRequest& r) {
     if (r.reorients) total += level0;  // pre-rotation scratch
     total += r.plan.gpuBytes;          // CPU mip chain handed to the GPU
     total += r.plan.gpuBytes;          // driver upload copy (short-lived)
-    // Codec working memory: progressive JPEG / interlaced PNG decoders keep a
-    // buffer proportional to the stored image (about 2 bytes per pixel).
-    total += 4 * kMiB + uint64_t(r.stored.w) * r.stored.h * 2;
+    // Codec working memory, proportional to the stored image: about 2 bytes per
+    // pixel in general, up to 6 for progressive JPEG (a 16-bit coefficient per
+    // sample for every block, 4:4:4 worst case), which DCT scaling does not reduce.
+    total += 4 * kMiB + uint64_t(r.stored.w) * r.stored.h * (r.progressive ? 6 : 2);
     return total;
 }
 

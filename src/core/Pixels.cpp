@@ -66,6 +66,31 @@ int JpegExifOrientation(const uint8_t* d, size_t n) {
     return 0;
 }
 
+int JpegIsProgressive(const uint8_t* d, size_t n) {
+    if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return -1;
+    size_t pos = 2;
+    while (pos + 4 <= n) {
+        if (d[pos] != 0xFF) return -1;
+        const uint8_t m = d[pos + 1];
+        if (m == 0xFF) {
+            ++pos;
+            continue;
+        }
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
+            pos += 2;
+            continue;
+        }
+        // SOF0..SOF15 except DHT (C4), JPG (C8) and DAC (CC).
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC)
+            return (m == 0xC2 || m == 0xC6 || m == 0xCA || m == 0xCE) ? 1 : 0;
+        if (m == 0xDA || m == 0xD9) return -1;
+        const size_t len = size_t(d[pos + 2]) << 8 | d[pos + 3];
+        if (len < 2) return -1;
+        pos += 2 + len;
+    }
+    return -1;
+}
+
 void ApplyOrientation(const uint32_t* src, Size s, int o, uint32_t* dst) {
     const uint32_t W = s.w, H = s.h;
     const Size d = OrientedSize(s, o);

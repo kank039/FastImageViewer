@@ -114,7 +114,9 @@ void Scheduler::Pump(const std::vector<Want>& wants, const Limits& limits, bool 
         // The image on screen must always be decodable: alone, it may briefly
         // exceed the transient pool (its texture still fits the texture pool).
         if (!fits && w->rank == 0 && running == 0 && committed + w->plan.gpuBytes <= gpuLimit) fits = true;
-        if (!fits) continue;
+        // Strict priority: lower ranks must not keep the pool busy while a
+        // higher rank waits for memory, so running work drains and it gets in.
+        if (!fits) break;
 
         const uint64_t job = nextJob_++;
         Entry e;

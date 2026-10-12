@@ -217,8 +217,8 @@ void App::ApplyBackdropSetting() {
 
 void App::RecreateDevice() {
     suspended_ = true;
+    ++deviceGen_;  // anything still running finishes on the old device and is discarded
     jobs_.CancelAll();
-    jobs_.WaitIdle();
     DrainCompletions();
     sched_.Clear();
     textures_.clear();
@@ -521,13 +521,20 @@ uint64_t App::PerImageCap() const {
     return std::min(core::EffectiveVramSetting(settings_, caps_), ram / 3);
 }
 
-core::DecodePlan App::PlanFor(const FileEntry& f, core::Variant v) const {
+// The image on screen must always be admissible, even when the live pool has
+// shrunk below the configured budget (low memory, a game holding the VRAM).
+uint64_t App::LiveCapForCurrent() const {
+    const uint64_t pool = limits_.unified ? limits_.ram / 2 : limits_.gpu;
+    return pool ? std::min(PerImageCap(), pool) : PerImageCap();
+}
+
+core::DecodePlan App::PlanFor(const FileEntry& f, core::Variant v, uint64_t maxBytes) const {
     core::PlanRequest r;
     r.source = f.Oriented();
     const bool fit = v == core::Variant::Fit && settings_.decodeMode == int(core::DecodeMode::FitScreen);
     if (fit) r.target = monitor_;
     r.maxTextureDim = gpu_.MaxTextureDim();
-    r.maxGpuBytes = PerImageCap();
+    r.maxGpuBytes = maxBytes;
     return core::PlanDecode(r);
 }
 
@@ -538,6 +545,7 @@ uint64_t App::TransientFor(const FileEntry& f, const core::DecodePlan& plan) con
     t.stored = f.stored;
     t.canPrescale = f.canPrescale;
     t.reorients = f.orientation != 1;
+    t.progressive = f.progressive;
     t.plan = plan;
     return core::TransientBytes(t);
 }
@@ -577,7 +585,7 @@ std::vector<core::Want> App::BuildWants() {
         w.mayProbe = stable && !waiting && !cloudBlocked && !(f.probed && FAILED(f.probeHr));
         w.mayLoad = stable && !waiting && !cloudBlocked;
         if (w.sizeKnown) {
-            w.plan = PlanFor(f, core::Variant::Fit);
+            w.plan = PlanFor(f, core::Variant::Fit, isCurrent ? LiveCapForCurrent() : PerImageCap());
             if (!w.plan.valid()) continue;
             w.transientBytes = TransientFor(f, w.plan);
         }
@@ -586,7 +594,7 @@ std::vector<core::Want> App::BuildWants() {
         if (isCurrent && wantFull_ && w.sizeKnown) {
             if (fullItem_ != f.id) {  // frozen per image so budget jitter never causes re-decodes
                 fullItem_ = f.id;
-                fullPlan_ = PlanFor(f, core::Variant::Full);
+                fullPlan_ = PlanFor(f, core::Variant::Full, LiveCapForCurrent() / 2);
             }
             if (fullPlan_.valid() && fullPlan_.gpuBytes > w.plan.gpuBytes) {
                 core::Want full = w;
@@ -607,6 +615,7 @@ void App::UpdateCache() {
     if (suspended_ || !gpu_.Alive()) return;
     const bool settled = NowMs() >= lastNavMs_ + kSettleMs;
     sched_.Pump(BuildWants(), limits_, settled);
+    if (!inRender_ && gpu_.Context()) gpu_.Context()->Flush();  // released textures are freed now, not at the next frame
     if (settings_.showStats || settings_.showSidebar) RequestFrames(1);
 }
 
@@ -645,7 +654,7 @@ void App::DrainCompletions() {
 void App::StartProbe(uint64_t job, uint64_t item, int rank) {
     const FileEntry* f = folder_.FindById(item);
     if (!f) {
-        Post([this, job, item] { OnProbeResult(job, item, ProbeResult{E_ABORT}); });
+        Post([this, job, item] { OnProbeResult(job, item, ProbeResult{E_ABORT}, deviceGen_); });
         return;
     }
     const ImageFormat* fmt = formats_.ForExtension(f->ext);
@@ -654,7 +663,8 @@ void App::StartProbe(uint64_t job, uint64_t item, int rank) {
     ComPtr<ID3D11Device> thumbDevice;
     if (rank == 0 && !TextureFor(item)) thumbDevice = gpu_.Device();
     std::wstring path = f->path;
-    jobs_.Submit(job, rank, [this, job, item, path, honorExif, thumbDevice, rank](WorkerContext& ctx, const CancelFlag& cancel) {
+    const uint64_t gen = deviceGen_;
+    jobs_.Submit(job, rank, [this, job, item, path, honorExif, thumbDevice, rank, gen](WorkerContext& ctx, const CancelFlag& cancel) {
         ProbeResult r;
         r.hr = E_ABORT;
         if (!cancel) {
@@ -664,12 +674,13 @@ void App::StartProbe(uint64_t job, uint64_t item, int rank) {
                 r = ProbeImage(ctx, thumbDevice.Get(), path, honorExif);
             }
         }
-        Post([this, job, item, r] { OnProbeResult(job, item, r); });
+        Post([this, job, item, r, gen] { OnProbeResult(job, item, r, gen); });
     });
 }
 
-void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r) {
+void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen) {
     sched_.OnProbeDone(job);
+    if (gen != deviceGen_) r.thumb.Reset();  // texture belongs to a replaced device
     FileEntry* f = folder_.FindById(item);
     if (f && r.hr != E_ABORT) {
         ++probes_;
@@ -679,6 +690,7 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r) {
             f->stored = r.stored;
             f->orientation = r.orientation;
             f->canPrescale = r.canPrescale;
+            f->progressive = r.progressive;
             f->error.clear();
         } else if (IsTransientError(r.hr)) {
             f->retryAt = NowMs() + kRetryMs;
@@ -703,7 +715,7 @@ void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::Decod
         Post([this, job, key, plan] {
             DecodeResult r;
             r.hr = E_ABORT;
-            OnDecodeResult(job, key, plan, r, 0);
+            OnDecodeResult(job, key, plan, r, 0, deviceGen_);
         });
         return;
     }
@@ -715,17 +727,24 @@ void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::Decod
     req.orientation = f->orientation;
     req.canPrescale = f->canPrescale;
     req.plan = plan;
-    req.priority = rank;
-    req.background = rank > 1;  // everything except the image on screen runs at background priority
+    req.priority->store(rank);  // everything except the image on screen runs at background priority
+    livePriority_[job] = req.priority;
     ComPtr<ID3D11Device> device = gpu_.Device();
-    jobs_.Submit(job, rank, [this, job, key, plan, req, device](WorkerContext& ctx, const CancelFlag& cancel) {
+    const uint64_t gen = deviceGen_;
+    jobs_.Submit(job, rank, [this, job, key, plan, req, device, gen](WorkerContext& ctx, const CancelFlag& cancel) {
         DecodeResult r = DecodeImage(ctx, device.Get(), gate_, req, cancel);
         const uint64_t bytes = SUCCEEDED(r.hr) && req.readIntoMemory ? req.fileBytes : 0;
-        Post([this, job, key, plan, r, bytes] { OnDecodeResult(job, key, plan, r, bytes); });
+        Post([this, job, key, plan, r, bytes, gen] { OnDecodeResult(job, key, plan, r, bytes, gen); });
     });
 }
 
-void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan, DecodeResult r, uint64_t bytesRead) {
+void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan, DecodeResult r, uint64_t bytesRead,
+                         uint64_t gen) {
+    livePriority_.erase(job);
+    if (gen != deviceGen_) {  // started on a device that has since been replaced
+        sched_.OnDecodeDone(job, core::Outcome::Cancelled);
+        return;
+    }
     core::Outcome outcome = core::Outcome::Ok;
     if (FAILED(r.hr)) {
         if (r.hr == E_ABORT)
@@ -736,7 +755,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
             outcome = core::Outcome::Failed;
     }
     const bool keep = sched_.OnDecodeDone(job, outcome);
-    const FileEntry* cur = Current();
+    const uint64_t curId = Current() ? Current()->id : 0;
     if (keep) {
         textures_[key] = {r.srv, plan.size};
         ++decodes_;
@@ -745,7 +764,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
             ++filesRead_;
             bytesRead_ += bytesRead;
         }
-        if (cur && cur->id == key.item) {
+        if (curId == key.item) {
             preview_ = {};
             previewItem_ = 0;
             RequestFrames();
@@ -761,20 +780,32 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
                 SyncCurrentIndex();
             }
         }
-        if (cur && cur->id == key.item) RequestFrames();
+        if (curId == key.item) RequestFrames();
     }
     if (Gpu::IsDeviceLost(r.hr) && !suspended_) {
         RecreateDevice();
         return;
     }
     UpdateCache();
+    // Let the driver finish the upload now, even if no frame follows, so the
+    // staging copy is freed as soon as its accounting is.
+    if (gpu_.Context()) gpu_.Context()->Flush();
 }
 
 void App::CancelJob(uint64_t job) { jobs_.Cancel(job); }
 
-void App::SetJobPriority(uint64_t job, int rank) { jobs_.SetPriority(job, rank); }
+void App::SetJobPriority(uint64_t job, int rank) {
+    jobs_.SetPriority(job, rank);
+    auto it = livePriority_.find(job);
+    if (it != livePriority_.end()) it->second->store(rank);
+}
 
-void App::ReleaseEntry(const core::EntryKey& key) { textures_.erase(key); }
+void App::ReleaseEntry(const core::EntryKey& key) {
+    auto it = textures_.find(key);
+    if (it == textures_.end()) return;
+    if (inRender_) graveyard_.push_back(std::move(it->second.srv));
+    textures_.erase(it);
+}
 
 const App::Texture* App::TextureFor(uint64_t item) const {
     auto full = textures_.find({item, core::Variant::Full});
@@ -933,6 +964,7 @@ void App::RenderFrame() {
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     const HRESULT hr = gpu_.Present();
     inRender_ = false;
+    graveyard_.clear();
     if (Gpu::IsDeviceLost(hr)) RecreateDevice();
 }
 

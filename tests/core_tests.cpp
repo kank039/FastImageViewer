@@ -120,6 +120,9 @@ static void TestPlan() {
     CHECK(TransientBytes(t) == base - 10 * kMiB);
     t.reorients = true;
     CHECK(TransientBytes(t) > base - 10 * kMiB);
+    const uint64_t seq = TransientBytes(t);
+    t.progressive = true;
+    CHECK(TransientBytes(t) == seq + 4000ull * 3000 * 4);
 }
 
 static void TestOrientation() {
@@ -188,6 +191,12 @@ static void TestExif() {
     for (size_t cut = 0; cut < j.size(); ++cut) CHECK(JpegExifOrientation(j.data(), cut) == 0 || cut > 40);
     j[30] = 0xFF;  // corrupt an IFD byte: must not crash or read out of bounds
     (void)JpegExifOrientation(j.data(), j.size());
+    // Progressive detection: SOF0 baseline, SOF2 progressive, none = unknown.
+    std::vector<uint8_t> base = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0, 0, 0xFF, 0xC4, 0x00, 0x02, 0xFF, 0xC0, 0x00, 0x02};
+    CHECK(JpegIsProgressive(base.data(), base.size()) == 0);
+    base[13] = 0xC2;
+    CHECK(JpegIsProgressive(base.data(), base.size()) == 1);
+    CHECK(JpegIsProgressive(base.data(), 8) == -1);
     const uint8_t png[] = {0x89, 'P', 'N', 'G'};
     CHECK(JpegExifOrientation(png, sizeof png) == 0);
     const uint8_t evil[] = {0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 'E', 'x', 'i', 'f', 0, 0, 'I', 'I', 42, 0, 0xF0, 0xFF, 0xFF, 0x7F};

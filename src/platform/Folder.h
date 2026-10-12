@@ -30,6 +30,7 @@ struct FileEntry {
     core::Size stored;
     int orientation = 1;
     bool canPrescale = false;
+    bool progressive = false;  // progressive JPEG (larger decoder working memory)
 
     std::string error;       // last probe/decode error for the UI
     uint64_t changedAt = 0;  // tick of the last change notification (still being written?)

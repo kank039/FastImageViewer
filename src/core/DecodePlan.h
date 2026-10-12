@@ -54,6 +54,7 @@ struct TransientRequest {
     Size stored;                 // size as stored in the file (before EXIF rotation)
     bool canPrescale = false;
     bool reorients = false;      // EXIF orientation != 1 needs a second buffer
+    bool progressive = false;    // progressive JPEG: decoder buffers all DCT coefficients
     DecodePlan plan;
 };
 

@@ -84,3 +84,9 @@ Our own usage is added back into each limit, so the limits don't oscillate as th
 - Each changed name is re-stat'ed. Its id changes only if its size or modification time changed, so the rest of the cache is untouched.
 - Files changed in the last 1.5 s are not decoded yet, because they may still be being written.
 - If the change buffer overflows, the folder is rescanned. The rescan keeps the ids of files that didn't change, so cached images survive.
+
+## Known limitations
+
+- **Probes are not budgeted.** They read only a file's header, plus the embedded thumbnail for the current image. At most 3 run at once, which bounds them at roughly 36 MB.
+- **Exit can wait on a stalled read.** A header probe, or a streamed decode of a file over 64 MB, only checks for cancellation between steps, not during a read. If a network share stalls or a OneDrive download hangs, closing the app waits for that read to finish. A graphics device reset doesn't wait: jobs carry a device generation number and their results are discarded.
+- **Animated GIF/WebP** show their first frame only. **Colour management** (ICC profiles) is not applied.

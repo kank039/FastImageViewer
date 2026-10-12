@@ -38,16 +38,17 @@ int ReadOrientation(IWICBitmapFrameDecode* frame) {
     return 0;
 }
 
-// Fallback for codecs/WIC builds that do not expose EXIF through the query
-// reader: parse the JPEG header ourselves (first 256 KB only).
-int ReadJpegHeaderOrientation(const std::wstring& path) {
-    HANDLE h = OpenShared(path, 0);
-    if (h == INVALID_HANDLE_VALUE) return 0;
+// First 256 KB of a JPEG (already in the OS cache after WIC read the header):
+// used for the progressive check and as an EXIF fallback for WIC builds that do
+// not expose orientation through the query reader.
+std::vector<uint8_t> ReadHead(const std::wstring& path) {
     std::vector<uint8_t> head(256 * 1024);
+    HANDLE h = OpenShared(path, 0);
     DWORD got = 0;
-    const BOOL ok = ReadFile(h, head.data(), DWORD(head.size()), &got, nullptr);
-    CloseHandle(h);
-    return ok ? core::JpegExifOrientation(head.data(), got) : 0;
+    if (h == INVALID_HANDLE_VALUE || !ReadFile(h, head.data(), DWORD(head.size()), &got, nullptr)) got = 0;
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    head.resize(got);
+    return head;
 }
 
 UINT BitsPerPixel(IWICImagingFactory* wic, REFWICPixelFormatGUID fmt) {
@@ -133,11 +134,17 @@ ProbeResult ProbeImage(WorkerContext& ctx, ID3D11Device* thumbDevice, const std:
         return r;
     }
     r.stored = {w, h};
+    GUID container{};
+    const bool jpeg = SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatJpeg;
+    std::vector<uint8_t> head;
+    if (jpeg) {
+        head = ReadHead(path);
+        // Unknown counts as progressive: over-reserving is safe, under-reserving is not.
+        r.progressive = core::JpegIsProgressive(head.data(), head.size()) != 0;
+    }
     if (honorExifOrientation) {
         r.orientation = ReadOrientation(frame.Get());
-        GUID container{};
-        if (r.orientation == 0 && SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatJpeg)
-            r.orientation = ReadJpegHeaderOrientation(path);
+        if (r.orientation == 0 && jpeg) r.orientation = core::JpegExifOrientation(head.data(), head.size());
     }
     if (r.orientation < 1 || r.orientation > 8) r.orientation = 1;
 
@@ -165,11 +172,17 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
     if (aborted()) return fail(E_ABORT);
     if (!ctx.wic || !req.plan.valid()) return fail(E_UNEXPECTED);
 
-    BackgroundMode bg(req.background);
+    BackgroundMode bg(req.Priority() > 1);
+    // Re-evaluated at every checkpoint so a prefetch that becomes the current
+    // image immediately leaves background mode and stops yielding the disk.
+    auto checkpoint = [&] {
+        bg.Set(req.Priority() > 1);
+        return !aborted();
+    };
     const Size want = core::OrientedSize(req.plan.size, req.orientation);  // size before rotation
 
     std::optional<IoGateLock> io;
-    io.emplace(gate, req.priority, cancel);
+    io.emplace(gate, req.Priority(), cancel);
     if (!io->held()) return fail(E_ABORT);
 
     // 1. Input: whole file into RAM in one sequential pass (friendliest for
@@ -199,11 +212,11 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
                 return fail(FAILED(hr) ? hr : WINCODEC_ERR_STREAMREAD);
             }
             done += got;
-            if (aborted()) {
+            if (!checkpoint()) {
                 CloseHandle(h);
                 return fail(E_ABORT);
             }
-            io->YieldTo(req.priority, cancel);
+            io->YieldTo(req.Priority(), cancel);
             if (!io->held()) {
                 CloseHandle(h);
                 return fail(E_ABORT);
@@ -305,7 +318,7 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         WICRect r{0, INT(y), INT(want.w), INT(rows)};
         hr = src->CopyPixels(&r, stride, stride * rows, dst + size_t(y) * stride);
         if (FAILED(hr)) return fail(hr);
-        if (aborted()) return fail(E_ABORT);
+        if (!checkpoint()) return fail(E_ABORT);
     }
     io.reset();
     src.Reset();

@@ -105,8 +105,9 @@ private:
 // EcoQoS) for prefetch work; restores on destruction.
 class BackgroundMode {
 public:
-    explicit BackgroundMode(bool enable);
-    ~BackgroundMode();
+    explicit BackgroundMode(bool enable) { Set(enable); }
+    ~BackgroundMode() { Set(false); }
+    void Set(bool enable);  // switchable mid-job: a prefetch may become the image on screen
 
 private:
     bool active_ = false;

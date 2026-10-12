@@ -15,6 +15,10 @@ Size OrientedSize(Size stored, int orientation);
 // Bounds-checked: safe on truncated or hostile data.
 int JpegExifOrientation(const uint8_t* data, size_t size);
 
+// Coding process of a JPEG: 1 progressive, 0 baseline/sequential, -1 unknown
+// (no frame header within `size` bytes).
+int JpegIsProgressive(const uint8_t* data, size_t size);
+
 // Writes the display-oriented image into dst (size OrientedSize(stored)).
 void ApplyOrientation(const uint32_t* src, Size stored, int orientation, uint32_t* dst);
 

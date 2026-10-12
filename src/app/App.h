@@ -90,13 +90,15 @@ private:
     void UpdateCache();
     void UpdateLimits();
     std::vector<core::Want> BuildWants();
-    core::DecodePlan PlanFor(const FileEntry& f, core::Variant v) const;
+    core::DecodePlan PlanFor(const FileEntry& f, core::Variant v, uint64_t maxBytes) const;
+    uint64_t LiveCapForCurrent() const;
     uint64_t TransientFor(const FileEntry& f, const core::DecodePlan& plan) const;
     uint64_t PerImageCap() const;
     void Post(std::function<void()> fn);
     void DrainCompletions();
-    void OnProbeResult(uint64_t job, uint64_t item, ProbeResult r);
-    void OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan, DecodeResult r, uint64_t bytesRead);
+    void OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen);
+    void OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan, DecodeResult r, uint64_t bytesRead,
+                        uint64_t gen);
     const Texture* TextureFor(uint64_t item) const;  // best available for an item
 
     // View
@@ -161,6 +163,11 @@ private:
     uint64_t recheckAt_ = 0;
 
     std::unordered_map<core::EntryKey, Texture, core::EntryKeyHash> textures_;
+    // Textures released while a frame is being built may still be referenced by
+    // its draw list: they are kept alive here until after Present().
+    std::vector<ComPtr<ID3D11ShaderResourceView>> graveyard_;
+    std::unordered_map<uint64_t, std::shared_ptr<std::atomic<int>>> livePriority_;  // decode job -> rank
+    uint64_t deviceGen_ = 1;  // results from jobs started on an older device are discarded
     uint64_t previewItem_ = 0;
     Texture preview_;
     bool wantFull_ = false;
