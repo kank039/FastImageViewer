@@ -34,6 +34,12 @@ struct FileOpResult {
 FileOpResult MoveFiles(HWND owner, const std::vector<std::wstring>& paths, const std::wstring& destDir,
                        bool renameOnCollision);
 
+// Several groups (an image and its RAW/XMP companions) in one operation, so
+// Windows shows a single progress window. Each group is named as a unit and
+// never collides with another group of the batch. Results are in input order.
+FileOpResult MoveGroups(HWND owner, const std::vector<std::vector<std::wstring>>& groups, const std::wstring& destDir,
+                        bool renameOnCollision);
+
 // Sends to the Recycle Bin. Windows asks first if a file would be deleted permanently.
 FileOpResult RecycleFiles(HWND owner, const std::vector<std::wstring>& paths);
 

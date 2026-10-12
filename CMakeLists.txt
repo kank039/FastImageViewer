@@ -20,6 +20,7 @@ add_library(fiv_core STATIC
     src/core/FileGroups.cpp
     src/core/Histogram.cpp
     src/core/Keys.cpp
+    src/core/Marks.cpp
     src/core/MemoryLimits.cpp
     src/core/Pixels.cpp
     src/core/Scheduler.cpp

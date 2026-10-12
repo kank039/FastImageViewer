@@ -12,6 +12,7 @@
 #include "../core/CacheWindow.h"
 #include "../core/Histogram.h"
 #include "../core/Keys.h"
+#include "../core/Marks.h"
 #include "../core/Scheduler.h"
 #include "../core/Settings.h"
 #include "../platform/Folder.h"
@@ -100,7 +101,25 @@ private:
     void ApplyDirChanges();
     void Navigate(int delta);
     void JumpTo(int index, int direction);
-    void SyncCurrentIndex();
+    void SyncCurrentIndex();  // also rebuilds the view
+    // The view: folder indices in display order (filtered, sorted). Navigation,
+    // tiles and the prefetch window all work on positions in this list.
+    void RebuildView();
+    int ViewCount() const { return int(view_.size()); }
+    FileEntry& FileAt(int pos) { return folder_.Files()[size_t(view_[size_t(pos)])]; }
+    const FileEntry& FileAt(int pos) const { return folder_.Files()[size_t(view_[size_t(pos)])]; }
+    int PosOfPath(const std::wstring& path) const;  // -1 if not in the view
+    // Session-only marks
+    core::Mark MarkOf(const FileEntry& f) const;
+    void SetMark(const FileEntry& f, core::Mark m);
+    void EditActiveMark(core::Mark (*edit)(core::Mark, int), int arg, const char* what);
+    void SetFilter(core::Filter f);
+    struct BatchRequest {
+        core::Selection selection = core::Selection::Picks;
+        int destKey = 0;  // 1..9 destination, 0 Recycle Bin
+    };
+    void RunBatch(const BatchRequest& req);
+    std::vector<int> SelectionIndices(core::Selection s) const;  // folder indices
     void RecycleActive();
     void MoveActive(int key);
     void Undo();
@@ -186,6 +205,10 @@ private:
     void DrawHistogram(const core::Histogram& h, ImVec2 size);
     void DrawSortingTab();
     void DrawControlsTab();
+    void DrawMarksPanel();
+    // Pick/reject flag and stars at `pos` (top-left), `size` high. Returns the width used.
+    static float DrawMarkBadge(ImDrawList* dl, ImVec2 pos, float size, const core::Mark& m);
+    static float MarkBadgeWidth(float size, const core::Mark& m);
 
     // --- state ---
     HINSTANCE inst_ = nullptr;
@@ -252,6 +275,18 @@ private:
 
     // Rotation chosen in this session, by lower-case path.
     std::unordered_map<std::wstring, int> rotation_;
+
+    std::vector<int> view_;   // folder indices in display order
+    std::vector<int> posOf_;  // folder index -> view position (-1 hidden)
+    std::unordered_map<std::wstring, core::Mark> marks_;  // by lower-case path, RAM only
+    core::Filter filter_ = core::Filter::All;
+    bool showMarks_ = false;
+    int marksSelection_ = 0;   // core::Selection for the batch action
+    int marksAction_ = 0;      // 0 Recycle Bin, 1..9 destination, 10 copy paths
+    bool confirmBatch_ = false;
+    bool confirmClearMarks_ = false;
+    bool pendingBatchSet_ = false;
+    BatchRequest pendingBatch_;
 
     core::KeyMap keymap_;
     int recordingAction_ = -1;  // Settings > Controls is waiting for a key for this action

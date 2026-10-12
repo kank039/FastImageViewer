@@ -2,6 +2,8 @@
 // so an idle viewer draws no frames at all.
 #include "App.h"
 
+#include "../platform/Shell.h"
+
 #include <shellapi.h>
 
 #include <algorithm>
@@ -70,6 +72,21 @@ void AddRotatedImage(ImDrawList* dl, ImTextureID tex, ImVec2 pmin, ImVec2 pmax, 
 
 core::Size Turned(core::Size s, int rot) { return rot & 1 ? core::Size{s.h, s.w} : s; }
 
+void AddStar(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
+    ImVec2 pts[10];
+    for (int i = 0; i < 10; ++i) {
+        const float a = -1.5707963f + float(i) * 0.62831853f;  // 10 points, 36 degrees apart
+        const float rr = (i & 1) ? r * 0.45f : r;
+        pts[i] = ImVec2(c.x + std::cos(a) * rr, c.y + std::sin(a) * rr);
+    }
+    // A fan of triangles from the centre (the star itself is not convex);
+    // without anti-aliasing so the seams between them do not show.
+    const ImDrawListFlags saved = dl->Flags;
+    dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+    for (int i = 0; i < 10; ++i) dl->AddTriangleFilled(c, pts[i], pts[(i + 1) % 10], col);
+    dl->Flags = saved;
+}
+
 void SetPointSampler(const ImDrawList*, const ImDrawCmd* cmd) {
     auto* gpu = static_cast<Gpu*>(cmd->UserCallbackData);
     ID3D11SamplerState* s = gpu->PointSampler();
@@ -77,6 +94,38 @@ void SetPointSampler(const ImDrawList*, const ImDrawCmd* cmd) {
 }
 
 }  // namespace
+
+// ---- Marks ------------------------------------------------------------------------
+
+float App::MarkBadgeWidth(float size, const core::Mark& m) {
+    float w = m.flag != core::Flag::None ? size : 0.0f;
+    if (m.stars) w += (w > 0 ? size * 0.3f : 0.0f) + float(m.stars) * size * 0.95f;
+    return w;
+}
+
+float App::DrawMarkBadge(ImDrawList* dl, ImVec2 pos, float size, const core::Mark& m) {
+    float x = pos.x;
+    const float t = std::max(1.5f, size * 0.14f);
+    if (m.flag == core::Flag::Pick) {
+        dl->AddRectFilled(pos, ImVec2(x + size, pos.y + size), IM_COL32(40, 150, 70, 235), size * 0.2f);
+        dl->AddLine(ImVec2(x + size * 0.24f, pos.y + size * 0.52f), ImVec2(x + size * 0.43f, pos.y + size * 0.72f), IM_COL32_WHITE, t);
+        dl->AddLine(ImVec2(x + size * 0.43f, pos.y + size * 0.72f), ImVec2(x + size * 0.78f, pos.y + size * 0.3f), IM_COL32_WHITE, t);
+        x += size;
+    } else if (m.flag == core::Flag::Reject) {
+        dl->AddRectFilled(pos, ImVec2(x + size, pos.y + size), IM_COL32(190, 50, 50, 235), size * 0.2f);
+        dl->AddLine(ImVec2(x + size * 0.28f, pos.y + size * 0.28f), ImVec2(x + size * 0.72f, pos.y + size * 0.72f), IM_COL32_WHITE, t);
+        dl->AddLine(ImVec2(x + size * 0.72f, pos.y + size * 0.28f), ImVec2(x + size * 0.28f, pos.y + size * 0.72f), IM_COL32_WHITE, t);
+        x += size;
+    }
+    if (m.stars) {
+        if (x > pos.x) x += size * 0.3f;
+        for (int i = 0; i < m.stars; ++i) {
+            AddStar(dl, ImVec2(x + size * 0.475f, pos.y + size * 0.53f), size * 0.5f, IM_COL32(250, 190, 40, 255));
+            x += size * 0.95f;
+        }
+    }
+    return x - pos.x;
+}
 
 // ---- Image ------------------------------------------------------------------------
 
@@ -89,7 +138,7 @@ void App::DrawImage() {
     const bool compare = compareCount_ > 1;
     for (const Tile& tile : Tiles()) {
         if (tile.index < 0) continue;
-        const FileEntry& f = folder_.Files()[size_t(tile.index)];
+        const FileEntry& f = FileAt(tile.index);
         const ViewGeometry g = GeometryFor(tile.index, tile.min, tile.max);
         const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
 
@@ -150,6 +199,14 @@ void App::DrawImage() {
                               ImVec2(tile.min.x + 3 * pad + ts.x, tile.min.y + 2 * pad + ts.y + pad * 0.5f),
                               active ? IM_COL32(40, 90, 170, 220) : IM_COL32(0, 0, 0, 150), 4 * dpiScale_);
             dl->AddText(ImVec2(tile.min.x + 2 * pad, tile.min.y + 1.5f * pad), IM_COL32_WHITE, text.c_str());
+            const core::Mark mark = MarkOf(f);
+            if (!mark.empty()) {
+                const float bs = ts.y;
+                const float bw = MarkBadgeWidth(bs, mark);
+                const ImVec2 b0(tile.min.x + pad, tile.min.y + 3 * pad + ts.y);
+                dl->AddRectFilled(b0, ImVec2(b0.x + bw + 2 * pad, b0.y + bs + pad), IM_COL32(0, 0, 0, 150), 4 * dpiScale_);
+                DrawMarkBadge(dl, ImVec2(b0.x + pad, b0.y + pad * 0.5f), bs, mark);
+            }
             if (active)
                 dl->AddRect(ImVec2(tile.min.x + 1, tile.min.y + 1), ImVec2(tile.max.x - 1, tile.max.y - 1),
                             IM_COL32(70, 140, 255, 255), 0, 0, 2 * dpiScale_);
@@ -167,6 +224,14 @@ void App::DrawEmpty() {
     ImGui::Begin("##empty", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    if (folder_.Count() > 0 && filter_ != core::Filter::All) {
+        ImGui::Text("No images match \"%s\"", core::FilterName(filter_));
+        TextDim("Ctrl+F changes the filter, Esc shows everything");
+        ImGui::Spacing();
+        if (ImGui::Button("Show all images")) SetFilter(core::Filter::All);
+        ImGui::End();
+        return;
+    }
     if (folder_.Folder().empty()) {
         ImGui::TextUnformatted("Drop an image or a folder here");
         TextDim("or use Ctrl+O, or \"Open with\" in Explorer");
@@ -203,6 +268,12 @@ void App::DrawOverlay() {
     if (TileCount() > 1) ImGui::TextColored(kBlue, "Compare %d  \xC2\xB7  tile %d", TileCount(), activeTile_ + 1);
     if (slideshow_) ImGui::TextColored(kBlue, "Slideshow  \xC2\xB7  %d s", settings_.slideshowSeconds);
     if (settings_.ovName) ImGui::TextUnformatted(ToUtf8(f->name).c_str());
+    if (const core::Mark mark = MarkOf(*f); !mark.empty()) {
+        const float bs = ImGui::GetTextLineHeight();
+        const float bw = DrawMarkBadge(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(), bs, mark);
+        ImGui::Dummy(ImVec2(bw, bs));
+    }
+    if (filter_ != core::Filter::All) ImGui::TextColored(kBlue, "Showing %s", core::FilterName(filter_));
     if (!f->companions.empty()) {
         bool raw = false, xmp = false;
         CompanionKinds(*f, raw, xmp);
@@ -212,7 +283,7 @@ void App::DrawOverlay() {
         const ImageFormat* fmt = formats_.ForExtension(f->ext);
         TextDim("%s", fmt ? fmt->name.c_str() : ToUtf8(f->ext).c_str());
     }
-    if (settings_.ovIndex) TextDim("%d / %d", ActiveIndex() + 1, folder_.Count());
+    if (settings_.ovIndex) TextDim("%d / %d", ActiveIndex() + 1, ViewCount());
     if (settings_.ovSize) TextDim("%s", FormatBytes(f->size).c_str());
     if (settings_.ovDims && f->probed && SUCCEEDED(f->probeHr)) TextDim("%u x %u", f->Oriented().w, f->Oriented().h);
     if (settings_.ovZoom && !g.source.empty()) TextDim("%.0f%%", g.zoom * 100.0f);
@@ -255,6 +326,7 @@ void App::DrawSidebar() {
     const size_t slash = folder.find_last_of(L'\\');
     ImGui::TextUnformatted(ToUtf8(slash == std::wstring::npos ? folder : folder.substr(slash + 1)).c_str());
     TextDim("%d images  |  %s", folder_.Count(), StorageName(storage_));
+    if (filter_ != core::Filter::All) ImGui::TextColored(kBlue, "Showing %s: %d", core::FilterName(filter_), ViewCount());
     TextDim("Cache %s of %s %s", FormatBytes(sched_.ResidentGpu()).c_str(), FormatBytes(limits_.gpu).c_str(),
             caps_.unified ? "(shared RAM)" : "VRAM");
     ImGui::Separator();
@@ -262,7 +334,7 @@ void App::DrawSidebar() {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
     ImGui::BeginChild("##list", ImVec2(0, 0), false, ImGuiWindowFlags_NoNav);
     const float rowH = std::round((float(settings_.thumbHeight) + 8) * dpiScale_);
-    const int n = folder_.Count();
+    const int n = ViewCount();
     if (scrollSidebarToCurrent_ && n) {
         const float target = float(current_) * rowH - (ImGui::GetWindowHeight() - rowH) * 0.5f;
         ImGui::SetScrollY(std::max(0.0f, target));
@@ -274,7 +346,7 @@ void App::DrawSidebar() {
     clip.Begin(n, rowH);
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
-            const FileEntry& e = folder_.Files()[size_t(i)];
+            const FileEntry& e = FileAt(i);
             ImGui::PushID(i);
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float rowW = ImGui::GetContentRegionAvail().x;
@@ -304,6 +376,11 @@ void App::DrawSidebar() {
             std::snprintf(line, sizeof line, "%d", i + 1);
             const float lh = ImGui::GetTextLineHeight();
             dl->AddText(ImVec2(tx, p.y + pad), ImGui::GetColorU32(ImGuiCol_Text), ToUtf8(e.name).c_str());
+            if (const core::Mark mark = MarkOf(e); !mark.empty()) {  // badge on its own line under the details
+                const float bs = std::round(ImGui::GetTextLineHeight() * 0.85f);
+                const float by = std::min(p.y + pad + 2 * ImGui::GetTextLineHeight(), p.y + rowH - bs - pad);
+                DrawMarkBadge(dl, ImVec2(tx, by), bs, mark);
+            }
             std::string info = line;
             if (e.probed && SUCCEEDED(e.probeHr)) {
                 std::snprintf(line, sizeof line, "  |  %u x %u", e.Oriented().w, e.Oriented().h);
@@ -619,10 +696,128 @@ void App::DrawInfo() {
     }
 }
 
+// ---- Marks panel ----------------------------------------------------------------------------
+
+void App::DrawMarksPanel() {
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    ImGui::SetNextWindowPos(ImVec2(float(rc.right) - 16 * dpiScale_, 16 * dpiScale_), ImGuiCond_Appearing, ImVec2(1, 0));
+    if (!ImGui::Begin("Marks (Shift+P)", &showMarks_,
+                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
+                          ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ImGui::End();
+        return;
+    }
+    int picks = 0, rejects = 0, rated = 0, marked = 0, stars[6] = {};
+    for (const FileEntry& f : folder_.Files()) {
+        const core::Mark m = MarkOf(f);
+        marked += !m.empty();
+        picks += m.flag == core::Flag::Pick;
+        rejects += m.flag == core::Flag::Reject;
+        rated += m.stars > 0;
+        ++stars[m.stars];
+    }
+    ImGui::Text("Picked %d    Rejected %d    Rated %d    of %d", picks, rejects, rated, folder_.Count());
+    if (rated) TextDim("5 stars %d   4: %d   3: %d   2: %d   1: %d", stars[5], stars[4], stars[3], stars[2], stars[1]);
+    TextDim("P pick, X reject, U clear, Ctrl+1-5 stars. Kept in memory for this session only;");
+    TextDim("nothing is written to your files.");
+    bool changed = ImGui::Checkbox("Show the next image after marking", &settings_.autoAdvance);
+
+    ImGui::SeparatorText("Show (Ctrl+F)");
+    for (int i = 0; i < int(core::Filter::Count); ++i) {
+        if (i % 3) ImGui::SameLine();
+        if (ImGui::RadioButton(core::FilterName(core::Filter(i)), int(filter_) == i)) SetFilter(core::Filter(i));
+    }
+
+    ImGui::SeparatorText("Apply to marked images");
+    std::vector<std::string> selLabels;
+    for (int i = 0; i < int(core::Selection::Count); ++i)
+        selLabels.push_back(std::string(core::SelectionName(core::Selection(i))) + " (" +
+                            std::to_string(SelectionIndices(core::Selection(i)).size()) + ")");
+    const float comboW = std::round(260 * dpiScale_);
+    ImGui::SetNextItemWidth(comboW);
+    if (ImGui::BeginCombo("Images", selLabels[size_t(marksSelection_)].c_str())) {
+        for (int i = 0; i < int(selLabels.size()); ++i)
+            if (ImGui::Selectable(selLabels[size_t(i)].c_str(), i == marksSelection_)) {
+                marksSelection_ = i;
+                confirmBatch_ = false;
+            }
+        ImGui::EndCombo();
+    }
+    auto actionLabel = [&](int a) {
+        if (a == 0) return std::string("Move to the Recycle Bin");
+        if (a == 10) return std::string("Copy their file paths");
+        return "Move to " + std::to_string(a) + ": " + DestinationLabel(a);
+    };
+    ImGui::SetNextItemWidth(comboW);
+    if (ImGui::BeginCombo("Action", actionLabel(marksAction_).c_str())) {
+        for (int a : {1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 10})
+            if (ImGui::Selectable(actionLabel(a).c_str(), a == marksAction_)) {
+                marksAction_ = a;
+                confirmBatch_ = false;
+            }
+        ImGui::EndCombo();
+    }
+    const core::Selection sel = core::Selection(marksSelection_);
+    const std::vector<int> chosen = SelectionIndices(sel);
+    ImGui::BeginDisabled(chosen.empty() || folder_.Folder().empty());
+    if (!confirmBatch_) {
+        char label[64];
+        std::snprintf(label, sizeof label, "Apply to %d image%s", int(chosen.size()), chosen.size() == 1 ? "" : "s");
+        if (ImGui::Button(label)) {
+            if (marksAction_ == 10) {
+                std::wstring text;
+                for (int i : chosen) {
+                    const FileEntry& f = folder_.Files()[size_t(i)];
+                    text += f.path + L"\r\n";
+                    for (const auto& c : f.companions) text += c + L"\r\n";
+                }
+                Toast(CopyTextToClipboard(hwnd_, text) ? "Copied " + std::to_string(chosen.size()) + " paths"
+                                                       : "Could not open the clipboard");
+            } else {
+                confirmBatch_ = true;
+            }
+        }
+    } else {
+        const std::string count = std::to_string(chosen.size()) + (chosen.size() == 1 ? " image" : " images");
+        const std::string where = marksAction_ == 0 ? std::string("the Recycle Bin") : DestinationLabel(marksAction_);
+        ImGui::TextColored(kAmber, "Move %s to %s?  Paired RAW/XMP files go with them.", count.c_str(), where.c_str());
+        if (ImGui::Button("Yes, do it")) {
+            pendingBatch_ = {sel, marksAction_};
+            pendingBatchSet_ = true;
+            confirmBatch_ = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) confirmBatch_ = false;
+    }
+    ImGui::EndDisabled();
+    TextDim("Ctrl+Z undoes a whole batch in one step.");
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(marked == 0);
+    if (!confirmClearMarks_) {
+        if (ImGui::Button("Clear all marks in this folder")) confirmClearMarks_ = true;
+    } else {
+        ImGui::TextColored(kAmber, "Clear the marks of %d image%s?", marked, marked == 1 ? "" : "s");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            for (const FileEntry& f : folder_.Files()) marks_.erase(ToLower(f.path));
+            confirmClearMarks_ = false;
+            SyncCurrentIndex();
+            UpdateCache();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep")) confirmClearMarks_ = false;
+    }
+    ImGui::EndDisabled();
+    ImGui::End();
+    if (changed) MarkSettingsDirty();
+}
+
 // ---- Stats & help ------------------------------------------------------------------------
 
 void App::DrawCacheMap(float height) {
-    const int n = folder_.Count();
+    const int n = ViewCount();
     if (!n) return;
     core::WindowParams p;
     p.count = n;
@@ -639,7 +834,7 @@ void App::DrawCacheMap(float height) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     const float cell = height, gap = 3 * dpiScale_;
     for (const auto& s : slots) {
-        const FileEntry& e = folder_.Files()[size_t(s.index)];
+        const FileEntry& e = FileAt(s.index);
         const core::EntryKey k{e.id, core::Variant::Fit};
         ImVec4 c(0.25f, 0.25f, 0.27f, 1);
         if (sched_.IsProbing(e.id) || sched_.IsDecoding(k)) c = kAmber;

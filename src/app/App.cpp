@@ -305,8 +305,24 @@ void App::OnCacheSettingsChanged() {
 // ---- Folder & navigation ----------------------------------------------------------
 
 const FileEntry* App::Current() const {
-    if (current_ < 0 || current_ >= folder_.Count()) return nullptr;
-    return &folder_.Files()[size_t(current_)];
+    if (current_ < 0 || current_ >= ViewCount()) return nullptr;
+    return &FileAt(current_);
+}
+
+void App::RebuildView() {
+    const int n = folder_.Count();
+    view_.clear();
+    posOf_.assign(size_t(n), -1);
+    for (int i = 0; i < n; ++i) {
+        if (filter_ != core::Filter::All && !core::Matches(filter_, MarkOf(folder_.Files()[size_t(i)]))) continue;
+        posOf_[size_t(i)] = int(view_.size());
+        view_.push_back(i);
+    }
+}
+
+int App::PosOfPath(const std::wstring& path) const {
+    const int i = folder_.IndexOfPath(path);
+    return i >= 0 && size_t(i) < posOf_.size() ? posOf_[size_t(i)] : -1;
 }
 
 void App::OpenPath(const std::wstring& raw) {
@@ -334,13 +350,15 @@ void App::OpenPath(const std::wstring& raw) {
     }
     folder_.SetPairing(settings_.pairRawJpeg);
     if (!folder_.Load(folder, formats_)) Toast("Could not read the folder");
+    filter_ = core::Filter::All;  // whatever was asked for must be visible
+    RebuildView();
     storage_ = DetectStorage(folder);
     gate_.SetSlots(ReadersFor(storage_));
     if (!same) watcher_.Start(folder, hwnd_, WM_APP_DIRCHANGED);
 
     int index = 0;
     if (!select.empty()) {
-        index = folder_.IndexOfPath(select);
+        index = PosOfPath(select);
         if (index < 0) {
             index = 0;
             if (GetFileAttributesW(select.c_str()) != INVALID_FILE_ATTRIBUTES)
@@ -348,7 +366,7 @@ void App::OpenPath(const std::wstring& raw) {
         }
     }
     current_ = index;
-    currentPath_ = folder_.Count() ? folder_.Files()[size_t(index)].path : L"";
+    currentPath_ = ViewCount() ? FileAt(index).path : L"";
     direction_ = 1;
     activeTile_ = 0;
     lastNavMs_ = 0;
@@ -391,14 +409,15 @@ void App::CheckEmpty() {
 }
 
 void App::SyncCurrentIndex() {
-    const int n = folder_.Count();
-    const int i = folder_.IndexOfPath(currentPath_);
+    RebuildView();
+    const int n = ViewCount();
+    const int i = PosOfPath(currentPath_);
     if (i >= 0) {
         current_ = i;
     } else {
-        // Current file vanished: whatever now sits at its position (the next file) takes over.
+        // Current file vanished (or was filtered out): whatever now sits at its position (the next file) takes over.
         current_ = n ? std::clamp(current_, 0, n - 1) : 0;
-        currentPath_ = n ? folder_.Files()[size_t(current_)].path : L"";
+        currentPath_ = n ? FileAt(current_).path : L"";
         if (compareCount_ == 1) ResetView();
     }
     activeTile_ = std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1));
@@ -406,7 +425,7 @@ void App::SyncCurrentIndex() {
 }
 
 void App::Navigate(int delta) {
-    const int n = folder_.Count();
+    const int n = ViewCount();
     if (n == 0) return;
     int next = current_ + delta;
     if (settings_.wrapAround)
@@ -417,9 +436,9 @@ void App::Navigate(int delta) {
 }
 
 void App::JumpTo(int index, int direction) {
-    if (index < 0 || index >= folder_.Count()) return;
+    if (index < 0 || index >= ViewCount()) return;
     current_ = index;
-    currentPath_ = folder_.Files()[size_t(index)].path;
+    currentPath_ = FileAt(index).path;
     direction_ = direction < 0 ? -1 : 1;
     lastNavMs_ = NowMs();
     settleArmed_ = true;
@@ -531,6 +550,155 @@ void App::RecycleActive() {
     UpdateCache();
     Toast("Deleted " + label +
           (permanent ? "  (permanently)" : untracked ? "  (restore it from the Recycle Bin)" : "  \xC2\xB7  Ctrl+Z to undo"));
+    CheckEmpty();
+    RequestFrames();
+}
+
+// ---- Session marks ------------------------------------------------------------------
+
+core::Mark App::MarkOf(const FileEntry& f) const {
+    if (marks_.empty()) return {};
+    auto it = marks_.find(ToLower(f.path));
+    return it == marks_.end() ? core::Mark{} : it->second;
+}
+
+void App::SetMark(const FileEntry& f, core::Mark m) {
+    if (m.empty())
+        marks_.erase(ToLower(f.path));
+    else
+        marks_[ToLower(f.path)] = m;
+}
+
+void App::EditActiveMark(core::Mark (*edit)(core::Mark, int), int arg, const char* what) {
+    const FileEntry* f = Active();
+    if (!f) return;
+    const std::wstring path = f->path;
+    const core::Mark before = MarkOf(*f), after = edit(before, arg);
+    SetMark(*f, after);
+    std::string text = what;
+    if (after.stars) text += "  " + std::string(size_t(after.stars), '*');
+    Toast(text);
+    RequestFrames();
+    if (filter_ != core::Filter::All) {
+        SyncCurrentIndex();  // it may have left the filtered view: the next image takes its place
+        UpdateCache();
+        if (PosOfPath(path) < 0) return;
+    }
+    // Culling flow: mark, see the next one. Not in compare mode, where the set stays put.
+    if (settings_.autoAdvance && compareCount_ == 1 && !(after == before)) Navigate(+1);
+}
+
+void App::SetFilter(core::Filter f) {
+    if (f == filter_) return;
+    filter_ = f;
+    const int before = current_;
+    SyncCurrentIndex();
+    if (current_ != before || PosOfPath(currentPath_) >= 0) ResetView();
+    UpdateCache();
+    scrollSidebarToCurrent_ = true;
+    Toast(std::string("Showing: ") + core::FilterName(f) + "  (" + std::to_string(ViewCount()) + ")");
+    RequestFrames();
+}
+
+std::vector<int> App::SelectionIndices(core::Selection sel) const {
+    std::vector<int> out;
+    if (marks_.empty() && sel != core::Selection::Unflagged) return out;
+    for (int i = 0; i < folder_.Count(); ++i)
+        if (core::Matches(sel, MarkOf(folder_.Files()[size_t(i)]))) out.push_back(i);
+    return out;
+}
+
+void App::RunBatch(const BatchRequest& req) {
+    std::vector<std::vector<std::wstring>> groups;
+    for (int i : SelectionIndices(req.selection)) {
+        const FileEntry& f = folder_.Files()[size_t(i)];
+        std::vector<std::wstring> g{f.path};
+        g.insert(g.end(), f.companions.begin(), f.companions.end());
+        groups.push_back(std::move(g));
+    }
+    if (groups.empty()) {
+        Toast("No images are marked that way");
+        return;
+    }
+    std::wstring dest;
+    std::string where;
+    if (req.destKey) {
+        dest = DestinationFor(req.destKey);
+        where = DestinationLabel(req.destKey);
+        if (dest.empty() || CompareStringOrdinal(dest.c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
+            Toast("Destination " + std::to_string(req.destKey) + " is not usable from this folder");
+            return;
+        }
+    }
+    FileOpResult r;
+    if (req.destKey) {
+        r = MoveGroups(hwnd_, groups, dest, settings_.renameOnConflict);
+    } else {
+        std::vector<std::wstring> flat;
+        for (const auto& g : groups) flat.insert(flat.end(), g.begin(), g.end());
+        r = RecycleFiles(hwnd_, flat);
+    }
+
+    // Per group: all of it or none of it (a JPEG never leaves without its RAW).
+    UndoOp op;
+    const std::string count = std::to_string(groups.size()) + (groups.size() == 1 ? " image" : " images");
+    op.label = req.destKey ? "move " + count + " to " + where : "delete " + count;
+    int moved = 0, failed = 0;
+    bool split = false, permanent = false, untracked = false;
+    HRESULT firstError = S_OK;
+    std::vector<std::wstring> removed;
+    size_t base = 0;
+    for (const auto& g : groups) {
+        std::vector<UndoFile> done;
+        bool ok = true;
+        for (size_t k = 0; k < g.size(); ++k) {
+            if (base + k >= r.files.size()) {
+                ok = false;
+                continue;
+            }
+            const OpFile& file = r.files[base + k];
+            if (FAILED(file.hr)) {
+                ok = false;
+                if (SUCCEEDED(firstError)) firstError = file.hr;
+            } else if (req.destKey) {
+                UndoFile u{file.from, file.to, false};
+                StatFile(file.to, u.size, u.mtime);
+                done.push_back(u);
+            } else if (file.untracked) {
+                untracked = true;  // in the Recycle Bin, but we do not know which item
+            } else if (file.to.empty()) {
+                permanent = true;  // the shell deleted it outright (after asking)
+            } else {
+                done.push_back({file.from, file.to, true});
+            }
+        }
+        if (ok) {
+            ++moved;
+            removed.push_back(g[0]);
+            op.files.insert(op.files.end(), done.begin(), done.end());
+        } else {
+            ++failed;
+            const auto stuck = RollBack(done);
+            split |= !stuck.empty();
+            op.files.insert(op.files.end(), stuck.begin(), stuck.end());
+        }
+        base += g.size();
+    }
+    PushUndo(std::move(op));
+    for (const auto& p : removed) folder_.RemovePath(p);
+    if (split || untracked || permanent) {
+        ReloadFolder();
+    } else {
+        SyncCurrentIndex();
+        UpdateCache();
+    }
+    std::string msg = req.destKey ? "Moved " + std::to_string(moved) + " to " + where
+                                  : "Deleted " + std::to_string(moved);
+    msg += moved == 1 ? " image" : " images";
+    if (failed) msg += ", " + std::to_string(failed) + " failed (" + DescribeError(firstError) + ")";
+    if (r.aborted && moved == 0) msg = "Cancelled";
+    else if (moved) msg += permanent ? "  (some permanently)" : untracked ? "  (restore from the Recycle Bin)" : "  \xC2\xB7  Ctrl+Z undoes all of it";
+    Toast(msg);
     CheckEmpty();
     RequestFrames();
 }
@@ -656,7 +824,8 @@ void App::Undo() {
     const std::wstring& primary = op.files.front().original;
     if (CompareStringOrdinal(ParentFolder(primary).c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
         for (const auto& f : op.files) folder_.Refresh(LeafOf(f.original), formats_, 0);
-        const int i = folder_.IndexOfPath(primary);
+        RebuildView();
+        const int i = PosOfPath(primary);
         if (i >= 0) {
             current_ = std::max(0, i - activeTile_);
             JumpTo(current_, direction_);
@@ -770,7 +939,7 @@ void App::ToggleSlideshow() {
         Toast("Slideshow stopped");
         return;
     }
-    if (folder_.Count() < 2) return;
+    if (ViewCount() < 2) return;
     if (compareCount_ > 1) SetCompare(1);
     slideshow_ = true;
     slideShownAt_ = 0;
@@ -847,7 +1016,7 @@ void App::CopyActiveImage() {
 void App::UpdateTitle() {
     std::wstring title = L"FastImageViewer";
     if (const FileEntry* f = Active())
-        title = f->name + L"  \u2014  " + std::to_wstring(ActiveIndex() + 1) + L" / " + std::to_wstring(folder_.Count()) +
+        title = f->name + L"  \u2014  " + std::to_wstring(ActiveIndex() + 1) + L" / " + std::to_wstring(ViewCount()) +
                 L"  \u2014  FastImageViewer";
     SetWindowTextW(hwnd_, title.c_str());
 }
@@ -905,7 +1074,7 @@ uint64_t App::TransientFor(const FileEntry& f, const core::DecodePlan& plan) con
 
 std::vector<core::Want> App::BuildWants() {
     std::vector<core::Want> out;
-    const int n = folder_.Count();
+    const int n = ViewCount();
     if (n == 0) return out;
     const bool trim = minimized_ && trimmed_;
 
@@ -929,7 +1098,7 @@ std::vector<core::Want> App::BuildWants() {
     auto later = [&](uint64_t t) { recheck = recheck ? std::min(recheck, t) : t; };
 
     auto addWant = [&](int index, int rank, bool isVisible, int tileSlot) {
-        FileEntry& f = folder_.Files()[size_t(index)];
+        FileEntry& f = FileAt(index);
         const bool stable = f.changedAt == 0 || now >= f.changedAt + kStableMs;
         const bool waiting = f.retryAt > now;
         // Reading an online-only file makes OneDrive download it to disk: only on request.
@@ -973,7 +1142,7 @@ std::vector<core::Want> App::BuildWants() {
     // Forget frozen full-size plans of images that are no longer on screen.
     for (auto it = fullPlans_.begin(); it != fullPlans_.end();) {
         const bool shown = std::any_of(visible.begin(), visible.end(),
-                                       [&](int i) { return folder_.Files()[size_t(i)].id == it->first; });
+                                       [&](int i) { return FileAt(i).id == it->first; });
         it = shown ? std::next(it) : fullPlans_.erase(it);
     }
     std::stable_sort(out.begin(), out.end(), [](const core::Want& a, const core::Want& b) { return a.rank < b.rank; });
@@ -1201,7 +1370,7 @@ void App::ViewArea(ImVec2& mn, ImVec2& mx) const {
     mx = ImVec2(float(rc.right), float(rc.bottom));
 }
 
-int App::TileCount() const { return std::max(0, std::min(compareCount_, folder_.Count())); }
+int App::TileCount() const { return std::max(0, std::min(compareCount_, ViewCount())); }
 
 int App::VisibleTiles() const {
     int n = 0;
@@ -1210,7 +1379,7 @@ int App::VisibleTiles() const {
 }
 
 int App::TileIndex(int slot) const {
-    const int n = folder_.Count();
+    const int n = ViewCount();
     if (n == 0 || slot < 0 || slot >= TileCount()) return -1;
     int i = current_ + slot;
     if (i >= n) {
@@ -1249,20 +1418,20 @@ int App::TileAt(ImVec2 p) const {
 }
 
 int App::ActiveIndex() const {
-    if (folder_.Count() == 0) return -1;
+    if (ViewCount() == 0) return -1;
     if (compareCount_ <= 1) return current_;
     return TileIndex(std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1)));
 }
 
 const FileEntry* App::Active() const {
     const int i = ActiveIndex();
-    return i >= 0 && i < folder_.Count() ? &folder_.Files()[size_t(i)] : nullptr;
+    return i >= 0 && i < ViewCount() ? &FileAt(i) : nullptr;
 }
 
 bool App::IsVisible(uint64_t item) const {
     for (int t = 0; t < TileCount(); ++t) {
         const int i = TileIndex(t);
-        if (i >= 0 && folder_.Files()[size_t(i)].id == item) return true;
+        if (i >= 0 && FileAt(i).id == item) return true;
     }
     return false;
 }
@@ -1278,8 +1447,8 @@ App::ViewGeometry App::GeometryFor(int index, ImVec2 mn, ImVec2 mx) const {
     ViewGeometry g;
     g.viewMin = mn;
     g.viewMax = mx;
-    if (index < 0 || index >= folder_.Count()) return g;
-    const FileEntry& file = folder_.Files()[size_t(index)];
+    if (index < 0 || index >= ViewCount()) return g;
+    const FileEntry& file = FileAt(index);
     g.source = SourceSize(file);
     if (RotationOf(file) & 1) std::swap(g.source.w, g.source.h);  // view rotation
     if (g.source.empty()) return g;
@@ -1311,7 +1480,7 @@ App::ViewGeometry App::Geometry() const {
     }
     ImVec2 mn, mx;
     ViewArea(mn, mx);
-    return GeometryFor(folder_.Count() ? current_ : -1, mn, mx);
+    return GeometryFor(ViewCount() ? current_ : -1, mn, mx);
 }
 
 void App::ResetView() {
@@ -1437,6 +1606,10 @@ void App::Tick() {
         pendingOpen_ = 0;
         ShowOpenDialog(folder);
     }
+    if (pendingBatchSet_) {  // shell file operations pump messages: never inside a frame
+        pendingBatchSet_ = false;
+        RunBatch(pendingBatch_);
+    }
     if (pendingEditorPick_) {
         pendingEditorPick_ = false;
         ComPtr<IFileOpenDialog> dlg;
@@ -1491,7 +1664,7 @@ void App::Tick() {
         } else if (ready && slideShownAt_ == 0) {
             slideShownAt_ = now;
         } else if (ready && now >= slideShownAt_ + uint64_t(settings_.slideshowSeconds) * 1000) {
-            if (!settings_.wrapAround && current_ >= folder_.Count() - 1) {
+            if (!settings_.wrapAround && current_ >= ViewCount() - 1) {
                 StopSlideshow();
                 Toast("Slideshow finished");
             } else {
@@ -1533,6 +1706,7 @@ void App::RenderFrame() {
     if (!showSettings_) recordingAction_ = -1;  // closed while waiting for a key
     if (settings_.showStats) DrawStats();
     if (settings_.showInfo) DrawInfo();
+    if (showMarks_) DrawMarksPanel();
     if (showHelp_) DrawHelp();
 
     ImGui::Render();
@@ -1593,8 +1767,10 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         if (repeat) return true;
         if (showHelp_) showHelp_ = false;
         else if (showSettings_) showSettings_ = false;
+        else if (showMarks_) showMarks_ = false;
         else if (slideshow_) StopSlideshow();
         else if (compareCount_ > 1) SetCompare(1);
+        else if (filter_ != core::Filter::All) SetFilter(core::Filter::All);
         else if (fullscreen_) ToggleFullscreen();
         else PostMessageW(hwnd_, WM_CLOSE, 0, 0);
         RequestFrames();
@@ -1623,7 +1799,7 @@ void App::Execute(core::Action a, bool repeat) {
         case A::NextSet: Navigate(+page); break;  // in compare mode: the next set
         case A::PrevSet: Navigate(-page); break;
         case A::First: JumpTo(0, 1); break;
-        case A::Last: JumpTo(std::max(0, folder_.Count() - page), -1); break;
+        case A::Last: JumpTo(std::max(0, ViewCount() - page), -1); break;
         case A::ZoomIn: ZoomAt(1.25f, vc); break;
         case A::ZoomOut: ZoomAt(0.8f, vc); break;
         case A::Fit:
@@ -1651,6 +1827,16 @@ void App::Execute(core::Action a, bool repeat) {
             MoveActive(int(a) - int(A::Move1) + 1);
             break;
         case A::Undo: Undo(); break;
+        case A::Pick: EditActiveMark([](core::Mark m, int) { return core::TogglePick(m); }, 0, "Pick"); break;
+        case A::Reject: EditActiveMark([](core::Mark m, int) { return core::ToggleReject(m); }, 0, "Reject"); break;
+        case A::Unflag: EditActiveMark([](core::Mark, int) { return core::Mark{}; }, 0, "Mark cleared"); break;
+        case A::Rate0: case A::Rate1: case A::Rate2: case A::Rate3: case A::Rate4: case A::Rate5: {
+            const int stars = int(a) - int(A::Rate0);
+            EditActiveMark(core::SetStars, stars, stars ? "Rated" : "Stars cleared");
+            break;
+        }
+        case A::PicksPanel: showMarks_ = !showMarks_; RequestFrames(); break;
+        case A::CycleFilter: SetFilter(core::NextFilter(filter_)); break;
         case A::Slideshow: ToggleSlideshow(); break;
         case A::CopyImage: CopyActiveImage(); break;
         case A::CopyPath: CopyActivePath(); break;

@@ -86,6 +86,7 @@ std::vector<Field> Fields(Settings& s) {
         {"wheelNavigates", Field::Bool, &s.wheelNavigates},
         {"slideshowSeconds", Field::Int, &s.slideshowSeconds},
         {"editorPath", Field::Str, &s.editorPath},
+        {"autoAdvance", Field::Bool, &s.autoAdvance},
     };
     for (int i = 0; i < 9; ++i) f.push_back({kDest[i], Field::Str, &s.destinations[size_t(i)]});
     return f;

@@ -10,6 +10,7 @@
 #include "../src/core/FileGroups.h"
 #include "../src/core/Histogram.h"
 #include "../src/core/Keys.h"
+#include "../src/core/Marks.h"
 #include "../src/core/MemoryLimits.h"
 #include "../src/core/Pixels.h"
 #include "../src/core/Scheduler.h"
@@ -670,6 +671,32 @@ static void TestHistogram() {
     CHECK(HistogramLevel({300, 200}, FullMipLevels({300, 200})) == 0);
 }
 
+static void TestMarks() {
+    std::puts("marks");
+    Mark m;
+    CHECK(m.empty() && Matches(Filter::All, m) && Matches(Filter::Unflagged, m) && !Matches(Filter::Picks, m));
+    m = TogglePick(m);
+    CHECK(m.flag == Flag::Pick && Matches(Filter::Picks, m) && !Matches(Filter::Unflagged, m));
+    m = ToggleReject(m);  // a reject replaces the pick
+    CHECK(m.flag == Flag::Reject && Matches(Filter::Rejects, m) && !Matches(Filter::Picks, m));
+    m = ToggleReject(m);
+    CHECK(m.flag == Flag::None && m.empty());
+    m = SetStars(m, 9);
+    CHECK(m.stars == 5 && Matches(Filter::Rated, m) && !m.empty());
+    CHECK(SetStars(m, -1).stars == 0);
+    m = SetStars(Mark{}, 3);
+    CHECK(Matches(Selection::Stars1, m) && Matches(Selection::Stars3, m) && !Matches(Selection::Stars4, m));
+    CHECK(Matches(Selection::Unflagged, m) && !Matches(Selection::Picks, m));
+    // Ctrl+F visits every filter and comes back to All.
+    Filter f = Filter::All;
+    for (int i = 0; i < int(Filter::Count); ++i) {
+        CHECK(FilterName(f)[0] != 0);
+        f = NextFilter(f);
+    }
+    CHECK(f == Filter::All);
+    for (int i = 0; i < int(Selection::Count); ++i) CHECK(SelectionName(Selection(i))[0] != 0);
+}
+
 static void TestKeys() {
     std::puts("keys");
     for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
@@ -723,6 +750,7 @@ int main() {
     TestGroups();
     TestExifInfo();
     TestHistogram();
+    TestMarks();
     TestKeys();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <set>
 
 #include "../core/FileGroups.h"
 #include "System.h"
@@ -172,50 +173,59 @@ bool Unsupported(HRESULT hr) { return hr == E_NOTIMPL || hr == REGDB_E_CLASSNOTR
 
 bool PathExists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
-FileOpResult MoveFiles(HWND owner, const std::vector<std::wstring>& paths, const std::wstring& destDir,
-                       bool renameOnCollision) {
+FileOpResult MoveGroups(HWND owner, const std::vector<std::vector<std::wstring>>& groups, const std::wstring& destDir,
+                        bool renameOnCollision) {
     FileOpResult r;
-    for (const auto& p : paths) r.files.push_back({p, L"", E_FAIL, false});
-    if (paths.empty()) return r;
+    for (const auto& g : groups)
+        for (const auto& p : g) r.files.push_back({p, L"", E_FAIL, false});
+    if (r.files.empty()) return r;
     const int mk = SHCreateDirectoryExW(nullptr, destDir.c_str(), nullptr);
     if (mk != ERROR_SUCCESS && mk != ERROR_ALREADY_EXISTS && mk != ERROR_FILE_EXISTS) {
         for (auto& f : r.files) f.hr = HRESULT_FROM_WIN32(mk);
         return r;
     }
 
-    // One set of names for the whole group, so pairs stay paired: either the
-    // original names, or the same "(n)" suffix on every file.
-    std::vector<std::wstring> leaves, names, targets;
-    for (const auto& p : paths) leaves.push_back(LeafName(p));
-    auto anyExists = [&](const std::vector<std::wstring>& candidate) {
-        for (const auto& n : candidate)
-            if (PathExists(JoinPath(destDir, n))) return true;
-        return false;
-    };
-    names = leaves;
-    if (anyExists(names)) {
-        if (!renameOnCollision) {
-            for (auto& f : r.files) f.hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
-            return r;
+    // One set of names per group, so pairs stay paired: either the original
+    // names, or the same "(n)" suffix on every file. Names chosen earlier in
+    // this batch count as taken.
+    std::vector<std::wstring> names(r.files.size()), targets(r.files.size());
+    std::vector<bool> refused(r.files.size(), false);
+    std::set<std::wstring> taken;
+    size_t base = 0;
+    for (const auto& g : groups) {
+        std::vector<std::wstring> leaves;
+        for (const auto& p : g) leaves.push_back(LeafName(p));
+        auto clash = [&](const std::vector<std::wstring>& candidate) {
+            for (const auto& n : candidate)
+                if (taken.count(ToLower(n)) || PathExists(JoinPath(destDir, n))) return true;
+            return false;
+        };
+        std::vector<std::wstring> chosen = leaves;
+        bool ok = !clash(chosen);
+        for (int n = 2; !ok && renameOnCollision && n < 10000; ++n) ok = !clash(chosen = core::SuffixedNames(leaves, n));
+        for (size_t i = 0; i < g.size(); ++i) {
+            if (!ok) {
+                refused[base + i] = true;
+                r.files[base + i].hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
+                continue;
+            }
+            names[base + i] = chosen[i];
+            targets[base + i] = JoinPath(destDir, chosen[i]);
+            taken.insert(ToLower(chosen[i]));
         }
-        for (int n = 2; n < 10000 && anyExists(names = core::SuffixedNames(leaves, n)); ++n) {
-        }
-        if (anyExists(names)) {
-            for (auto& f : r.files) f.hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
-            return r;
-        }
+        base += g.size();
     }
-    for (const auto& n : names) targets.push_back(JoinPath(destDir, n));
 
     ComPtr<IShellItem> dest;
     HRESULT hr = SHCreateItemFromParsingName(destDir.c_str(), nullptr, IID_PPV_ARGS(&dest));
     // No FOF_NOCONFIRMATION: if a name appears in the meantime, Windows asks instead of replacing.
     ComPtr<IFileOperation> op = SUCCEEDED(hr) ? NewOperation(owner, FOF_NOCONFIRMMKDIR) : nullptr;
-    std::vector<ComPtr<IShellItem>> items(paths.size());
+    std::vector<ComPtr<IShellItem>> items(r.files.size());
     int queued = 0;
-    for (size_t i = 0; op && i < paths.size(); ++i) {
+    for (size_t i = 0; op && i < r.files.size(); ++i) {
+        if (refused[i]) continue;
         OpFile& f = r.files[i];
-        if (SUCCEEDED(f.hr = SHCreateItemFromParsingName(paths[i].c_str(), nullptr, IID_PPV_ARGS(&items[i]))) &&
+        if (SUCCEEDED(f.hr = SHCreateItemFromParsingName(f.from.c_str(), nullptr, IID_PPV_ARGS(&items[i]))) &&
             SUCCEEDED(f.hr = op->MoveItem(items[i].Get(), dest.Get(), names[i].c_str(), nullptr))) {
             f.hr = E_PENDING;
             ++queued;
@@ -224,15 +234,26 @@ FileOpResult MoveFiles(HWND owner, const std::vector<std::wstring>& paths, const
     if (op) Perform(op.Get(), r, queued, items, targets, false);
 
     // The shell could not do it at all: plain Win32 moves (never replacing).
-    const bool fallback = !op || std::all_of(r.files.begin(), r.files.end(), [](const OpFile& f) { return Unsupported(f.hr); });
+    bool fallback = !op;
+    if (!fallback) {
+        fallback = true;
+        for (size_t i = 0; i < r.files.size(); ++i)
+            if (!refused[i] && !Unsupported(r.files[i].hr)) fallback = false;
+    }
     if (fallback) {
         for (size_t i = 0; i < r.files.size(); ++i) {
+            if (refused[i]) continue;
             OpFile& f = r.files[i];
             f.hr = LegacyMove(f.from, targets[i]);
             if (SUCCEEDED(f.hr)) f.to = targets[i];
         }
     }
     return r;
+}
+
+FileOpResult MoveFiles(HWND owner, const std::vector<std::wstring>& paths, const std::wstring& destDir,
+                       bool renameOnCollision) {
+    return MoveGroups(owner, {paths}, destDir, renameOnCollision);
 }
 
 FileOpResult RecycleFiles(HWND owner, const std::vector<std::wstring>& paths) {

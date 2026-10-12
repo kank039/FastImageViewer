@@ -58,6 +58,7 @@ struct Settings {
     bool wheelNavigates = false;   // wheel = previous/next (Ctrl+wheel zooms) instead of zoom
     int slideshowSeconds = 4;
     std::string editorPath;        // "Open in editor"; empty = Windows "Open with" chooser
+    bool autoAdvance = true;       // after marking an image, show the next one
     std::map<std::string, std::string> keyBindings;  // action id -> chords, only where changed
 
     // Camera RAW is off by default: RAW+JPEG pairs would otherwise show every photo twice.
