@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 
+#include "../core/FileGroups.h"
+
 namespace fiv {
 
 struct ImageFormat {
@@ -23,6 +25,10 @@ public:
     std::vector<std::string> DisabledNames() const;
     const ImageFormat* ForExtension(const std::wstring& lowerExt) const;
     bool IsEnabled(const std::wstring& lowerExt) const;
+    // Pairing role of a file: RAW and .xmp are classified even when not shown.
+    core::FileKind Classify(const std::wstring& lowerExt) const;
+    bool RawEnabled() const;
+    bool IsRaw(const std::wstring& lowerExt) const;
     std::vector<ImageFormat>& All() { return formats_; }
 
 private:

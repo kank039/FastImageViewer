@@ -16,6 +16,9 @@ option(FIV_BUILD_TESTS "Build the core unit tests" ON)
 add_library(fiv_core STATIC
     src/core/CacheWindow.cpp
     src/core/DecodePlan.cpp
+    src/core/Exif.cpp
+    src/core/FileGroups.cpp
+    src/core/Histogram.cpp
     src/core/MemoryLimits.cpp
     src/core/Pixels.cpp
     src/core/Scheduler.cpp
@@ -45,6 +48,7 @@ if(WIN32)
         src/main.cpp
         src/app/App.cpp
         src/app/AppUi.cpp
+        src/platform/FileOps.cpp
         src/platform/FileStream.cpp
         src/platform/Folder.cpp
         src/platform/Formats.cpp

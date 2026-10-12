@@ -8,6 +8,8 @@
 #include <string>
 
 #include "../core/DecodePlan.h"
+#include "../core/Exif.h"
+#include "../core/Histogram.h"
 #include "Jobs.h"
 #include "Win.h"
 
@@ -19,13 +21,16 @@ struct ProbeResult {
     int orientation = 1;     // EXIF orientation to apply (1 = none)
     bool canPrescale = false;
     bool progressive = false;
+    core::PhotoInfo photo;
     ComPtr<ID3D11ShaderResourceView> thumb;  // embedded preview, if requested and present
     core::Size thumbSize;
 };
 
 // Reads only the header (plus the embedded thumbnail when `thumbDevice` is set).
+// headExif: the format keeps EXIF at the start of the file (JPEG, TIFF-based RAW),
+// so it is parsed from the first 256 KB; otherwise WIC's metadata reader is used.
 ProbeResult ProbeImage(WorkerContext& ctx, ID3D11Device* thumbDevice, const std::wstring& path,
-                       bool honorExifOrientation);
+                       bool honorExifOrientation, bool headExif);
 
 struct DecodeRequest {
     std::wstring path;
@@ -45,6 +50,7 @@ struct DecodeResult {
     HRESULT hr = E_FAIL;
     bool retry = false;  // transient failure (memory, file changed): try again later
     ComPtr<ID3D11ShaderResourceView> srv;
+    std::shared_ptr<const core::Histogram> histogram;  // from a small mip level (4 KB)
     double ms = 0;
 };
 

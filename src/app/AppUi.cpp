@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <cstdarg>
 #include <cstdio>
 
@@ -45,6 +46,13 @@ void HelpMarker(const char* text) {
     }
 }
 
+void CompanionKinds(const FileEntry& f, bool& raw, bool& xmp) {
+    for (const auto& c : f.companions) {
+        const size_t dot = c.find_last_of(L'.');
+        (dot != std::wstring::npos && ToLower(c.substr(dot)) == L".xmp" ? xmp : raw) = true;
+    }
+}
+
 void SetPointSampler(const ImDrawList*, const ImDrawCmd* cmd) {
     auto* gpu = static_cast<Gpu*>(cmd->UserCallbackData);
     ID3D11SamplerState* s = gpu->PointSampler();
@@ -56,60 +64,85 @@ void SetPointSampler(const ImDrawList*, const ImDrawCmd* cmd) {
 // ---- Image ------------------------------------------------------------------------
 
 void App::DrawImage() {
-    const FileEntry* f = Current();
-    if (!f) {
+    if (!Current()) {
         DrawEmpty();
         return;
     }
-    const ViewGeometry g = Geometry();
-    const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const bool compare = compareCount_ > 1;
+    for (const Tile& tile : Tiles()) {
+        if (tile.index < 0) continue;
+        const FileEntry& f = folder_.Files()[size_t(tile.index)];
+        const ViewGeometry g = GeometryFor(tile.index, tile.min, tile.max);
+        const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
 
-    const Texture* tex = TextureFor(f->id);
-    const Texture* shown = tex ? tex : (previewItem_ == f->id && preview_.srv ? &preview_ : nullptr);
-    if (shown && !g.source.empty()) {
-        const ImVec2 size(float(g.source.w) * g.zoom, float(g.source.h) * g.zoom);
-        const ImVec2 pmin(std::round(vc.x - g.center.x * g.zoom), std::round(vc.y - g.center.y * g.zoom));
-        const ImVec2 pmax(pmin.x + size.x, pmin.y + size.y);
-        const float texelScale = size.x / float(std::max(1u, shown->size.w));  // screen pixels per texel
-        const bool point = settings_.pixelatedZoom && shown != &preview_ && texelScale > 1.01f;
-        dl->PushClipRect(g.viewMin, g.viewMax, false);
-        if (point) dl->AddCallback(SetPointSampler, &gpu_);
-        dl->AddImage(ToTex(shown->srv.Get()), pmin, pmax);
-        if (point) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
-        dl->PopClipRect();
+        const Texture* tex = TextureFor(f.id);
+        const Texture* shown = tex ? tex : (previewItem_ == f.id && preview_.srv ? &preview_ : nullptr);
+        if (shown && !g.source.empty()) {
+            const ImVec2 size(float(g.source.w) * g.zoom, float(g.source.h) * g.zoom);
+            const ImVec2 pmin(std::round(vc.x - g.center.x * g.zoom), std::round(vc.y - g.center.y * g.zoom));
+            const ImVec2 pmax(pmin.x + size.x, pmin.y + size.y);
+            const float texelScale = size.x / float(std::max(1u, shown->size.w));  // screen pixels per texel
+            const bool point = settings_.pixelatedZoom && shown != &preview_ && texelScale > 1.01f;
+            dl->PushClipRect(g.viewMin, g.viewMax, false);
+            if (point) dl->AddCallback(SetPointSampler, &gpu_);
+            dl->AddImage(ToTex(shown->srv.Get()), pmin, pmax);
+            if (point) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+            dl->PopClipRect();
 
-        // Zoomed past the screen-sized texture: fetch the full-resolution version of this one image.
-        if (tex && !wantFull_ && texelScale > 1.02f && tex->size.w < g.source.w &&
-            settings_.decodeMode == int(core::DecodeMode::FitScreen)) {
-            wantFull_ = true;
-            UpdateCache();
+            // Zoomed past the screen-sized texture: fetch full-resolution versions of the visible images.
+            if (tex && !wantFull_ && texelScale > 1.02f && tex->size.w < g.source.w &&
+                settings_.decodeMode == int(core::DecodeMode::FitScreen)) {
+                wantFull_ = true;
+                UpdateCache();
+            }
         }
-    }
 
-    if (!tex) {
-        std::string msg;
-        ImVec4 color = kDim;
-        if (!f->error.empty() && f->retryAt <= NowMs()) {
-            msg = f->error;
-            color = kRed;
-        } else if (f->CloudOnly()) {
-            msg = "Downloading online-only file...";
-        } else {
-            msg = "Loading...";
+        if (!tex) {
+            std::string msg;
+            ImVec4 color = kDim;
+            if (!f.error.empty() && f.retryAt <= NowMs()) {
+                msg = f.error;
+                color = kRed;
+            } else if (f.CloudOnly()) {
+                msg = "Downloading online-only file...";
+            } else {
+                msg = "Loading...";
+            }
+            const ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
+            const ImVec2 pos(vc.x - ts.x * 0.5f, shown ? g.viewMax.y - ts.y - 24 * dpiScale_ : vc.y - ts.y * 0.5f);
+            dl->PushClipRect(g.viewMin, g.viewMax, true);
+            dl->AddRectFilled(ImVec2(pos.x - 10 * dpiScale_, pos.y - 6 * dpiScale_),
+                              ImVec2(pos.x + ts.x + 10 * dpiScale_, pos.y + ts.y + 6 * dpiScale_), IM_COL32(0, 0, 0, 150),
+                              6 * dpiScale_);
+            dl->AddText(pos, ImGui::ColorConvertFloat4ToU32(color), msg.c_str());
+            dl->PopClipRect();
         }
-        const ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
-        const ImVec2 pos(vc.x - ts.x * 0.5f, shown ? g.viewMax.y - ts.y - 24 * dpiScale_ : vc.y - ts.y * 0.5f);
-        dl->AddRectFilled(ImVec2(pos.x - 10 * dpiScale_, pos.y - 6 * dpiScale_),
-                          ImVec2(pos.x + ts.x + 10 * dpiScale_, pos.y + ts.y + 6 * dpiScale_), IM_COL32(0, 0, 0, 150),
-                          6 * dpiScale_);
-        dl->AddText(pos, ImGui::ColorConvertFloat4ToU32(color), msg.c_str());
+
+        if (compare) {  // tile caption + active outline
+            const bool active = tile.slot == activeTile_;
+            char caption[32];
+            std::snprintf(caption, sizeof caption, "%d  ", tile.index + 1);
+            const std::string text = caption + ToUtf8(f.name);
+            const float pad = 6 * dpiScale_;
+            const ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+            dl->PushClipRect(tile.min, tile.max, true);
+            dl->AddRectFilled(ImVec2(tile.min.x + pad, tile.min.y + pad),
+                              ImVec2(tile.min.x + 3 * pad + ts.x, tile.min.y + 2 * pad + ts.y + pad * 0.5f),
+                              active ? IM_COL32(40, 90, 170, 220) : IM_COL32(0, 0, 0, 150), 4 * dpiScale_);
+            dl->AddText(ImVec2(tile.min.x + 2 * pad, tile.min.y + 1.5f * pad), IM_COL32_WHITE, text.c_str());
+            if (active)
+                dl->AddRect(ImVec2(tile.min.x + 1, tile.min.y + 1), ImVec2(tile.max.x - 1, tile.max.y - 1),
+                            IM_COL32(70, 140, 255, 255), 0, 0, 2 * dpiScale_);
+            dl->PopClipRect();
+        }
     }
 }
 
 void App::DrawEmpty() {
-    const ViewGeometry g = Geometry();
-    const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    const ImVec2 vc((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
     ImGui::SetNextWindowPos(vc, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowBgAlpha(0.0f);
     ImGui::Begin("##empty", nullptr,
@@ -134,24 +167,32 @@ void App::DrawEmpty() {
 // ---- Overlay & toasts ------------------------------------------------------------------
 
 void App::DrawOverlay() {
-    const FileEntry* f = Current();
+    const FileEntry* f = Active();
     if (!settings_.showOverlay || !f) return;
     const ViewGeometry g = Geometry();
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
     const float pad = 10 * dpiScale_;
     const int c = settings_.overlayCorner;
     const bool right = c == 1 || c == 3, bottom = c == 2 || c == 3;
-    ImGui::SetNextWindowPos(ImVec2(right ? g.viewMax.x - pad : g.viewMin.x + pad, bottom ? g.viewMax.y - pad : pad),
+    ImGui::SetNextWindowPos(ImVec2(right ? mx.x - pad : mn.x + pad, bottom ? mx.y - pad : pad),
                             ImGuiCond_Always, ImVec2(right ? 1.0f : 0.0f, bottom ? 1.0f : 0.0f));
     ImGui::SetNextWindowBgAlpha(0.55f);
     ImGui::Begin("##overlay", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
+    if (TileCount() > 1) ImGui::TextColored(kBlue, "Compare %d  \xC2\xB7  tile %d", TileCount(), activeTile_ + 1);
     if (settings_.ovName) ImGui::TextUnformatted(ToUtf8(f->name).c_str());
+    if (!f->companions.empty()) {
+        bool raw = false, xmp = false;
+        CompanionKinds(*f, raw, xmp);
+        ImGui::TextColored(kAmber, "%s%s", raw ? "+RAW " : "", xmp ? "+XMP" : "");
+    }
     if (settings_.ovType) {
         const ImageFormat* fmt = formats_.ForExtension(f->ext);
         TextDim("%s", fmt ? fmt->name.c_str() : ToUtf8(f->ext).c_str());
     }
-    if (settings_.ovIndex) TextDim("%d / %d", current_ + 1, folder_.Count());
+    if (settings_.ovIndex) TextDim("%d / %d", ActiveIndex() + 1, folder_.Count());
     if (settings_.ovSize) TextDim("%s", FormatBytes(f->size).c_str());
     if (settings_.ovDims && f->probed && SUCCEEDED(f->probeHr)) TextDim("%u x %u", f->Oriented().w, f->Oriented().h);
     if (settings_.ovZoom && !g.source.empty()) TextDim("%.0f%%", g.zoom * 100.0f);
@@ -161,8 +202,9 @@ void App::DrawOverlay() {
 
 void App::DrawToasts() {
     if (toasts_.empty()) return;
-    const ViewGeometry g = Geometry();
-    ImGui::SetNextWindowPos(ImVec2((g.viewMin.x + g.viewMax.x) * 0.5f, g.viewMax.y - 16 * dpiScale_), ImGuiCond_Always,
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    ImGui::SetNextWindowPos(ImVec2((mn.x + mx.x) * 0.5f, mx.y - 16 * dpiScale_), ImGuiCond_Always,
                             ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowBgAlpha(0.75f);
     ImGui::Begin("##toasts", nullptr,
@@ -215,7 +257,9 @@ void App::DrawSidebar() {
             ImGui::PushID(i);
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float rowW = ImGui::GetContentRegionAvail().x;
-            if (ImGui::Selectable("##row", i == current_, 0, ImVec2(0, rowH))) JumpTo(i, i >= current_ ? 1 : -1);
+            bool shown = false;
+            for (int t = 0; t < TileCount(); ++t) shown |= TileIndex(t) == i;
+            if (ImGui::Selectable("##row", shown, 0, ImVec2(0, rowH))) JumpTo(i, i >= current_ ? 1 : -1);
 
             const ImVec2 b0(p.x + pad, p.y + pad), b1(b0.x + box, b0.y + box);
             if (const Texture* t = TextureFor(e.id)) {
@@ -353,6 +397,10 @@ void App::DrawSettings() {
             if (changed) MarkSettingsDirty();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Sorting")) {
+            DrawSortingTab();
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Formats")) {
             bool changed = false;
             for (auto& fmt : formats_.All()) {
@@ -403,6 +451,144 @@ void App::DrawSettings() {
     ImGui::End();
 }
 
+// ---- Sorting, info & histogram -----------------------------------------------------------
+
+void App::DrawSortingTab() {
+    bool changed = false;
+    if (ImGui::Checkbox("Keep RAW + JPEG pairs together", &settings_.pairRawJpeg)) {
+        changed = true;
+        ReloadFolder();
+    }
+    HelpMarker("Files with the same name (IMG_1234.jpg, IMG_1234.CR2, IMG_1234.xmp) are shown once, and are deleted, "
+               "moved and restored together.");
+    changed |= ImGui::Checkbox("Rename when the destination already has that name", &settings_.renameOnConflict);
+    HelpMarker("On: the moved file becomes \"IMG_1234 (2).jpg\". Off: the move is refused. Files are never overwritten.");
+
+    ImGui::SeparatorText("Keys 1 - 9");
+    TextDim("Empty = a subfolder named 1-9 next to the images. Relative paths are relative to the open folder.");
+    if (ImGui::BeginTable("##dest", 3, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("path", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("buttons", ImGuiTableColumnFlags_WidthFixed);
+        for (int i = 0; i < 9; ++i) {
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%d", i + 1);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            char buf[520];
+            std::snprintf(buf, sizeof buf, "%s", settings_.destinations[size_t(i)].c_str());
+            char hint[32];
+            std::snprintf(hint, sizeof hint, "subfolder %d", i + 1);
+            if (ImGui::InputTextWithHint("##path", hint, buf, sizeof buf)) {
+                settings_.destinations[size_t(i)] = buf;
+                changed = true;
+            }
+            if (!folder_.Folder().empty() && !settings_.destinations[size_t(i)].empty())
+                TextDim("-> %s", ToUtf8(DestinationFor(i + 1)).c_str());
+            ImGui::TableSetColumnIndex(2);
+            if (ImGui::Button("Browse...")) pendingDestPick_ = i + 1;
+            ImGui::SameLine();
+            ImGui::BeginDisabled(settings_.destinations[size_t(i)].empty());
+            if (ImGui::Button("Clear")) {
+                settings_.destinations[size_t(i)].clear();
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Spacing();
+    TextDim("Ctrl+Z undoes deletes and moves, newest first (%d in history, up to 50).", int(undo_.size()));
+    if (changed) MarkSettingsDirty();
+}
+
+void App::DrawHistogram(const core::Histogram& h, ImVec2 size) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float bottom = p.y + size.y;
+    dl->AddRectFilled(p, ImVec2(p.x + size.x, bottom), IM_COL32(12, 12, 15, 235), 3 * dpiScale_);
+    // Scale by the inner bins so clipped spikes at 0/255 do not flatten the curve.
+    uint32_t peak = 1;
+    for (int i = 1; i < 255; ++i) peak = std::max({peak, h.r[size_t(i)], h.g[size_t(i)], h.b[size_t(i)], h.luma[size_t(i)]});
+    const float bw = size.x / 256.0f;
+    struct Channel {
+        const std::array<uint32_t, 256>* bins;
+        ImU32 color;
+    } channels[] = {{&h.luma, IM_COL32(200, 200, 200, 70)},
+                    {&h.r, IM_COL32(255, 70, 70, 95)},
+                    {&h.g, IM_COL32(70, 220, 90, 95)},
+                    {&h.b, IM_COL32(80, 120, 255, 95)}};
+    for (const auto& ch : channels) {
+        for (int i = 0; i < 256; ++i) {
+            const float v = std::min(1.0f, float((*ch.bins)[size_t(i)]) / float(peak));
+            if (v <= 0) continue;
+            const float x = p.x + float(i) * bw;
+            dl->AddRectFilled(ImVec2(x, bottom - v * size.y), ImVec2(x + bw + 0.5f, bottom), ch.color);
+        }
+    }
+    ImGui::Dummy(size);
+}
+
+void App::DrawInfo() {
+    const FileEntry* f = Active();
+    if (!f) return;
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    const float pad = 10 * dpiScale_;
+    const bool overlayBottomRight = settings_.showOverlay && settings_.overlayCorner == 3;
+    ImGui::SetNextWindowPos(ImVec2(mx.x - pad, overlayBottomRight ? pad : mx.y - pad), ImGuiCond_Always,
+                            ImVec2(1.0f, overlayBottomRight ? 0.0f : 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.82f);
+    bool open = true;
+    ImGui::Begin("Info (I)", &open,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoCollapse);
+    ImGui::TextUnformatted(ToUtf8(f->name).c_str());
+    if (!f->companions.empty()) {
+        bool raw = false, xmp = false;
+        CompanionKinds(*f, raw, xmp);
+        ImGui::SameLine();
+        ImGui::TextColored(kAmber, "%s%s", raw ? "+RAW " : "", xmp ? "+XMP" : "");
+    }
+    const core::PhotoInfo& p = f->photo;
+    const std::string camera = core::CameraLine(p), exposure = core::ExposureLine(p);
+    if (!camera.empty()) ImGui::TextUnformatted(camera.c_str());
+    if (!exposure.empty()) ImGui::TextUnformatted(exposure.c_str());
+    if (!p.dateTaken.empty()) TextDim("Taken %s", core::FormatExifDate(p.dateTaken).c_str());
+    if (f->probed && SUCCEEDED(f->probeHr)) {
+        const core::Size s = f->Oriented();
+        const ImageFormat* fmt = formats_.ForExtension(f->ext);
+        TextDim("%u x %u  \xC2\xB7  %.1f MP  \xC2\xB7  %s  \xC2\xB7  %s%s", s.w, s.h, double(s.w) * s.h / 1e6,
+                FormatBytes(f->size).c_str(), fmt ? fmt->name.c_str() : "", f->progressive ? " (progressive)" : "");
+    }
+    if (camera.empty() && exposure.empty() && f->probed) TextDim("No camera data in this file");
+
+    // Histogram of the decoded image (computed when it was decoded; no extra work here).
+    const Texture* tex = nullptr;
+    auto fit = textures_.find({f->id, core::Variant::Fit});
+    if (fit != textures_.end()) tex = &fit->second;
+    if (!tex) tex = TextureFor(f->id);
+    if (tex && tex->histogram) {
+        const core::Histogram& h = *tex->histogram;
+        DrawHistogram(h, ImVec2(std::round(256 * dpiScale_), std::round(90 * dpiScale_)));
+        const float lo = h.LowPercent(), hi = h.HighPercent();
+        ImGui::TextColored(lo >= 1.0f ? kRed : kDim, "Shadows clipped %.1f%%", double(lo));
+        ImGui::SameLine();
+        ImGui::TextColored(hi >= 1.0f ? kRed : kDim, "   Highlights clipped %.1f%%", double(hi));
+    } else {
+        TextDim("Histogram appears when the image has loaded");
+    }
+    ImGui::End();
+    if (!open) {
+        settings_.showInfo = false;
+        MarkSettingsDirty();
+    }
+}
+
 // ---- Stats & help ------------------------------------------------------------------------
 
 void App::DrawCacheMap(float height) {
@@ -438,8 +624,9 @@ void App::DrawCacheMap(float height) {
 }
 
 void App::DrawStats() {
-    const ViewGeometry g = Geometry();
-    ImGui::SetNextWindowPos(ImVec2(g.viewMin.x + 10 * dpiScale_, g.viewMax.y - 10 * dpiScale_), ImGuiCond_Always, ImVec2(0, 1));
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    ImGui::SetNextWindowPos(ImVec2(mn.x + 10 * dpiScale_, mx.y - 10 * dpiScale_), ImGuiCond_Always, ImVec2(0, 1));
     ImGui::SetNextWindowBgAlpha(0.8f);
     ImGui::Begin("Stats (F3)", nullptr,
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -484,18 +671,22 @@ void App::DrawHelp() {
         {"Mouse wheel, + / -", "Zoom at cursor"},
         {"Drag", "Pan"},
         {"Double-click, Z", "Toggle 100% / fit"},
+        {"C", "Compare 2 / 4 images side by side (synced zoom)"},
+        {"Tab, click", "Pick the active image in compare mode"},
         {"0", "Fit to window"},
         {"F, F11, Alt+Enter", "Fullscreen"},
-        {"Delete", "Move to Recycle Bin"},
-        {"1 ... 9", "Move into subfolder 1 ... 9"},
+        {"Delete", "Move to Recycle Bin (with RAW/XMP pair)"},
+        {"1 ... 9", "Move to destination 1 ... 9 (Settings > Sorting)"},
+        {"Ctrl+Z", "Undo the last delete / move"},
         {"Ctrl+O / Ctrl+Shift+O", "Open image / folder"},
         {"F5", "Rescan folder"},
         {"O", "Overlay"},
         {"B", "Sidebar"},
         {"S", "Settings"},
-        {"I, F3", "Stats"},
+        {"I", "Info: camera data and histogram"},
+        {"F3", "Stats"},
         {"H, F1", "This help"},
-        {"Esc", "Close panel / leave fullscreen / quit"},
+        {"Esc", "Close panel / leave compare / leave fullscreen / quit"},
     };
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
         for (const auto& r : rows) {

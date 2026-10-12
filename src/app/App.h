@@ -3,12 +3,14 @@
 
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "../core/CacheWindow.h"
+#include "../core/Histogram.h"
 #include "../core/Scheduler.h"
 #include "../core/Settings.h"
 #include "../platform/Folder.h"
@@ -40,6 +42,22 @@ private:
     struct Texture {
         ComPtr<ID3D11ShaderResourceView> srv;
         core::Size size;
+        std::shared_ptr<const core::Histogram> histogram;
+    };
+    struct Tile {
+        ImVec2 min, max;  // screen rectangle
+        int index = -1;   // folder index shown in it
+        int slot = 0;     // 0 .. TileCount()-1
+    };
+    // Undo: where each file of an operation went (Recycle Bin item or new path).
+    struct UndoFile {
+        std::wstring original;
+        std::wstring location;
+        bool recycled = false;
+    };
+    struct UndoOp {
+        std::vector<UndoFile> files;  // primary first
+        std::string label;
     };
     struct ToastMsg {
         std::string text;
@@ -78,8 +96,13 @@ private:
     void Navigate(int delta);
     void JumpTo(int index, int direction);
     void SyncCurrentIndex();
-    void RecycleCurrent();
-    void MoveCurrent(int folderNumber);
+    void RecycleActive();
+    void MoveActive(int key);
+    void Undo();
+    void PushUndo(UndoOp op);
+    std::wstring DestinationFor(int key) const;
+    std::string DestinationLabel(int key) const;
+    std::wstring PickFolder();
     void ShowOpenDialog(bool pickFolder);
     void ToggleFullscreen();
     void UpdateTitle();
@@ -101,11 +124,23 @@ private:
                         uint64_t gen);
     const Texture* TextureFor(uint64_t item) const;  // best available for an item
 
-    // View
-    ViewGeometry Geometry() const;
+    // View (single image or 2/4-up compare)
+    void ViewArea(ImVec2& mn, ImVec2& mx) const;
+    std::vector<Tile> Tiles() const;
+    int TileCount() const;
+    int TileIndex(int slot) const;  // folder index shown in a tile, -1 if none
+    int TileAt(ImVec2 screen) const;
+    int ActiveIndex() const;
+    const FileEntry* Active() const;
+    bool IsVisible(uint64_t item) const;
+    ViewGeometry GeometryFor(int index, ImVec2 mn, ImVec2 mx) const;
+    ViewGeometry Geometry() const;  // the active image
+    core::Size SourceSize(const FileEntry& f) const;
     void ResetView();
     void ZoomAt(float factor, ImVec2 screen);
     void ToggleActualSize(ImVec2 screen);
+    void PanBy(float dx, float dy);
+    void SetCompare(int count);
 
     // Frame
     void Tick();
@@ -125,6 +160,9 @@ private:
     void DrawStats();
     void DrawHelp();
     void DrawCacheMap(float height);
+    void DrawInfo();
+    void DrawHistogram(const core::Histogram& h, ImVec2 size);
+    void DrawSortingTab();
 
     // --- state ---
     HINSTANCE inst_ = nullptr;
@@ -171,8 +209,7 @@ private:
     uint64_t previewItem_ = 0;
     Texture preview_;
     bool wantFull_ = false;
-    uint64_t fullItem_ = 0;
-    core::DecodePlan fullPlan_;
+    std::unordered_map<uint64_t, core::DecodePlan> fullPlans_;  // frozen per visible image
 
     std::mutex completionsMutex_;
     std::vector<std::function<void()>> completions_;
@@ -182,7 +219,16 @@ private:
     float zoom_ = 1.0f;
     ImVec2 center_{0, 0};
     bool dragging_ = false;
-    POINT dragLast_{};
+    bool dragMoved_ = false;
+    POINT dragLast_{}, dragStart_{};
+
+    int compareCount_ = 1;      // 1 (single), 2 or 4 images side by side
+    int activeTile_ = 0;        // tile that Delete / 1-9 / info act on
+    float cmpZoomRel_ = 1.0f;   // compare zoom relative to each tile's fit (synced across tiles)
+    ImVec2 cmpCenter_{0.5f, 0.5f};  // compare centre in normalized image coordinates
+
+    std::deque<UndoOp> undo_;   // newest at the back
+    int pendingDestPick_ = 0;   // 1..9: folder picker for that key (run outside the ImGui frame)
 
     int pendingOpen_ = 0;  // 1 file dialog, 2 folder dialog (run outside the ImGui frame)
     bool showSettings_ = false;

@@ -33,6 +33,13 @@ Quality
     [x] GitHub Actions: MSVC Windows build + tests
     [ ] Hands-on test pass on real Windows hardware (HDD, network share, OneDrive folder, integrated GPU, HDR monitor)
 
+Culling (v3.1)
+    [x] Undo for delete / move (exact, via IFileOperation)
+    [x] Compare 2 / 4 with synced zoom
+    [x] RAW + JPEG + XMP pairing
+    [x] Configurable destinations for 1-9, rename on conflict
+    [x] Info panel: EXIF + histogram
+
 Ideas for later
     [ ] Animated GIF / WebP playback
     [ ] ICC colour management

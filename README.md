@@ -16,16 +16,28 @@ Open an image from Explorer ("Open with"), drag one onto the window, or press **
 
 | Keys | Action |
 |---|---|
-| → ↓ Space PgDn / ← ↑ Backspace PgUp | Next / previous |
+| → ↓ Space / ← ↑ Backspace | Next / previous |
+| PgDn / PgUp | Next / previous set (one image, or the whole set in compare mode) |
 | Home / End | First / last |
 | Mouse wheel, + / − | Zoom at cursor (beyond screen size loads the full-resolution image) |
 | Drag | Pan |
 | Double-click, Z / 0 | 100 % / fit |
+| C | Compare 2 or 4 consecutive images side by side, zoom and pan synced |
+| Tab, click | Pick the active image in compare mode |
+| Delete | Recycle Bin, together with its RAW/XMP (Windows asks first if it would be permanent) |
+| 1 … 9 | Move to destination 1 … 9 (Settings → Sorting), together with its RAW/XMP |
+| Ctrl+Z | Undo the last delete or move (up to 50) |
+| I | Info: camera, lens, exposure, date, histogram and clipping |
 | F, F11, Alt+Enter | Fullscreen |
-| Delete | Recycle Bin (Windows asks first if it would be permanent) |
-| 1 … 9 | Move into subfolder `1` … `9` (never overwrites) |
-| O / B / S / I (F3) / H (F1) | Overlay / sidebar / settings / stats / help |
+| O / B / S / F3 / H (F1) | Overlay / sidebar / settings / stats / help |
 | F5 | Rescan folder |
+
+### Culling workflow
+
+- **Compare** a burst: press **C**. Zoom into the eyes on one image and every tile follows. Use **Tab** or a click to pick the weaker shot, press **Delete** or a sorting key, and the next image slides in.
+- **RAW + JPEG pairs** (`IMG_1234.jpg` + `IMG_1234.CR2` + `IMG_1234.xmp`) show once, and they're deleted, moved and restored together. You can turn this off in Settings → Sorting.
+- **Destinations:** keys 1–9 can point anywhere, for example `D:\Keepers` or `..\Rejects`. If a name already exists the moved file is renamed to `name (2).jpg`, or the move is refused if you prefer. Files are never overwritten.
+- **Undo** knows exactly where every file went. A moved file is moved back, and a deleted file is restored from the Recycle Bin.
 
 The **stats panel (F3)** shows the cache map, texture and decode memory against their limits, the live Windows VRAM budget, free system RAM, process memory and how many files have been read from disk, so you can see the guarantees hold.
 
@@ -40,6 +52,8 @@ The **stats panel (F3)** shows the cache map, texture and decode memory against 
   - On integrated GPUs, textures live in system RAM, so a single shared budget is shown.
 - **Resolution:** *Fit to screen* (recommended) or *Full resolution*.
 - **Release cache when minimized**, and **Don't prefetch online-only files**.
+
+**Settings → Sorting:** RAW+JPEG pairing, rename-on-conflict, and the folder for each key 1–9 (with a Browse button).
 
 Settings are stored in `%LOCALAPPDATA%\FastImageViewer\settings.ini`.
 

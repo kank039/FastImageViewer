@@ -6,6 +6,9 @@
 
 #include "../src/core/CacheWindow.h"
 #include "../src/core/DecodePlan.h"
+#include "../src/core/Exif.h"
+#include "../src/core/FileGroups.h"
+#include "../src/core/Histogram.h"
 #include "../src/core/MemoryLimits.h"
 #include "../src/core/Pixels.h"
 #include "../src/core/Scheduler.h"
@@ -458,9 +461,188 @@ static void TestSettings() {
     CHECK(back.ahead == s.ahead && back.behind == s.behind && back.overlayCorner == 2 && back.backdrop == 1);
     CHECK(back.disabledFormats.size() == 2 && back.disabledFormats[1] == "RAW");
 
+    s.destinations[0] = "D:\\Keepers";
+    s.destinations[8] = "Rejects";
+    s.renameOnConflict = false;
+    Settings back2;
+    Deserialize(Serialize(s), back2);
+    CHECK(back2.destinations[0] == "D:\\Keepers" && back2.destinations[8] == "Rejects" && back2.destinations[3].empty());
+    CHECK(!back2.renameOnConflict && back2.pairRawJpeg);
+
     Settings junk;
     Deserialize("ahead=abc\n=5\nnope\nbehind=7\n", junk);
     CHECK(junk.ahead == 4 && junk.behind == 7);
+}
+
+// ---- Pairing ---------------------------------------------------------------
+
+static std::vector<std::pair<size_t, std::vector<size_t>>> Groups(const std::vector<GroupInput>& in, GroupOptions o) {
+    std::vector<std::pair<size_t, std::vector<size_t>>> r;
+    for (auto& g : GroupFiles(in, o)) r.push_back({g.primary, g.companions});
+    return r;
+}
+
+static void TestGroups() {
+    std::puts("groups");
+    using K = FileKind;
+    // 0 a.jpg, 1 a.cr2, 2 a.xmp, 3 b.cr2, 4 c.png, 5 d.xmp, 6 notes.txt, 7 a.heic
+    std::vector<GroupInput> in = {{L"a", K::Primary}, {L"a", K::Raw},     {L"a", K::Sidecar}, {L"b", K::Raw},
+                                  {L"c", K::Primary}, {L"d", K::Sidecar}, {L"notes", K::Ignore}, {L"a", K::Primary}};
+    using G = std::vector<std::pair<size_t, std::vector<size_t>>>;
+    // Pairing, RAW format off: a.jpg carries a.cr2 + a.xmp; b.cr2 hidden; a.heic standalone.
+    CHECK((Groups(in, {true, false}) == G{{0, {1, 2}}, {4, {}}, {7, {}}}));
+    // Pairing, RAW on: lone RAW b.cr2 is shown.
+    CHECK((Groups(in, {true, true}) == G{{0, {1, 2}}, {3, {}}, {4, {}}, {7, {}}}));
+    // No pairing, RAW on: everything shown separately, sidecars ignored.
+    CHECK((Groups(in, {false, true}) == G{{0, {}}, {1, {}}, {3, {}}, {4, {}}, {7, {}}}));
+    // No pairing, RAW off.
+    CHECK((Groups(in, {false, false}) == G{{0, {}}, {4, {}}, {7, {}}}));
+    CHECK(GroupFiles({}, {}).empty());
+}
+
+// ---- EXIF ------------------------------------------------------------------
+
+struct TiffBuilder {
+    bool be;
+    std::vector<uint8_t> d;
+    void U16(uint16_t v) {
+        if (be) { d.push_back(uint8_t(v >> 8)); d.push_back(uint8_t(v)); }
+        else { d.push_back(uint8_t(v)); d.push_back(uint8_t(v >> 8)); }
+    }
+    void U32(uint32_t v) {
+        if (be) { U16(uint16_t(v >> 16)); U16(uint16_t(v)); }
+        else { U16(uint16_t(v)); U16(uint16_t(v >> 16)); }
+    }
+    void Put16(size_t at, uint16_t v) {
+        if (be) { d[at] = uint8_t(v >> 8); d[at + 1] = uint8_t(v); }
+        else { d[at] = uint8_t(v); d[at + 1] = uint8_t(v >> 8); }
+    }
+    void Put32(size_t at, uint32_t v) {
+        if (be) { Put16(at, uint16_t(v >> 16)); Put16(at + 2, uint16_t(v)); }
+        else { Put16(at, uint16_t(v)); Put16(at + 2, uint16_t(v >> 16)); }
+    }
+};
+
+// IFD entries: (tag, type, count, inline value or payload bytes)
+struct Ent {
+    uint16_t tag, type;
+    uint32_t count;
+    std::vector<uint8_t> payload;  // raw value bytes in the builder's byte order (filled by helpers)
+};
+
+static std::vector<uint8_t> BuildExif(bool be) {
+    TiffBuilder b{be, {}};
+    auto str = [&](const char* s) { std::vector<uint8_t> v(s, s + strlen(s) + 1); return v; };
+    auto rat = [&](uint32_t n, uint32_t dd) {
+        TiffBuilder t{be, {}};
+        t.U32(n);
+        t.U32(dd);
+        return t.d;
+    };
+    auto sh = [&](uint16_t v) {
+        TiffBuilder t{be, {}};
+        t.U16(v);
+        t.U16(0);
+        return t.d;
+    };
+    std::vector<Ent> ifd0 = {{0x010F, 2, 6, str("Canon")}, {0x0110, 2, 13, str("Canon EOS R5")}, {0x8769, 4, 1, {}}};
+    std::vector<Ent> exif = {{0x829A, 5, 1, rat(1, 250)},           {0x829D, 5, 1, rat(28, 10)},
+                             {0x8827, 3, 1, sh(400)},               {0x9003, 2, 20, str("2024:05:01 12:34:56")},
+                             {0x9204, 10, 1, rat(uint32_t(-1), 3)}, {0x920A, 5, 1, rat(50, 1)},
+                             {0xA405, 3, 1, sh(75)},                {0xA434, 2, 24, str("RF24-70mm F2.8 L IS USM")}};
+    b.d.push_back(be ? 'M' : 'I');
+    b.d.push_back(be ? 'M' : 'I');
+    b.U16(42);
+    b.U32(8);
+    auto writeIfd = [&](std::vector<Ent>& ents, size_t& exifPtrAt) {
+        const size_t start = b.d.size();
+        b.U16(uint16_t(ents.size()));
+        std::vector<size_t> valAt;
+        for (auto& e : ents) {
+            b.U16(e.tag);
+            b.U16(e.type);
+            b.U32(e.count);
+            valAt.push_back(b.d.size());
+            b.U32(0);
+        }
+        b.U32(0);  // next IFD
+        for (size_t i = 0; i < ents.size(); ++i) {
+            auto& e = ents[i];
+            if (e.tag == 0x8769) { exifPtrAt = valAt[i]; continue; }
+            if (e.payload.size() <= 4) {
+                for (size_t k = 0; k < e.payload.size(); ++k) b.d[valAt[i] + k] = e.payload[k];
+            } else {
+                b.Put32(valAt[i], uint32_t(b.d.size()));
+                b.d.insert(b.d.end(), e.payload.begin(), e.payload.end());
+            }
+        }
+        return start;
+    };
+    size_t exifPtrAt = 0, unused = 0;
+    writeIfd(ifd0, exifPtrAt);
+    const size_t exifStart = writeIfd(exif, unused);
+    b.Put32(exifPtrAt, uint32_t(exifStart));
+    return b.d;
+}
+
+static void TestExifInfo() {
+    std::puts("exif info");
+    for (bool be : {false, true}) {
+        const auto tiff = BuildExif(be);
+        PhotoInfo p;
+        CHECK(ParseExifHead(tiff.data(), tiff.size(), p));  // TIFF-based file (DNG, NEF, ...)
+        CHECK(p.make == "Canon" && p.model == "Canon EOS R5" && p.lens == "RF24-70mm F2.8 L IS USM");
+        CHECK(p.exposureNum == 1 && p.exposureDen == 250 && p.iso == 400 && p.focal35 == 75);
+        CHECK(p.fNumber > 2.79 && p.fNumber < 2.81 && p.focalLength == 50 && p.hasBias);
+        CHECK(p.dateTaken == "2024:05:01 12:34:56");
+        CHECK(CameraLine(p) == "Canon EOS R5  \xC2\xB7  RF24-70mm F2.8 L IS USM");
+        CHECK(ExposureLine(p) == "1/250 s  \xC2\xB7  f/2.8  \xC2\xB7  ISO 400  \xC2\xB7  50 mm (75 mm eq.)  \xC2\xB7  -0.3 EV");
+
+        // Same data inside a JPEG APP1 segment.
+        std::vector<uint8_t> j = {0xFF, 0xD8};
+        const size_t len = 2 + 6 + tiff.size();
+        j.insert(j.end(), {0xFF, 0xE1, uint8_t(len >> 8), uint8_t(len), 'E', 'x', 'i', 'f', 0, 0});
+        j.insert(j.end(), tiff.begin(), tiff.end());
+        j.insert(j.end(), {0xFF, 0xDA, 0, 2});
+        PhotoInfo q;
+        CHECK(ParseExifHead(j.data(), j.size(), q) && q.model == p.model && q.iso == 400);
+        // Every truncation must be safe (ASan checks the reads).
+        for (size_t cut = 0; cut < j.size(); ++cut) {
+            PhotoInfo r;
+            (void)ParseExifHead(j.data(), cut, r);
+        }
+        // Corrupt offsets must be safe too.
+        auto bad = j;
+        for (size_t i = 12; i < bad.size(); i += 7) bad[i] ^= 0xA5;
+        PhotoInfo r;
+        (void)ParseExifHead(bad.data(), bad.size(), r);
+    }
+    CHECK(FormatExposure(1, 250) == "1/250 s");
+    CHECK(FormatExposure(10, 2500) == "1/250 s");
+    CHECK(FormatExposure(2, 1) == "2 s");
+    CHECK(FormatExposure(13, 10) == "1.3 s");
+    CHECK(FormatExposure(0, 0).empty());
+    CHECK(FormatExifDate("2024:05:01 12:34:56") == "2024-05-01 12:34:56");
+    PhotoInfo nikon;
+    nikon.make = "NIKON CORPORATION";
+    nikon.model = "NIKON Z 6";
+    CHECK(CameraLine(nikon) == "NIKON Z 6");
+    nikon.model = "Z 6";
+    CHECK(CameraLine(nikon) == "NIKON CORPORATION Z 6");
+}
+
+static void TestHistogram() {
+    std::puts("histogram");
+    // 4 pixels BGRA: white, black, pure red, transparent
+    const uint8_t px[] = {255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 255, 255, 9, 9, 9, 0};
+    Histogram h;
+    ComputeHistogram(px, {2, 2}, h);
+    CHECK(h.total == 3);
+    CHECK(h.r[255] == 2 && h.g[255] == 1 && h.b[0] == 2 && h.luma[255] == 1 && h.luma[0] == 1);
+    CHECK(h.clippedHigh == 2 && h.clippedLow == 1);
+    CHECK(h.MaxBin() == 2);
+    CHECK(HistogramLevel({4000, 3000}, FullMipLevels({4000, 3000})) == 3);  // 500x375
+    CHECK(HistogramLevel({300, 200}, FullMipLevels({300, 200})) == 0);
 }
 
 int main() {
@@ -472,6 +654,9 @@ int main() {
     TestCaps();
     TestScheduler();
     TestSettings();
+    TestGroups();
+    TestExifInfo();
+    TestHistogram();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

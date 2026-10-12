@@ -9,7 +9,10 @@
 #include <thread>
 #include <vector>
 
+#include <unordered_map>
+
 #include "../core/DecodePlan.h"
+#include "../core/Exif.h"
 #include "Formats.h"
 #include "Win.h"
 
@@ -32,6 +35,10 @@ struct FileEntry {
     bool canPrescale = false;
     bool progressive = false;  // progressive JPEG (larger decoder working memory)
 
+    // RAW/XMP files with the same name that travel with this one (full paths).
+    std::vector<std::wstring> companions;
+    core::PhotoInfo photo;   // EXIF summary from the probe
+
     std::string error;       // last probe/decode error for the UI
     uint64_t changedAt = 0;  // tick of the last change notification (still being written?)
     uint64_t retryAt = 0;    // transient failure: do not retry before this tick
@@ -39,6 +46,8 @@ struct FileEntry {
     core::Size Oriented() const;
     bool CloudOnly() const;  // OneDrive/online-only placeholder: reading it downloads it to disk
 };
+
+struct Scanned;
 
 class FolderModel {
 public:
@@ -58,9 +67,15 @@ public:
     bool Refresh(const std::wstring& name, const FormatRegistry& formats, uint64_t now);
     bool RemovePath(const std::wstring& path);
 
+    // RAW/XMP pairing (takes effect on the next Load).
+    void SetPairing(bool pair) { pairRaw_ = pair; }
+
 private:
+    std::vector<FileEntry> Build(const std::vector<Scanned>& scanned, const FormatRegistry& formats,
+                                 std::unordered_map<std::wstring, FileEntry>& old, uint64_t now) const;
     std::wstring folder_;
     std::vector<FileEntry> files_;
+    bool pairRaw_ = true;
 };
 
 // Watches one directory with ReadDirectoryChangesW and posts `msg` to `hwnd`

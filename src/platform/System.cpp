@@ -137,33 +137,11 @@ bool WriteTextFileAtomic(const std::wstring& path, const std::string& text) {
     return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
 }
 
-bool RecycleFile(HWND owner, const std::wstring& path) {
-    std::wstring from = path;
-    from.push_back(L'\0');  // double-null terminated list
-    SHFILEOPSTRUCTW op{};
-    op.hwnd = owner;
-    op.wFunc = FO_DELETE;
-    op.pFrom = from.c_str();
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT;
-    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted &&
-           GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
-}
-
 std::wstring ParentFolder(const std::wstring& path) {
     const size_t slash = path.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return {};
     if (slash == 2 && path[1] == L':') return path.substr(0, 3);  // keep "C:\"
     return path.substr(0, slash);
-}
-
-DWORD MoveIntoSubfolder(const std::wstring& path, const std::wstring& sub) {
-    const std::wstring folder = ParentFolder(path);
-    const std::wstring name = path.substr(path.find_last_of(L"\\/") + 1);
-    const std::wstring dir = folder + (folder.back() == L'\\' ? L"" : L"\\") + sub;
-    if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return GetLastError();
-    // No MOVEFILE_REPLACE_EXISTING (never overwrite), no MOVEFILE_COPY_ALLOWED (a rename, never a copy).
-    if (!MoveFileExW(path.c_str(), (dir + L"\\" + name).c_str(), 0)) return GetLastError();
-    return ERROR_SUCCESS;
 }
 
 bool IsDirectory(const std::wstring& path) {

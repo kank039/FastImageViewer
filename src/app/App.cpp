@@ -1,6 +1,7 @@
 #include "App.h"
 
 #include <imgui_impl_dx11.h>
+#include <shlwapi.h>
 #include <imgui_impl_win32.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -8,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+
+#include "../platform/FileOps.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -276,7 +279,7 @@ void App::SaveSettingsNow() {
 void App::OnCacheSettingsChanged() {
     core::Validate(settings_, caps_);
     MarkSettingsDirty();
-    fullItem_ = 0;  // plans depend on the budget
+    fullPlans_.clear();  // plans depend on the budget
     nextGovernorMs_ = 0;
     UpdateLimits();
     UpdateCache();
@@ -312,6 +315,7 @@ void App::OpenPath(const std::wstring& raw) {
         previewItem_ = 0;
         watcher_.Stop();
     }
+    folder_.SetPairing(settings_.pairRawJpeg);
     if (!folder_.Load(folder, formats_)) Toast("Could not read the folder");
     storage_ = DetectStorage(folder);
     gate_.SetSlots(ReadersFor(storage_));
@@ -329,6 +333,7 @@ void App::OpenPath(const std::wstring& raw) {
     current_ = index;
     currentPath_ = folder_.Count() ? folder_.Files()[size_t(index)].path : L"";
     direction_ = 1;
+    activeTile_ = 0;
     lastNavMs_ = 0;
     scrollSidebarToCurrent_ = true;
     ResetView();
@@ -339,6 +344,7 @@ void App::OpenPath(const std::wstring& raw) {
 
 void App::ReloadFolder() {
     if (folder_.Folder().empty()) return;
+    folder_.SetPairing(settings_.pairRawJpeg);
     folder_.Load(folder_.Folder(), formats_);
     SyncCurrentIndex();
     UpdateCache();
@@ -376,8 +382,9 @@ void App::SyncCurrentIndex() {
         // Current file vanished: whatever now sits at its position (the next file) takes over.
         current_ = n ? std::clamp(current_, 0, n - 1) : 0;
         currentPath_ = n ? folder_.Files()[size_t(current_)].path : L"";
-        ResetView();
+        if (compareCount_ == 1) ResetView();
     }
+    activeTile_ = std::clamp(activeTile_, 0, std::max(0, TileCount() - 1));
     UpdateTitle();
 }
 
@@ -400,47 +407,191 @@ void App::JumpTo(int index, int direction) {
     lastNavMs_ = NowMs();
     settleArmed_ = true;
     scrollSidebarToCurrent_ = true;
-    ResetView();
+    if (compareCount_ == 1)
+        ResetView();
+    else
+        wantFull_ = false;  // compare keeps its synced zoom while sliding through a burst
     UpdateTitle();
     UpdateCache();
     RequestFrames();
 }
 
-void App::RecycleCurrent() {
-    const FileEntry* f = Current();
+namespace {
+
+std::string NameWithCompanions(const FileEntry& f) {
+    std::string s = ToUtf8(f.name);
+    bool raw = false, xmp = false;
+    for (const auto& c : f.companions) {
+        const size_t dot = c.find_last_of(L'.');
+        const std::wstring ext = dot == std::wstring::npos ? L"" : ToLower(c.substr(dot));
+        (ext == L".xmp" ? xmp : raw) = true;
+    }
+    if (raw) s += " +RAW";
+    if (xmp) s += " +XMP";
+    return s;
+}
+
+std::wstring LeafOf(const std::wstring& p) {
+    const size_t slash = p.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? p : p.substr(slash + 1);
+}
+
+}  // namespace
+
+void App::PushUndo(UndoOp op) {
+    if (op.files.empty()) return;
+    undo_.push_back(std::move(op));
+    while (undo_.size() > 50) undo_.pop_front();
+}
+
+void App::RecycleActive() {
+    const FileEntry* f = Active();
     if (!f) return;
-    const std::wstring path = f->path;
-    const std::string name = ToUtf8(f->name);
-    if (RecycleFile(hwnd_, path)) {
-        folder_.RemovePath(path);
+    std::vector<std::wstring> paths{f->path};
+    paths.insert(paths.end(), f->companions.begin(), f->companions.end());
+    const std::string label = NameWithCompanions(*f);
+    const FileOpResult r = RecycleFiles(hwnd_, paths);
+
+    UndoOp op;
+    op.label = "delete " + label;
+    bool permanent = false, untracked = false;
+    for (const auto& file : r.files) {
+        if (FAILED(file.hr)) continue;
+        if (file.untracked)
+            untracked = true;  // in the Recycle Bin via the legacy API: restore it from there
+        else if (file.to.empty())
+            permanent = true;  // the shell deleted it outright (after asking): nothing to restore
+        else
+            op.files.push_back({file.from, file.to, true});
+    }
+    const bool primaryGone = !r.files.empty() && SUCCEEDED(r.files[0].hr);
+    PushUndo(std::move(op));
+    if (primaryGone) {
+        folder_.RemovePath(paths[0]);
         SyncCurrentIndex();
         UpdateCache();
-        Toast("Deleted " + name);
+        Toast("Deleted " + label +
+              (permanent ? "  (permanently)" : untracked ? "  (restore it from the Recycle Bin)" : "  \xC2\xB7  Ctrl+Z to undo"));
         CheckEmpty();
+    } else if (r.aborted) {
+        Toast("Delete cancelled");
     } else {
-        Toast("Could not delete " + name);
+        Toast("Could not delete " + label + ": " + DescribeError(r.files.empty() ? E_FAIL : r.files[0].hr));
     }
     RequestFrames();
 }
 
-void App::MoveCurrent(int number) {
-    const FileEntry* f = Current();
+std::wstring App::DestinationFor(int key) const {
+    const std::string& s = settings_.destinations[size_t(key - 1)];
+    std::wstring d = s.empty() ? std::to_wstring(key) : FromUtf8(s);
+    wchar_t expanded[MAX_PATH * 2] = {};
+    if (ExpandEnvironmentStringsW(d.c_str(), expanded, DWORD(std::size(expanded))) > 0) d = expanded;
+    if (PathIsRelativeW(d.c_str())) {
+        const std::wstring& folder = folder_.Folder();
+        d = folder + (folder.empty() || folder.back() == L'\\' ? L"" : L"\\") + d;
+    }
+    return FullPath(d);
+}
+
+std::string App::DestinationLabel(int key) const {
+    if (settings_.destinations[size_t(key - 1)].empty()) return "folder " + std::to_string(key);
+    const std::wstring leaf = LeafOf(DestinationFor(key));
+    return ToUtf8(leaf.empty() ? DestinationFor(key) : leaf);
+}
+
+void App::MoveActive(int key) {
+    const FileEntry* f = Active();
     if (!f) return;
-    const std::wstring path = f->path;
-    const std::string name = ToUtf8(f->name);
-    const DWORD err = MoveIntoSubfolder(path, std::to_wstring(number));
-    if (err == ERROR_SUCCESS) {
-        folder_.RemovePath(path);
+    const std::wstring dest = DestinationFor(key);
+    const std::string where = DestinationLabel(key);
+    if (CompareStringOrdinal(dest.c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
+        Toast("Key " + std::to_string(key) + " points at this folder");
+        return;
+    }
+    std::vector<std::wstring> paths{f->path};
+    paths.insert(paths.end(), f->companions.begin(), f->companions.end());
+    const std::string label = NameWithCompanions(*f);
+    const FileOpResult r = MoveFiles(hwnd_, paths, dest, settings_.renameOnConflict);
+
+    UndoOp op;
+    op.label = "move " + label + " to " + where;
+    for (const auto& file : r.files)
+        if (SUCCEEDED(file.hr) && !file.to.empty()) op.files.push_back({file.from, file.to, false});
+    const bool moved = !r.files.empty() && SUCCEEDED(r.files[0].hr);
+    std::string renamed;
+    if (moved && !r.files[0].to.empty() && CompareStringOrdinal(LeafOf(r.files[0].to).c_str(), -1, f->name.c_str(), -1, TRUE) != CSTR_EQUAL)
+        renamed = " as " + ToUtf8(LeafOf(r.files[0].to));
+    PushUndo(std::move(op));
+    if (moved) {
+        folder_.RemovePath(paths[0]);
         SyncCurrentIndex();
         UpdateCache();
-        Toast("Moved " + name + " to folder " + std::to_string(number));
+        Toast("Moved " + label + " to " + where + renamed);
         CheckEmpty();
-    } else if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) {
-        Toast("Folder " + std::to_string(number) + " already has a file named " + name);
+    } else if (!r.files.empty() && r.files[0].hr == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)) {
+        Toast(where + " already has a file named " + ToUtf8(f->name));
+    } else if (r.aborted) {
+        Toast("Move cancelled");
     } else {
-        Toast("Could not move " + name + ": " + DescribeError(HRESULT_FROM_WIN32(err)));
+        Toast("Could not move " + label + ": " + DescribeError(r.files.empty() ? E_FAIL : r.files[0].hr));
     }
     RequestFrames();
+}
+
+void App::Undo() {
+    if (undo_.empty()) {
+        Toast("Nothing to undo");
+        return;
+    }
+    UndoOp op = std::move(undo_.back());
+    undo_.pop_back();
+    int restored = 0;
+    HRESULT firstError = S_OK;
+    for (const auto& f : op.files) {
+        const HRESULT hr = f.recycled ? RestoreRecycled(hwnd_, f.location, f.original) : MoveBack(hwnd_, f.location, f.original);
+        if (SUCCEEDED(hr))
+            ++restored;
+        else if (SUCCEEDED(firstError))
+            firstError = hr;
+    }
+    // Show the restored image right away (the folder watcher would also catch it).
+    const std::wstring& primary = op.files.front().original;
+    if (CompareStringOrdinal(ParentFolder(primary).c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
+        for (const auto& f : op.files) folder_.Refresh(LeafOf(f.original), formats_, 0);
+        const int i = folder_.IndexOfPath(primary);
+        if (i >= 0) {
+            current_ = std::max(0, i - activeTile_);
+            JumpTo(current_, direction_);
+        } else {
+            SyncCurrentIndex();
+            UpdateCache();
+        }
+    }
+    if (restored == int(op.files.size()))
+        Toast("Undone: " + op.label);
+    else if (restored > 0)
+        Toast("Partly undone: " + op.label + " (" + DescribeError(firstError) + ")");
+    else
+        Toast("Could not undo " + op.label + ": " +
+              (firstError == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) ? std::string("a file with that name is back in place")
+                                                                    : DescribeError(firstError)));
+    RequestFrames();
+}
+
+std::wstring App::PickFolder() {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return {};
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PICKFOLDERS);
+    std::wstring out;
+    ComPtr<IShellItem> item;
+    PWSTR path = nullptr;
+    if (SUCCEEDED(dlg->Show(hwnd_)) && SUCCEEDED(dlg->GetResult(&item)) &&
+        SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+        out = path;
+    CoTaskMemFree(path);
+    return out;
 }
 
 void App::ShowOpenDialog(bool pickFolder) {
@@ -493,8 +644,8 @@ void App::ToggleFullscreen() {
 
 void App::UpdateTitle() {
     std::wstring title = L"FastImageViewer";
-    if (const FileEntry* f = Current())
-        title = f->name + L"  \u2014  " + std::to_wstring(current_ + 1) + L" / " + std::to_wstring(folder_.Count()) +
+    if (const FileEntry* f = Active())
+        title = f->name + L"  \u2014  " + std::to_wstring(ActiveIndex() + 1) + L" / " + std::to_wstring(folder_.Count()) +
                 L"  \u2014  FastImageViewer";
     SetWindowTextW(hwnd_, title.c_str());
 }
@@ -506,7 +657,7 @@ void App::UpdateMonitor() {
     const core::Size m{uint32_t(mi.rcMonitor.right - mi.rcMonitor.left), uint32_t(mi.rcMonitor.bottom - mi.rcMonitor.top)};
     if (m != monitor_ && !m.empty()) {
         monitor_ = m;  // decode size follows the monitor, not the window: resizing never re-decodes
-        fullItem_ = 0;
+        fullPlans_.clear();
         UpdateCache();
     }
 }
@@ -556,55 +707,72 @@ std::vector<core::Want> App::BuildWants() {
     if (n == 0) return out;
     const bool trim = minimized_ && trimmed_;
 
+    // Priority: the visible images (1, 2 or 4 tiles) first, then their
+    // full-resolution versions when zoomed in, then the prefetch window.
+    const int tiles = TileCount();
+    std::vector<int> visible;
+    for (int t = 0; t < tiles; ++t)
+        if (TileIndex(t) >= 0) visible.push_back(TileIndex(t));
+
     core::WindowParams p;
     p.count = n;
     p.current = current_;
     p.direction = direction_;
-    p.ahead = trim ? 0 : settings_.ahead;
-    p.behind = trim ? 0 : settings_.behind;
+    p.ahead = trim ? 0 : settings_.ahead + tiles - 1;
+    p.behind = trim ? 0 : settings_.behind + (tiles > 1 ? tiles - 1 : 0);
     p.wrap = settings_.wrapAround;
 
     const uint64_t now = NowMs();
     uint64_t recheck = 0;
     auto later = [&](uint64_t t) { recheck = recheck ? std::min(recheck, t) : t; };
 
-    for (const core::WindowSlot& slot : core::ComputeWindow(p)) {
-        FileEntry& f = folder_.Files()[size_t(slot.index)];
-        const bool isCurrent = slot.rank == 0;
+    auto addWant = [&](int index, int rank, bool isVisible, int tileSlot) {
+        FileEntry& f = folder_.Files()[size_t(index)];
         const bool stable = f.changedAt == 0 || now >= f.changedAt + kStableMs;
         const bool waiting = f.retryAt > now;
         // Reading an online-only file makes OneDrive download it to disk: only on request.
-        const bool cloudBlocked = !isCurrent && settings_.skipCloudFiles && f.CloudOnly();
+        const bool cloudBlocked = !isVisible && settings_.skipCloudFiles && f.CloudOnly();
         if (!stable) later(f.changedAt + kStableMs);
         if (waiting) later(f.retryAt);
 
         core::Want w;
         w.key = {f.id, core::Variant::Fit};
-        w.rank = isCurrent ? 0 : slot.rank + 1;  // rank 1 is reserved for the current image at full size
+        w.rank = rank;
         w.sizeKnown = f.probed && SUCCEEDED(f.probeHr);
         w.mayProbe = stable && !waiting && !cloudBlocked && !(f.probed && FAILED(f.probeHr));
         w.mayLoad = stable && !waiting && !cloudBlocked;
         if (w.sizeKnown) {
-            w.plan = PlanFor(f, core::Variant::Fit, isCurrent ? LiveCapForCurrent() : PerImageCap());
-            if (!w.plan.valid()) continue;
+            w.plan = PlanFor(f, core::Variant::Fit, isVisible ? LiveCapForCurrent() : PerImageCap());
+            if (!w.plan.valid()) return;
             w.transientBytes = TransientFor(f, w.plan);
         }
         out.push_back(w);
 
-        if (isCurrent && wantFull_ && w.sizeKnown) {
-            if (fullItem_ != f.id) {  // frozen per image so budget jitter never causes re-decodes
-                fullItem_ = f.id;
-                fullPlan_ = PlanFor(f, core::Variant::Full, LiveCapForCurrent() / 2);
-            }
-            if (fullPlan_.valid() && fullPlan_.gpuBytes > w.plan.gpuBytes) {
+        if (isVisible && wantFull_ && w.sizeKnown) {
+            auto it = fullPlans_.find(f.id);
+            if (it == fullPlans_.end())  // frozen per image so budget jitter never causes re-decodes
+                it = fullPlans_.emplace(f.id, PlanFor(f, core::Variant::Full, LiveCapForCurrent() / 2)).first;
+            if (it->second.valid() && it->second.gpuBytes > w.plan.gpuBytes) {
                 core::Want full = w;
                 full.key.variant = core::Variant::Full;
-                full.rank = 1;
-                full.plan = fullPlan_;
-                full.transientBytes = TransientFor(f, fullPlan_);
+                full.rank = tiles + tileSlot;
+                full.plan = it->second;
+                full.transientBytes = TransientFor(f, it->second);
                 out.push_back(full);
             }
         }
+    };
+
+    for (size_t t = 0; t < visible.size(); ++t) addWant(visible[t], int(t), true, int(t));
+    for (const core::WindowSlot& slot : core::ComputeWindow(p)) {
+        if (std::find(visible.begin(), visible.end(), slot.index) != visible.end()) continue;
+        addWant(slot.index, 2 * tiles + slot.rank, false, 0);
+    }
+    // Forget frozen full-size plans of images that are no longer on screen.
+    for (auto it = fullPlans_.begin(); it != fullPlans_.end();) {
+        const bool shown = std::any_of(visible.begin(), visible.end(),
+                                       [&](int i) { return folder_.Files()[size_t(i)].id == it->first; });
+        it = shown ? std::next(it) : fullPlans_.erase(it);
     }
     std::stable_sort(out.begin(), out.end(), [](const core::Want& a, const core::Want& b) { return a.rank < b.rank; });
     recheckAt_ = recheck;
@@ -659,19 +827,21 @@ void App::StartProbe(uint64_t job, uint64_t item, int rank) {
     }
     const ImageFormat* fmt = formats_.ForExtension(f->ext);
     const bool honorExif = fmt ? fmt->honorsExif : true;
+    // EXIF lives at the start of JPEG and TIFF-based files (incl. most RAW): parse it ourselves.
+    const bool headExif = (fmt && (fmt->name == "JPEG" || fmt->name == "TIFF")) || (formats_.IsRaw(f->ext) && f->ext != L".cr3");
     // The embedded thumbnail is only worth reading for the image on screen.
     ComPtr<ID3D11Device> thumbDevice;
     if (rank == 0 && !TextureFor(item)) thumbDevice = gpu_.Device();
     std::wstring path = f->path;
     const uint64_t gen = deviceGen_;
-    jobs_.Submit(job, rank, [this, job, item, path, honorExif, thumbDevice, rank, gen](WorkerContext& ctx, const CancelFlag& cancel) {
+    jobs_.Submit(job, rank, [this, job, item, path, honorExif, headExif, thumbDevice, rank, gen](WorkerContext& ctx, const CancelFlag& cancel) {
         ProbeResult r;
         r.hr = E_ABORT;
         if (!cancel) {
             IoGateLock io(gate_, rank, cancel);
             if (io.held()) {
                 BackgroundMode bg(rank > 1);
-                r = ProbeImage(ctx, thumbDevice.Get(), path, honorExif);
+                r = ProbeImage(ctx, thumbDevice.Get(), path, honorExif, headExif);
             }
         }
         Post([this, job, item, r, gen] { OnProbeResult(job, item, r, gen); });
@@ -691,6 +861,7 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen
             f->orientation = r.orientation;
             f->canPrescale = r.canPrescale;
             f->progressive = r.progressive;
+            f->photo = r.photo;
             f->error.clear();
         } else if (IsTransientError(r.hr)) {
             f->retryAt = NowMs() + kRetryMs;
@@ -704,7 +875,7 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen
             preview_ = {r.thumb, r.thumbSize};
             previewItem_ = item;
         }
-        if (Current() && Current()->id == item) RequestFrames();
+        if (IsVisible(item)) RequestFrames();
     }
     UpdateCache();
 }
@@ -757,7 +928,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
     const bool keep = sched_.OnDecodeDone(job, outcome);
     const uint64_t curId = Current() ? Current()->id : 0;
     if (keep) {
-        textures_[key] = {r.srv, plan.size};
+        textures_[key] = {r.srv, plan.size, r.histogram};
         ++decodes_;
         lastDecodeMs_ = r.ms;
         if (bytesRead) {
@@ -767,8 +938,8 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
         if (curId == key.item) {
             preview_ = {};
             previewItem_ = 0;
-            RequestFrames();
         }
+        if (IsVisible(key.item)) RequestFrames();
     }
     if (FileEntry* f = folder_.FindById(key.item)) {
         if (outcome == core::Outcome::Failed) f->error = DescribeError(r.hr);
@@ -780,7 +951,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
                 SyncCurrentIndex();
             }
         }
-        if (curId == key.item) RequestFrames();
+        if (IsVisible(key.item)) RequestFrames();
     }
     if (Gpu::IsDeviceLost(r.hr) && !suspended_) {
         RecreateDevice();
@@ -821,28 +992,99 @@ float App::SidebarWidthPx() const {
     return settings_.showSidebar ? std::round(float(settings_.sidebarWidth) * dpiScale_) : 0.0f;
 }
 
-App::ViewGeometry App::Geometry() const {
-    ViewGeometry g;
+void App::ViewArea(ImVec2& mn, ImVec2& mx) const {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
-    g.viewMin = ImVec2(SidebarWidthPx(), 0);
-    g.viewMax = ImVec2(float(rc.right), float(rc.bottom));
-    if (const FileEntry* f = Current()) {
-        if (f->probed && SUCCEEDED(f->probeHr)) {
-            g.source = f->Oriented();
-        } else if (const Texture* t = TextureFor(f->id)) {
-            g.source = t->size;
-        } else if (previewItem_ == f->id && preview_.srv) {
-            g.source = preview_.size;
-        }
+    mn = ImVec2(SidebarWidthPx(), 0);
+    mx = ImVec2(float(rc.right), float(rc.bottom));
+}
+
+int App::TileCount() const { return std::max(0, std::min(compareCount_, folder_.Count())); }
+
+int App::TileIndex(int slot) const {
+    const int n = folder_.Count();
+    if (n == 0 || slot < 0 || slot >= TileCount()) return -1;
+    int i = current_ + slot;
+    if (i >= n) {
+        if (!settings_.wrapAround) return -1;
+        i %= n;
     }
+    return i;
+}
+
+std::vector<App::Tile> App::Tiles() const {
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    const int count = std::max(1, TileCount());
+    const float gap = count > 1 ? std::round(4 * dpiScale_) : 0.0f;
+    const float w = mx.x - mn.x, h = mx.y - mn.y;
+    int cols = 1, rows = 1;
+    if (count == 2) (w >= h ? cols : rows) = 2;
+    if (count >= 3) cols = rows = 2;
+    const float tw = (w - gap * float(cols - 1)) / float(cols), th = (h - gap * float(rows - 1)) / float(rows);
+    std::vector<Tile> out;
+    for (int t = 0; t < count; ++t) {
+        Tile tile;
+        tile.min = ImVec2(std::round(mn.x + float(t % cols) * (tw + gap)), std::round(mn.y + float(t / cols) * (th + gap)));
+        tile.max = ImVec2(std::round(tile.min.x + tw), std::round(tile.min.y + th));
+        tile.slot = t;
+        tile.index = TileIndex(t);
+        out.push_back(tile);
+    }
+    return out;
+}
+
+int App::TileAt(ImVec2 p) const {
+    for (const Tile& t : Tiles())
+        if (p.x >= t.min.x && p.x < t.max.x && p.y >= t.min.y && p.y < t.max.y) return t.slot;
+    return -1;
+}
+
+int App::ActiveIndex() const {
+    if (folder_.Count() == 0) return -1;
+    if (compareCount_ <= 1) return current_;
+    return TileIndex(std::clamp(activeTile_, 0, std::max(0, TileCount() - 1)));
+}
+
+const FileEntry* App::Active() const {
+    const int i = ActiveIndex();
+    return i >= 0 && i < folder_.Count() ? &folder_.Files()[size_t(i)] : nullptr;
+}
+
+bool App::IsVisible(uint64_t item) const {
+    for (int t = 0; t < TileCount(); ++t) {
+        const int i = TileIndex(t);
+        if (i >= 0 && folder_.Files()[size_t(i)].id == item) return true;
+    }
+    return false;
+}
+
+core::Size App::SourceSize(const FileEntry& f) const {
+    if (f.probed && SUCCEEDED(f.probeHr)) return f.Oriented();
+    if (const Texture* t = TextureFor(f.id)) return t->size;
+    if (previewItem_ == f.id && preview_.srv) return preview_.size;
+    return {};
+}
+
+App::ViewGeometry App::GeometryFor(int index, ImVec2 mn, ImVec2 mx) const {
+    ViewGeometry g;
+    g.viewMin = mn;
+    g.viewMax = mx;
+    if (index < 0 || index >= folder_.Count()) return g;
+    g.source = SourceSize(folder_.Files()[size_t(index)]);
     if (g.source.empty()) return g;
-    const float vw = std::max(1.0f, g.viewMax.x - g.viewMin.x), vh = std::max(1.0f, g.viewMax.y - g.viewMin.y);
+    const float vw = std::max(1.0f, mx.x - mn.x), vh = std::max(1.0f, mx.y - mn.y);
     const float sw = float(g.source.w), sh = float(g.source.h);
     g.fitZoom = std::min(vw / sw, vh / sh);
     if (!settings_.upscaleSmall) g.fitZoom = std::min(g.fitZoom, 1.0f);
-    g.zoom = zoomMode_ == ZoomMode::Fit ? g.fitZoom : zoom_;
-    ImVec2 c = zoomMode_ == ZoomMode::Fit ? ImVec2(sw * 0.5f, sh * 0.5f) : center_;
+    ImVec2 c;
+    if (compareCount_ > 1) {  // synced: same zoom relative to fit, same relative position
+        g.zoom = g.fitZoom * cmpZoomRel_;
+        c = ImVec2(cmpCenter_.x * sw, cmpCenter_.y * sh);
+    } else {
+        g.zoom = zoomMode_ == ZoomMode::Fit ? g.fitZoom : zoom_;
+        c = zoomMode_ == ZoomMode::Fit ? ImVec2(sw * 0.5f, sh * 0.5f) : center_;
+    }
     // Keep the image inside the view: centred when smaller, edges clamped when larger.
     const float hw = vw * 0.5f / g.zoom, hh = vh * 0.5f / g.zoom;
     c.x = sw * g.zoom <= vw ? sw * 0.5f : std::clamp(c.x, hw, sw - hw);
@@ -851,14 +1093,60 @@ App::ViewGeometry App::Geometry() const {
     return g;
 }
 
+App::ViewGeometry App::Geometry() const {
+    if (compareCount_ > 1) {
+        const auto tiles = Tiles();
+        const Tile& t = tiles[size_t(std::clamp(activeTile_, 0, int(tiles.size()) - 1))];
+        return GeometryFor(t.index, t.min, t.max);
+    }
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    return GeometryFor(folder_.Count() ? current_ : -1, mn, mx);
+}
+
 void App::ResetView() {
     zoomMode_ = ZoomMode::Fit;
     zoom_ = 1.0f;
+    cmpZoomRel_ = 1.0f;
+    cmpCenter_ = ImVec2(0.5f, 0.5f);
     wantFull_ = false;
     dragging_ = false;
 }
 
+void App::SetCompare(int count) {
+    compareCount_ = count;
+    activeTile_ = 0;
+    ResetView();
+    UpdateTitle();
+    UpdateCache();
+    if (count > 1)
+        Toast("Compare " + std::to_string(count) + " images  \xC2\xB7  Tab or click picks the active one  \xC2\xB7  C to change");
+    RequestFrames();
+}
+
 void App::ZoomAt(float factor, ImVec2 screen) {
+    if (compareCount_ > 1) {
+        const auto tiles = Tiles();
+        int s = TileAt(screen);
+        if (s < 0) s = std::clamp(activeTile_, 0, int(tiles.size()) - 1);
+        const Tile& t = tiles[size_t(s)];
+        const ViewGeometry g = GeometryFor(t.index, t.min, t.max);
+        if (g.source.empty()) return;
+        const ImVec2 tc((t.min.x + t.max.x) * 0.5f, (t.min.y + t.max.y) * 0.5f);
+        const ImVec2 under(g.center.x + (screen.x - tc.x) / g.zoom, g.center.y + (screen.y - tc.y) / g.zoom);
+        const float rel = std::clamp(cmpZoomRel_ * factor, 1.0f, std::max(1.0f, 64.0f / g.fitZoom));
+        if (rel <= 1.001f) {
+            cmpZoomRel_ = 1.0f;
+            cmpCenter_ = ImVec2(0.5f, 0.5f);
+        } else {
+            const float z = g.fitZoom * rel;
+            cmpCenter_ = ImVec2((under.x - (screen.x - tc.x) / z) / float(g.source.w),
+                                (under.y - (screen.y - tc.y) / z) / float(g.source.h));
+            cmpZoomRel_ = rel;
+        }
+        RequestFrames();
+        return;
+    }
     ViewGeometry g = Geometry();
     if (g.source.empty()) return;
     const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
@@ -877,6 +1165,21 @@ void App::ZoomAt(float factor, ImVec2 screen) {
 }
 
 void App::ToggleActualSize(ImVec2 screen) {
+    if (compareCount_ > 1) {
+        const auto tiles = Tiles();
+        int s = TileAt(screen);
+        if (s < 0) s = std::clamp(activeTile_, 0, int(tiles.size()) - 1);
+        const ViewGeometry g = GeometryFor(tiles[size_t(s)].index, tiles[size_t(s)].min, tiles[size_t(s)].max);
+        if (g.source.empty()) return;
+        if (cmpZoomRel_ > 1.001f && std::fabs(g.zoom - 1.0f) < 0.01f) {
+            cmpZoomRel_ = 1.0f;
+            cmpCenter_ = ImVec2(0.5f, 0.5f);
+            RequestFrames();
+        } else {
+            ZoomAt(1.0f / g.zoom, screen);
+        }
+        return;
+    }
     ViewGeometry g = Geometry();
     if (g.source.empty()) return;
     if (zoomMode_ == ZoomMode::Custom && std::fabs(g.zoom - 1.0f) < 0.001f) {
@@ -887,6 +1190,27 @@ void App::ToggleActualSize(ImVec2 screen) {
     ZoomAt(1.0f / g.zoom, screen);
     zoomMode_ = ZoomMode::Custom;
     zoom_ = 1.0f;
+}
+
+void App::PanBy(float dx, float dy) {
+    if (compareCount_ > 1) {
+        const auto tiles = Tiles();
+        int s = TileAt(ImVec2(float(dragStart_.x), float(dragStart_.y)));
+        if (s < 0) s = std::clamp(activeTile_, 0, int(tiles.size()) - 1);
+        const ViewGeometry g = GeometryFor(tiles[size_t(s)].index, tiles[size_t(s)].min, tiles[size_t(s)].max);
+        if (g.source.empty() || cmpZoomRel_ <= 1.001f) return;
+        cmpCenter_ = ImVec2((g.center.x - dx / g.zoom) / float(g.source.w), (g.center.y - dy / g.zoom) / float(g.source.h));
+        RequestFrames();
+        return;
+    }
+    const ViewGeometry g = Geometry();
+    const bool larger = float(g.source.w) * g.zoom > g.viewMax.x - g.viewMin.x + 0.5f ||
+                        float(g.source.h) * g.zoom > g.viewMax.y - g.viewMin.y + 0.5f;
+    if (g.source.empty() || !larger) return;  // a fitted image stays fitted (and re-fits on resize)
+    center_ = ImVec2(g.center.x - dx / g.zoom, g.center.y - dy / g.zoom);
+    zoom_ = g.zoom;
+    zoomMode_ = ZoomMode::Custom;
+    RequestFrames();
 }
 
 // ---- Frame ------------------------------------------------------------------------------
@@ -902,6 +1226,16 @@ void App::Tick() {
         const bool folder = pendingOpen_ == 2;
         pendingOpen_ = 0;
         ShowOpenDialog(folder);
+    }
+    if (pendingDestPick_) {
+        const int key = pendingDestPick_;
+        pendingDestPick_ = 0;
+        const std::wstring picked = PickFolder();
+        if (!picked.empty()) {
+            settings_.destinations[size_t(key - 1)] = ToUtf8(picked);
+            MarkSettingsDirty();
+            RequestFrames();
+        }
     }
     const uint64_t now = NowMs();
     if (folder_.Count() && now >= nextGovernorMs_) {
@@ -951,6 +1285,7 @@ void App::RenderFrame() {
     DrawToasts();
     if (showSettings_) DrawSettings();
     if (settings_.showStats) DrawStats();
+    if (settings_.showInfo) DrawInfo();
     if (showHelp_) DrawHelp();
 
     ImGui::Render();
@@ -993,15 +1328,32 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         }
         return false;
     }
+    auto fit = [&] {
+        zoomMode_ = ZoomMode::Fit;
+        cmpZoomRel_ = 1.0f;
+        cmpCenter_ = ImVec2(0.5f, 0.5f);
+        RequestFrames();
+    };
+    const int page = std::max(1, TileCount());
     switch (vk) {
-        case VK_RIGHT: case VK_DOWN: case VK_NEXT: case VK_SPACE: Navigate(+1); return true;
-        case VK_LEFT: case VK_UP: case VK_PRIOR: case VK_BACK: Navigate(-1); return true;
+        case VK_RIGHT: case VK_DOWN: case VK_SPACE: Navigate(+1); return true;
+        case VK_LEFT: case VK_UP: case VK_BACK: Navigate(-1); return true;
+        case VK_NEXT: Navigate(+page); return true;   // in compare mode: the next set
+        case VK_PRIOR: Navigate(-page); return true;
         case VK_HOME: JumpTo(0, 1); return true;
-        case VK_END: JumpTo(folder_.Count() - 1, -1); return true;
-        case VK_DELETE: if (!repeat) RecycleCurrent(); return true;
+        case VK_END: JumpTo(std::max(0, folder_.Count() - page), -1); return true;
+        case VK_DELETE: if (!repeat) RecycleActive(); return true;
+        case VK_TAB:
+            if (TileCount() > 1) {
+                activeTile_ = (activeTile_ + (shift ? TileCount() - 1 : 1)) % TileCount();
+                UpdateTitle();
+                RequestFrames();
+            }
+            return true;
         case VK_ESCAPE:
             if (showHelp_) showHelp_ = false;
             else if (showSettings_) showSettings_ = false;
+            else if (compareCount_ > 1) SetCompare(1);
             else if (fullscreen_) ToggleFullscreen();
             else PostMessageW(hwnd_, WM_CLOSE, 0, 0);
             RequestFrames();
@@ -1012,16 +1364,17 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         case VK_F11: if (!repeat) ToggleFullscreen(); return true;
         case VK_ADD: case VK_OEM_PLUS: ZoomAt(1.25f, vc); return true;
         case VK_SUBTRACT: case VK_OEM_MINUS: ZoomAt(0.8f, vc); return true;
-        case VK_NUMPAD0: zoomMode_ = ZoomMode::Fit; RequestFrames(); return true;
+        case VK_NUMPAD0: fit(); return true;
         default: break;
     }
     if (vk >= '1' && vk <= '9' && !ctrl) {
-        if (!repeat) MoveCurrent(int(vk - '0'));
+        if (!repeat) MoveActive(int(vk - '0'));
         return true;
     }
     if (repeat) return false;
     switch (vk) {
-        case '0': zoomMode_ = ZoomMode::Fit; RequestFrames(); return true;
+        case '0': fit(); return true;
+        case 'C': if (!ctrl) SetCompare(compareCount_ == 1 ? 2 : compareCount_ == 2 ? 4 : 1); return true;
         case 'O':
             if (ctrl) ShowOpenDialog(shift);
             else { settings_.showOverlay = !settings_.showOverlay; MarkSettingsDirty(); }
@@ -1029,10 +1382,13 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
             return true;
         case 'S': showSettings_ = !showSettings_; RequestFrames(); return true;
         case 'B': settings_.showSidebar = !settings_.showSidebar; scrollSidebarToCurrent_ = true; MarkSettingsDirty(); RequestFrames(); return true;
-        case 'I': settings_.showStats = !settings_.showStats; MarkSettingsDirty(); RequestFrames(); return true;
+        case 'I': settings_.showInfo = !settings_.showInfo; MarkSettingsDirty(); RequestFrames(); return true;
         case 'H': showHelp_ = !showHelp_; RequestFrames(); return true;
         case 'F': ToggleFullscreen(); return true;
-        case 'Z': ToggleActualSize(vc); return true;
+        case 'Z':
+            if (ctrl) Undo();
+            else ToggleActualSize(vc);
+            return true;
         default: return false;
     }
 }
@@ -1085,7 +1441,8 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RequestFrames();
             if (!uiMouse) {
                 dragging_ = true;
-                dragLast_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                dragMoved_ = false;
+                dragLast_ = dragStart_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                 SetCapture(hwnd);
             }
             return 0;
@@ -1093,14 +1450,8 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RequestFrames();
             if (dragging_) {
                 const POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                ViewGeometry g = Geometry();
-                const bool larger = float(g.source.w) * g.zoom > g.viewMax.x - g.viewMin.x + 0.5f ||
-                                    float(g.source.h) * g.zoom > g.viewMax.y - g.viewMin.y + 0.5f;
-                if (!g.source.empty() && larger) {  // a fitted image stays fitted (and re-fits on resize)
-                    center_ = ImVec2(g.center.x - float(p.x - dragLast_.x) / g.zoom, g.center.y - float(p.y - dragLast_.y) / g.zoom);
-                    zoom_ = g.zoom;
-                    zoomMode_ = ZoomMode::Custom;
-                }
+                if (std::abs(p.x - dragStart_.x) + std::abs(p.y - dragStart_.y) > 3) dragMoved_ = true;
+                PanBy(float(p.x - dragLast_.x), float(p.y - dragLast_.y));
                 dragLast_ = p;
             }
             return 0;
@@ -1109,6 +1460,13 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (dragging_) {
                 dragging_ = false;
                 ReleaseCapture();
+                if (!dragMoved_ && TileCount() > 1) {  // a click (not a drag) picks the active tile
+                    const int s = TileAt(ImVec2(float(dragStart_.x), float(dragStart_.y)));
+                    if (s >= 0 && s != activeTile_) {
+                        activeTile_ = s;
+                        UpdateTitle();
+                    }
+                }
             }
             return 0;
         case WM_LBUTTONDBLCLK:

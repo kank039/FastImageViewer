@@ -56,6 +56,25 @@ const ImageFormat* FormatRegistry::ForExtension(const std::wstring& ext) const {
     return nullptr;
 }
 
+const char* const kRawFormat = "Camera RAW";
+
+bool FormatRegistry::IsRaw(const std::wstring& ext) const {
+    const ImageFormat* f = ForExtension(ext);
+    return f && f->name == kRawFormat;
+}
+
+bool FormatRegistry::RawEnabled() const {
+    for (const auto& f : formats_)
+        if (f.name == kRawFormat) return f.enabled;
+    return false;
+}
+
+core::FileKind FormatRegistry::Classify(const std::wstring& ext) const {
+    if (ext == L".xmp") return core::FileKind::Sidecar;
+    if (IsRaw(ext)) return core::FileKind::Raw;
+    return IsEnabled(ext) ? core::FileKind::Primary : core::FileKind::Ignore;
+}
+
 bool FormatRegistry::IsEnabled(const std::wstring& ext) const {
     const ImageFormat* f = ForExtension(ext);
     return f && f->enabled;

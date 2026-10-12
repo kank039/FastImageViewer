@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <unordered_map>
 
+#include "../core/FileGroups.h"
 #include "../core/Pixels.h"
+#include "System.h"
 
 #ifndef FILE_ATTRIBUTE_RECALL_ON_OPEN
 #define FILE_ATTRIBUTE_RECALL_ON_OPEN 0x00040000
@@ -42,16 +44,6 @@ std::wstring Join(const std::wstring& folder, const std::wstring& name) {
     return folder + L'\\' + name;
 }
 
-void ResetProbe(FileEntry& e) {
-    e.probed = false;
-    e.probeHr = S_OK;
-    e.stored = {};
-    e.orientation = 1;
-    e.canPrescale = false;
-    e.progressive = false;
-    e.error.clear();
-    e.retryAt = 0;
-}
 
 }  // namespace
 
@@ -66,27 +58,55 @@ void FolderModel::Clear() {
     files_.clear();
 }
 
-bool FolderModel::Load(const std::wstring& folder, const FormatRegistry& formats) {
-    std::unordered_map<std::wstring, FileEntry> old;
-    if (SamePath(folder, folder_))
-        for (auto& e : files_) old.emplace(ToLower(e.path), std::move(e));
-    folder_ = folder;
-    files_.clear();
+struct Scanned {
+    std::wstring name, ext, stem;  // stem lower-cased
+    uint64_t size = 0, mtime = 0;
+    uint32_t attrs = 0;
+};
 
+namespace {
+
+std::wstring StemOf(const std::wstring& name) {
+    const size_t dot = name.find_last_of(L'.');
+    return dot == std::wstring::npos ? name : name.substr(0, dot);
+}
+
+void Scan(const std::wstring& pattern, std::vector<Scanned>& out) {
     WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileExW(Join(folder, L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+    HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
                                 FIND_FIRST_EX_LARGE_FETCH);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (!Listable(fd.dwFileAttributes)) continue;
+        Scanned s;
+        s.name = fd.cFileName;
+        s.ext = ExtOf(s.name);
+        s.stem = ToLower(StemOf(s.name));
+        s.size = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+        s.mtime = FileTimeToU64(fd.ftLastWriteTime);
+        s.attrs = fd.dwFileAttributes;
+        out.push_back(std::move(s));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+}  // namespace
+
+std::vector<FileEntry> FolderModel::Build(const std::vector<Scanned>& scanned, const FormatRegistry& formats,
+                                          std::unordered_map<std::wstring, FileEntry>& old, uint64_t now) const {
+    std::vector<core::GroupInput> in;
+    in.reserve(scanned.size());
+    for (const auto& s : scanned) in.push_back({s.stem, formats.Classify(s.ext)});
+    std::vector<FileEntry> out;
+    for (const auto& g : core::GroupFiles(in, {pairRaw_, formats.RawEnabled()})) {
+        const Scanned& s = scanned[g.primary];
         FileEntry e;
-        e.name = fd.cFileName;
-        e.ext = ExtOf(e.name);
-        if (!formats.IsEnabled(e.ext)) continue;
-        e.path = Join(folder, e.name);
-        e.size = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
-        e.mtime = FileTimeToU64(fd.ftLastWriteTime);
-        e.attrs = fd.dwFileAttributes;
+        e.name = s.name;
+        e.ext = s.ext;
+        e.path = Join(folder_, s.name);
+        e.size = s.size;
+        e.mtime = s.mtime;
+        e.attrs = s.attrs;
         auto it = old.find(ToLower(e.path));
         if (it != old.end() && it->second.size == e.size && it->second.mtime == e.mtime) {
             FileEntry kept = std::move(it->second);
@@ -94,10 +114,25 @@ bool FolderModel::Load(const std::wstring& folder, const FormatRegistry& formats
             e = std::move(kept);
         } else {
             e.id = g_nextId++;
+            e.changedAt = now;
         }
-        files_.push_back(std::move(e));
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+        e.companions.clear();
+        for (size_t c : g.companions) e.companions.push_back(Join(folder_, scanned[c].name));
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+bool FolderModel::Load(const std::wstring& folder, const FormatRegistry& formats) {
+    std::unordered_map<std::wstring, FileEntry> old;
+    if (SamePath(folder, folder_))
+        for (auto& e : files_) old.emplace(ToLower(e.path), std::move(e));
+    folder_ = folder;
+    files_.clear();
+    if (!IsDirectory(folder)) return false;
+    std::vector<Scanned> scanned;
+    Scan(Join(folder, L"*"), scanned);
+    files_ = Build(scanned, formats, old, 0);
     std::sort(files_.begin(), files_.end(), NameLess);
     return true;
 }
@@ -122,38 +157,38 @@ bool FolderModel::RemovePath(const std::wstring& path) {
 }
 
 bool FolderModel::Refresh(const std::wstring& name, const FormatRegistry& formats, uint64_t now) {
-    const std::wstring path = Join(folder_, name);
-    WIN32_FILE_ATTRIBUTE_DATA a{};
-    const bool exists = GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a) != FALSE;
-    const std::wstring ext = ExtOf(name);
-    if (!exists || !Listable(a.dwFileAttributes) || !formats.IsEnabled(ext)) return RemovePath(path);
+    // Everything sharing this name's stem is regrouped together, so a RAW
+    // appearing or a JPEG disappearing updates the pairing correctly.
+    const std::wstring stem = StemOf(name), stemLower = ToLower(stem);
+    auto signature = [&] {
+        std::wstring sig;
+        for (const auto& e : files_) {
+            if (ToLower(StemOf(e.name)) != stemLower) continue;
+            sig += e.path + L'|' + std::to_wstring(e.id) + L'|' + std::to_wstring(e.attrs) + L'|';
+            for (const auto& c : e.companions) sig += c + L';';
+            sig += L'\n';
+        }
+        return sig;
+    };
+    const std::wstring before = signature();
 
-    const uint64_t size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
-    const uint64_t mtime = FileTimeToU64(a.ftLastWriteTime);
-    const int i = IndexOfPath(path);
-    if (i >= 0) {
-        FileEntry& e = files_[size_t(i)];
-        const bool attrsChanged = e.attrs != a.dwFileAttributes;
-        e.attrs = a.dwFileAttributes;
-        if (e.size == size && e.mtime == mtime) return attrsChanged;
-        e.size = size;
-        e.mtime = mtime;
-        e.id = g_nextId++;
-        e.changedAt = now;
-        ResetProbe(e);
-        return true;
+    std::unordered_map<std::wstring, FileEntry> old;
+    for (auto it = files_.begin(); it != files_.end();) {
+        if (ToLower(StemOf(it->name)) == stemLower) {
+            old.emplace(ToLower(it->path), std::move(*it));
+            it = files_.erase(it);
+        } else {
+            ++it;
+        }
     }
-    FileEntry e;
-    e.name = name;
-    e.ext = ext;
-    e.path = path;
-    e.size = size;
-    e.mtime = mtime;
-    e.attrs = a.dwFileAttributes;
-    e.id = g_nextId++;
-    e.changedAt = now;
-    files_.insert(std::upper_bound(files_.begin(), files_.end(), e, NameLess), std::move(e));
-    return true;
+    std::vector<Scanned> scanned;
+    Scan(Join(folder_, stem + L".*"), scanned);
+    if (stem == name) Scan(Join(folder_, name), scanned);  // extensionless name
+    scanned.erase(std::remove_if(scanned.begin(), scanned.end(), [&](const Scanned& s) { return s.stem != stemLower; }),
+                  scanned.end());
+    for (auto& e : Build(scanned, formats, old, now))
+        files_.insert(std::upper_bound(files_.begin(), files_.end(), e, NameLess), std::move(e));
+    return signature() != before;
 }
 
 // ---- DirWatcher -------------------------------------------------------------

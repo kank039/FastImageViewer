@@ -4,6 +4,8 @@
 
 #include "WicCompat.h"
 
+#include <cmath>
+#include <cstdio>
 #include <memory>
 #include <new>
 #include <optional>
@@ -116,8 +118,86 @@ void MakeThumbnail(IWICImagingFactory* wic, ID3D11Device* device, IWICBitmapFram
 
 }  // namespace
 
+// WIC photo-metadata policies: covers HEIC, WebP, AVIF, PNG eXIf and more.
+void ReadPolicyInfo(IWICBitmapFrameDecode* frame, core::PhotoInfo& p) {
+    ComPtr<IWICMetadataQueryReader> q;
+    if (FAILED(frame->GetMetadataQueryReader(&q))) return;
+    auto get = [&](const wchar_t* name, PROPVARIANT& v) {
+        PropVariantInit(&v);
+        return SUCCEEDED(q->GetMetadataByName(name, &v));
+    };
+    auto str = [&](const wchar_t* name) {
+        PROPVARIANT v;
+        std::string s;
+        if (get(name, v)) {
+            if (v.vt == VT_LPWSTR && v.pwszVal) s = ToUtf8(v.pwszVal);
+            else if (v.vt == VT_LPSTR && v.pszVal) s = v.pszVal;
+            PropVariantClear(&v);
+        }
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\0')) s.pop_back();
+        return s;
+    };
+    auto num = [&](const wchar_t* name) {
+        PROPVARIANT v;
+        double d = 0;
+        if (get(name, v)) {
+            switch (v.vt) {
+                case VT_R8: d = v.dblVal; break;
+                case VT_R4: d = v.fltVal; break;
+                case VT_UI1: d = v.bVal; break;
+                case VT_UI2: d = v.uiVal; break;
+                case VT_UI4: d = v.ulVal; break;
+                case VT_I4: d = v.lVal; break;
+                default: break;
+            }
+            PropVariantClear(&v);
+        }
+        return d;
+    };
+    if (p.make.empty()) p.make = str(L"System.Photo.CameraManufacturer");
+    if (p.model.empty()) p.model = str(L"System.Photo.CameraModel");
+    if (p.lens.empty()) p.lens = str(L"System.Photo.LensModel");
+    if (p.dateTaken.empty()) {
+        PROPVARIANT v;
+        if (get(L"System.Photo.DateTaken", v)) {
+            SYSTEMTIME st{};
+            if (v.vt == VT_FILETIME && FileTimeToSystemTime(&v.filetime, &st)) {
+                char b[32];
+                std::snprintf(b, sizeof b, "%04u:%02u:%02u %02u:%02u:%02u", st.wYear, st.wMonth, st.wDay, st.wHour,
+                              st.wMinute, st.wSecond);
+                p.dateTaken = b;
+            }
+            PropVariantClear(&v);
+        }
+    }
+    if (p.exposureDen == 0) {
+        const double t = num(L"System.Photo.ExposureTime");
+        if (t > 0 && t < 1) {
+            p.exposureNum = 1;
+            p.exposureDen = uint32_t(std::lround(1.0 / t));
+        } else if (t >= 1) {
+            p.exposureNum = uint32_t(std::lround(t * 10));
+            p.exposureDen = 10;
+        }
+    }
+    if (p.fNumber == 0) p.fNumber = num(L"System.Photo.FNumber");
+    if (p.iso == 0) p.iso = uint32_t(num(L"System.Photo.ISOSpeed"));
+    if (p.focalLength == 0) p.focalLength = num(L"System.Photo.FocalLength");
+    if (p.focal35 == 0) p.focal35 = uint32_t(num(L"System.Photo.FocalLengthInFilm"));
+    if (!p.hasBias) {
+        PROPVARIANT v;
+        if (get(L"System.Photo.ExposureBias", v)) {
+            if (v.vt == VT_R8) {
+                p.exposureBias = v.dblVal;
+                p.hasBias = true;
+            }
+            PropVariantClear(&v);
+        }
+    }
+}
+
 ProbeResult ProbeImage(WorkerContext& ctx, ID3D11Device* thumbDevice, const std::wstring& path,
-                       bool honorExifOrientation) {
+                       bool honorExifOrientation, bool headExif) {
     ProbeResult r;
     if (!ctx.wic) return r;
     ComPtr<IStream> stream;
@@ -137,8 +217,10 @@ ProbeResult ProbeImage(WorkerContext& ctx, ID3D11Device* thumbDevice, const std:
     GUID container{};
     const bool jpeg = SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatJpeg;
     std::vector<uint8_t> head;
+    if (jpeg || headExif) head = ReadHead(path);
+    if (headExif) core::ParseExifHead(head.data(), head.size(), r.photo);
+    if (r.photo.Empty() || r.photo.lens.empty()) ReadPolicyInfo(frame.Get(), r.photo);
     if (jpeg) {
-        head = ReadHead(path);
         // Unknown counts as progressive: over-reserving is safe, under-reserving is not.
         r.progressive = core::JpegIsProgressive(head.data(), head.size()) != 0;
     }
@@ -335,6 +417,13 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         scratch.reset();
     }
     core::GenerateMips(chain.get(), req.plan.size, req.plan.mipLevels);
+    {  // Histogram from a <=512 px mip level: ~4 KB, no extra decoding.
+        const uint32_t level = core::HistogramLevel(req.plan.size, req.plan.mipLevels);
+        auto h = std::make_shared<core::Histogram>();
+        core::ComputeHistogram(chain.get() + core::MipChainBytes(req.plan.size, level),
+                               core::MipLevelSize(req.plan.size, level), *h);
+        res.histogram = std::move(h);
+    }
     if (aborted()) return fail(E_ABORT);
 
     // 5. Immutable texture, created on this worker thread (D3D11 devices are

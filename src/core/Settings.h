@@ -1,6 +1,7 @@
 #pragma once
 // User settings: plain data, validation against hardware caps, and a tiny
 // key=value text format. File I/O lives in the platform layer.
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -43,6 +44,14 @@ struct Settings {
     int thumbHeight = 72;
 
     bool showStats = false;
+    bool showInfo = false;
+
+    // Sorting
+    bool pairRawJpeg = true;       // RAW/XMP with the same name travel with the shown image
+    bool renameOnConflict = true;  // moving onto an existing name: "name (2).jpg" instead of refusing
+    // Keys 1..9: destination folder (UTF-8). Empty = subfolder "1".."9" of the
+    // current folder; a relative path is relative to the current folder.
+    std::array<std::string, 9> destinations{};
 
     // Camera RAW is off by default: RAW+JPEG pairs would otherwise show every photo twice.
     std::vector<std::string> disabledFormats = {"Camera RAW"};

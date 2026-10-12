@@ -42,12 +42,13 @@ namespace {
 
 struct Field {
     const char* key;
-    enum Kind { Bool, Int, UInt } kind;
+    enum Kind { Bool, Int, UInt, Str } kind;
     void* ptr;
 };
 
 std::vector<Field> Fields(Settings& s) {
-    return {
+    static const char* kDest[9] = {"dest1", "dest2", "dest3", "dest4", "dest5", "dest6", "dest7", "dest8", "dest9"};
+    std::vector<Field> f = {
         {"wrapAround", Field::Bool, &s.wrapAround},
         {"closeWhenEmpty", Field::Bool, &s.closeWhenEmpty},
         {"ahead", Field::Int, &s.ahead},
@@ -78,7 +79,12 @@ std::vector<Field> Fields(Settings& s) {
         {"winW", Field::Int, &s.winW},
         {"winH", Field::Int, &s.winH},
         {"winMaximized", Field::Bool, &s.winMaximized},
+        {"showInfo", Field::Bool, &s.showInfo},
+        {"pairRawJpeg", Field::Bool, &s.pairRawJpeg},
+        {"renameOnConflict", Field::Bool, &s.renameOnConflict},
     };
+    for (int i = 0; i < 9; ++i) f.push_back({kDest[i], Field::Str, &s.destinations[size_t(i)]});
+    return f;
 }
 
 std::string Trim(const std::string& v) {
@@ -100,6 +106,7 @@ std::string Serialize(const Settings& in) {
             case Field::Bool: o << (*static_cast<bool*>(f.ptr) ? 1 : 0); break;
             case Field::Int: o << *static_cast<int*>(f.ptr); break;
             case Field::UInt: o << *static_cast<uint32_t*>(f.ptr); break;
+            case Field::Str: o << *static_cast<std::string*>(f.ptr); break;
         }
         o << '\n';
     }
@@ -130,6 +137,10 @@ void Deserialize(const std::string& text, Settings& s) {
         }
         for (const Field& f : fields) {
             if (key != f.key) continue;
+            if (f.kind == Field::Str) {
+                *static_cast<std::string*>(f.ptr) = val.substr(0, 1024);
+                break;
+            }
             char* end = nullptr;
             const long long n = std::strtoll(val.c_str(), &end, 10);
             if (end == val.c_str()) break;
@@ -137,6 +148,7 @@ void Deserialize(const std::string& text, Settings& s) {
                 case Field::Bool: *static_cast<bool*>(f.ptr) = n != 0; break;
                 case Field::Int: *static_cast<int*>(f.ptr) = int(std::clamp<long long>(n, -1000000, 1000000)); break;
                 case Field::UInt: *static_cast<uint32_t*>(f.ptr) = uint32_t(std::clamp<long long>(n, 0, 1 << 30)); break;
+                case Field::Str: break;
             }
             break;
         }

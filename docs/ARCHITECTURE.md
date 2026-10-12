@@ -85,6 +85,28 @@ Our own usage is added back into each limit, so the limits don't oscillate as th
 - Files changed in the last 1.5 s are not decoded yet, because they may still be being written.
 - If the change buffer overflows, the folder is rescanned. The rescan keeps the ids of files that didn't change, so cached images survive.
 
+## Culling features
+
+**File operations** (`platform/FileOps`)
+- Delete and move go through the shell's `IFileOperation`, exactly like Explorer: the Recycle Bin, a progress dialog for slow cross-drive moves, and a warning before any permanent delete.
+- A progress sink records where every file ended up, either its new path or its Recycle Bin item. Undo uses that record: moved files are moved back, and recycled files are restored with the bin's own "Restore" command.
+- Neither operation overwrites a file. If the original path is taken again, undo refuses.
+- If the shell interface is unavailable, plain `MoveFileExW` and `SHFileOperationW` are used. Deletes made that way still go to the Recycle Bin, but can only be restored from there by hand.
+
+**RAW + JPEG pairing** (`core/FileGroups`, `FolderModel::Build`)
+- Files are grouped by name stem. The first displayable image of a stem is shown, and the RAW/XMP files with that stem become its *companions*.
+- A stem that has only RAW files shows the RAW, if the RAW format is enabled.
+- Every delete, move and undo includes the companions. A change notification regroups only the affected stem, and ids are preserved, so the cache is untouched.
+
+**Compare mode**
+- The view is a set of 1, 2 or 4 tiles showing consecutive images.
+- Zoom and pan are stored relative to each image's fit (`cmpZoomRel_`, `cmpCenter_`), so images of different resolutions stay aligned.
+- Cache priority goes to the visible tiles first, then their full-resolution versions when zoomed, then the prefetch window. Admission is still governed by the same budgets.
+
+**Info panel**
+- EXIF is parsed from the first 256 KB of JPEG and TIFF-based RAW files (`core/Exif`, bounds-checked and fuzz-tested). Other formats use WIC's photo metadata. It's collected during the header probe, so it costs no extra disk read.
+- The histogram is computed in the decode job from a mip level of at most 512 px (`core/Histogram`). That's 4 KB per cached image, with no extra decoding.
+
 ## Known limitations
 
 - **Probes are not budgeted.** They read only a file's header, plus the embedded thumbnail for the current image. At most 3 run at once, which bounds them at roughly 36 MB.

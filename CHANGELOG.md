@@ -1,3 +1,12 @@
+Fast Image Viewer – v3.1 "culling"
+
+    Compare mode: C shows 2 or 4 consecutive images side by side with synced zoom and pan; Tab or a click picks the active one; PgUp/PgDn move by a whole set.
+    Undo (Ctrl+Z, 50 levels) for deletes and moves. Windows reports where every file went, so moves are reversed and deletes are restored from the Recycle Bin exactly.
+    RAW + JPEG (+ XMP) pairs are shown once and deleted, moved and restored together (Settings → Sorting).
+    Keys 1–9 can point at any folder (relative or absolute, with Browse); name clashes become "name (2).jpg" or are refused; files are never overwritten.
+    Info panel (I): camera, lens, exposure, focal length, date taken, size, and an RGB histogram with shadow/highlight clipping, at no extra disk or decode cost.
+    I now toggles the info panel; the stats panel is F3.
+
 Fast Image Viewer – v3.0 "revamped"
 
 Rewritten from scratch around one rule: the cache may never hurt the machine.

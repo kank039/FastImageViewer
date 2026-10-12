@@ -28,12 +28,6 @@ std::wstring SettingsFilePath();
 bool ReadTextFile(const std::wstring& path, std::string& out);
 bool WriteTextFileAtomic(const std::wstring& path, const std::string& text);
 
-// Recycle Bin. If the file cannot be recycled (network share, bin disabled)
-// Windows asks before deleting permanently.
-bool RecycleFile(HWND owner, const std::wstring& path);
-// Moves into <folder>\<sub>\ (created if needed). Never overwrites. Returns a Win32 error code.
-DWORD MoveIntoSubfolder(const std::wstring& path, const std::wstring& sub);
-
 std::wstring ParentFolder(const std::wstring& path);
 bool IsDirectory(const std::wstring& path);
 std::wstring FullPath(const std::wstring& path);
