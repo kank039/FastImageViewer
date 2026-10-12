@@ -1,38 +1,46 @@
 # AI Agent Context & Guidelines
 
-**Target Audience:** Autonomous AI Agents, LLM Coding Assistants, and Automated Refactoring Tools.
+**Target audience:** autonomous AI agents, LLM coding assistants, automated refactoring tools.
 
-## Project Overview
-This repository contains the **Fast Image Viewer**, a hyper-optimized, zero-dependency, native Windows 11 application. 
+## Project overview
+**Fast Image Viewer** is a native Windows 10/11 image viewer. Read `docs/ARCHITECTURE.md` before changing the cache.
 
-**Core Directives for Agents:**
+**Core directives**
 * **Do NOT introduce heavy frameworks** (Qt, Electron).
-* **Do NOT introduce third-party image decoding libraries** (stb_image, libjpeg). 
-* All image decoding MUST be done using the native Windows Imaging Component (WIC) via COM interfaces.
-* The application utilizes Windows 11 DWM (`DWMSBT_MAINWINDOW` / Mica) for transparent frosted glass effects.
+* **Do NOT introduce third-party image decoders** (stb_image, libjpeg, ...). All decoding goes through WIC (`src/platform/WicCodec.cpp`).
+* Rendering is **Direct3D 11** with a DirectComposition swap chain, for the Mica backdrop. It falls back to an opaque HWND swap chain. Do not reintroduce OpenGL: the VRAM budget logic depends on DXGI.
+* The only third-party library is Dear ImGui (vcpkg, static).
 
-## 🛑 CRITICAL DIRECTIVES & KNOWN PITFALLS
-During the development of this engine, several fatal, "silent-crash" traps were uncovered. **You must strictly adhere to the following rules to prevent regression.**
+## Memory and disk rules (the point of v3)
+1. **Every image allocation is budgeted.**
+   - Size work with `core::PlanDecode` and `core::TransientBytes` before allocating.
+   - Only start decodes through `core::Scheduler`.
+   - Never allocate pixel buffers outside a scheduled job.
+2. **No thread per image.** Use `JobSystem::Submit`. Thread 0 is the express lane for the image on screen (priority ≤ 1).
+3. **Cancellation must not free accounting early.** A cancelled decode keeps its bytes counted until the worker reports back (scheduler "zombies").
+4. **No disk writes** except `settings.ini`, and only through `SaveSettingsNow`, which skips identical content. No logs, thumbnail caches or temp files. `io.IniFilename` stays `nullptr`.
+5. **No continuous rendering.** Call `RequestFrames()` when something visible changes.
+6. **Open files with `OpenShared`/`FileStream`** (full share flags, read-only). Never block Explorer from moving or deleting a file.
+7. **Prefetch runs at background priority** (`BackgroundMode`). Never prefetch cloud placeholder files (`FileEntry::CloudOnly`).
+8. Keep `src/core` free of Windows headers, and add unit tests in `tests/core_tests.cpp` for any logic you put there.
 
-### 1. COM Smart Pointer Scope Violations (The Silent Assassin)
-If you write or modify code using Windows COM interfaces (WIC), you MUST wrap the instantiation of `ComPtr<T>` objects inside an explicit scope block `{ }` if `CoUninitialize()` is called in the same function.
-* **Why:** `ComPtr` objects destruct at the end of their scope. If `CoUninitialize()` executes *before* the `ComPtr` destructs, the OS will trigger an immediate, untraceable Memory Access Violation (Segfault).
+## Critical directives and known pitfalls
+These traps caused fatal "silent crashes" in earlier versions (see `docs/HISTORY.md`).
 
-### 2. The Mutex "Garbage Memory" Bug
-Do not check for `ERROR_ALREADY_EXISTS` immediately after `CreateMutexA`. 
-* **Why:** Windows often leaves garbage error codes (frequently `183`) in the thread's memory during OS boot sequence. Reading it immediately will falsely trigger the singleton-lock and cause the app to instantly close itself.
-* **Rule:** You MUST manually clear the error state using `SetLastError(0);` *before* creating the Mutex.
+### 1. COM smart pointer scope
+`ComPtr<T>` must be destroyed **before** `CoUninitialize()`. Either wrap COM work in an explicit `{ }` scope, or declare a `ComApartment` object first in the scope, so it is destroyed last. Worker threads (`JobSystem::Worker`) and `wWinMain` follow this pattern.
 
-### 3. Subsystem Entry Points & Unicode Arguments
-This application is compiled with the `/SUBSYSTEM:WINDOWS` flag to hide the console terminal. Therefore, the entry point is `WinMain`, not `main`.
-* **Why:** In a `WinMain` environment, the standard MSVC global `__wargv` array is NOT guaranteed to be initialized and may be a `NULL` pointer. Dereferencing it will crash the app instantly.
-* **Rule:** ALWAYS use the native kernel parser `CommandLineToArgvW(GetCommandLineW(), &wargc)` to extract file paths. 
+### 2. Mutex "garbage memory" bug
+Call `SetLastError(0)` before `CreateMutexW`, then check `ERROR_ALREADY_EXISTS`.
 
-### 4. `std::filesystem` Crashing
-Never use the standard, throwing variants of `std::filesystem` methods (e.g., `fs::exists(path)`).
-* **Why:** Windows users often have hidden, system-protected, or corrupted files in their image directories. A throwing filesystem call will bypass standard logic and crash the background thread.
-* **Rule:** ALWAYS pass `std::error_code` to every filesystem operation.
+### 3. Entry point and Unicode arguments
+The app uses `wWinMain` with the WIN32 subsystem. Always parse arguments with `CommandLineToArgvW(GetCommandLineW(), &argc)`. Never use `/ENTRY` linker hacks.
 
-### 5. Debugging Silent OS Kills
-Because the console is hidden, missing DLLs (like `glfw3.dll`) will cause the Windows OS Loader to kill the executable in 1 millisecond with zero visual feedback.
-* **Rule:** If you are instructed to debug a "silent crash on launch", your first diagnostic step should be to instruct the user to comment out `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);` so the OS can display missing-DLL warning boxes.
+### 4. No throwing filesystem calls
+Use Win32 APIs (`FindFirstFileExW`, `GetFileAttributesExW`, `MoveFileExW`) or `std::error_code` overloads. Hidden, protected or cloud files must never be able to throw.
+
+### 5. Headers
+`<windows.h>` must come before `<shellapi.h>` and other shell headers. Include `platform/Win.h`, or a header that includes it, first. `Yield` is a Windows macro; don't use it as an identifier.
+
+### 6. Debugging silent launch failures
+The build is fully static, so missing DLLs are no longer a cause. If the app still exits silently, temporarily comment out `SetErrorMode(...)` in `src/main.cpp` so Windows can show its error dialogs.

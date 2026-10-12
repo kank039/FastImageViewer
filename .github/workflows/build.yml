@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-tests:
+    name: Core unit tests (Linux, sanitizers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run with AddressSanitizer + UBSan
+        run: |
+          cmake --preset core-tests -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake --build --preset core-tests
+          ctest --preset core-tests
+
+  windows:
+    name: Windows (MSVC, static exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure (vcpkg, x64-windows-static)
+        shell: pwsh
+        run: |
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          cmake --preset release
+      - name: Build
+        run: cmake --build --preset release
+      - name: Core tests
+        run: ctest --test-dir build/release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FastImageViewer
+          path: build/release/FastImageViewer.exe

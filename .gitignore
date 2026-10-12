@@ -70,3 +70,5 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+# Inno Setup output
+installer/

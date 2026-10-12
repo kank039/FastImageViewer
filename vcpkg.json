@@ -1,14 +1,12 @@
 {
     "name": "fast-image-viewer",
-    "version": "0.1.0",
+    "version": "3.0.0",
     "dependencies": [
-        "glfw3",
-        "glad",
         {
             "name": "imgui",
             "features": [
-                "glfw-binding",
-                "opengl3-binding"
+                "win32-binding",
+                "dx11-binding"
             ]
         }
     ]

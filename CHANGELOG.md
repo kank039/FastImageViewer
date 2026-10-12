@@ -1,3 +1,35 @@
+Fast Image Viewer – v3.0 "revamped"
+
+Rewritten from scratch around one rule: the cache may never hurt the machine.
+
+Why: v2 started a thread per image, under-estimated decoded sizes by about 4x, ignored work still in flight, flushed the whole cache on every folder change, decoded everything at full resolution and rendered at 60 fps when idle. Together these exhausted RAM, pushed Windows into the page file and thrashed disks.
+
+Cache & memory
+    Exact budgeting: the header is probed first, every texture and every transient decode buffer is sized before allocation, and in-flight work is counted.
+    Hardware caps: VRAM n-1 GB (n/2 below 2 GB) and RAM total minus max(2 GB, 25 %). Settings sliders cannot exceed them.
+    Live limits: follows the DXGI VRAM budget (with change notifications), keeps system RAM headroom, reacts to Windows low-memory signals, and releases the cache when minimized.
+    Direction-aware window: 4 ahead / 5 behind by default; the current image has its own express worker.
+    Screen-resolution decoding (JPEG uses 1/2–1/8 codec scaling); full resolution only for the image you zoom into.
+    Cancellation: images you skip past stop decoding within milliseconds.
+
+Disk
+    Fixed worker pool; 1 reader on HDD/network, 2 on SSD; prefetch at Windows background I/O priority with EcoQoS.
+    No disk writes except settings.ini, and only when it changes. imgui.ini is gone.
+    OneDrive online-only files are never prefetched (reading them would download them).
+    Folder changes are applied incrementally and no longer flush the cache.
+
+Display & UI
+    Direct3D 11 + DirectComposition (Mica), mipmapped textures created on worker threads, event-driven rendering (0 frames when idle).
+    Zoom (wheel, + / -, double-click for 100 %), pan, fullscreen, EXIF rotation, embedded-thumbnail preview while loading.
+    Whole-folder virtualized sidebar, overlay, stats panel (F3), help (F1), drag & drop, Ctrl+O, and a second launch now opens the file in the running window.
+    Settings persist (%LOCALAPPDATA%\FastImageViewer\settings.ini) and all of them apply immediately.
+
+Fixes
+    Unicode filenames no longer crash; filesystem calls no longer throw; the "DECODING..." screen no longer sticks forever; files are sorted the way Explorer sorts them; Delete warns before a permanent delete on drives with no Recycle Bin; moving to 1–9 never overwrites.
+
+Build
+    Single static .exe (x64-windows-static): no DLL drop. CMake presets and a GitHub Actions workflow (MSVC build plus sanitizer unit tests).
+
 Fast Image Viewer – v1.0 Changelog
 Core Engine & Architecture
 

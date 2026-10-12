@@ -1,66 +1,73 @@
-# Fast Image Viewer (Native Win32 / OpenGL)
+# Fast Image Viewer (v3, "revamped")
 
-A hyper-optimized, zero-dependency native Windows 11 image viewer built for speed. It bypasses heavy frameworks (like Qt or Electron) by hooking directly into the Windows OS layer, utilizing the Windows Imaging Component (WIC) for decoding and OpenGL/GLFW for hardware-accelerated rendering.
+A native Windows 10/11 image viewer that shows the next image **instantly**, keeps the last few in memory so going back is instant too, and never trades your machine's health for it:
 
-It features multithreaded background caching, dynamic RAM management, and native Windows 11 Desktop Window Manager (DWM) integration for hardware-accelerated "Mica" frosted glass interfaces.
+- **Hard memory ceiling.** Every byte is budgeted *before* it is allocated (the image header is read first, so sizes are exact, not guessed). Budgets are capped by your hardware: a GPU with *n* GB of VRAM can give the viewer at most *n − 1* GB, and RAM always leaves Windows its share.
+- **Never spills to the page file or demotes textures.** The cache shrinks automatically when Windows reports memory pressure, when other programs take VRAM (DXGI budget notifications), or when the window is minimized.
+- **Gentle on disks.** Each file is read once, sequentially. Hard disks and network shares get one reader at a time (no head thrashing). Prefetch I/O runs at background priority. Nothing is written except a tiny settings file, and only when a setting changes. OneDrive online-only files are not prefetched, because reading them downloads them.
+- **Fast.** Images are decoded at your monitor's resolution, not full size (a 24 MP photo on a 1440p screen is ~15 MB instead of 96 MB), JPEGs use the codec's built-in 1/2–1/8 scaling, textures are created on worker threads, and the image on screen has its own express worker so it never waits behind prefetching.
+- **Idle means idle.** Rendering is event-driven: no input, no frames.
 
-## 🛠 Tech Stack
+Tech: C++20, Win32, Direct3D 11 + DirectComposition (Mica), WIC (Windows Imaging Component) for decoding, Dear ImGui for the UI. One self-contained `.exe`.
 
-- **Language:** C++20
-- **Build System:** CMake + Ninja
-- **Windowing:** GLFW3 + Native Win32 API (`WinMain`)
-- **Graphics:** OpenGL 3.3 (via GLAD)
-- **UI:** Dear ImGui
-- **Image Decoding:** Native WIC (Windows Imaging Component) + COM Interfaces
+## Using it
 
-## 🛑 Contributor Guidelines: Do's and Don'ts
+Open an image from Explorer ("Open with"), drag one onto the window, or press **Ctrl+O**. A second launch hands the file to the open window.
 
-Native Windows development is a minefield of silent failures, memory access violations, and polluted OS memory. **Read these before modifying the core engine.**
+| Keys | Action |
+|---|---|
+| → ↓ Space PgDn / ← ↑ Backspace PgUp | Next / previous |
+| Home / End | First / last |
+| Mouse wheel, + / − | Zoom at cursor (beyond screen size loads the full-resolution image) |
+| Drag | Pan |
+| Double-click, Z / 0 | 100 % / fit |
+| F, F11, Alt+Enter | Fullscreen |
+| Delete | Recycle Bin (Windows asks first if it would be permanent) |
+| 1 … 9 | Move into subfolder `1` … `9` (never overwrites) |
+| O / B / S / I (F3) / H (F1) | Overlay / sidebar / settings / stats / help |
+| F5 | Rescan folder |
 
-### The Do's
+The **stats panel (F3)** shows the cache map, texture and decode memory against their limits, the live Windows VRAM budget, free system RAM, process memory and how many files have been read from disk, so you can see the guarantees hold.
 
-- **DO wrap COM Smart Pointers in explicit scopes:** If you use `ComPtr<T>`, you MUST ensure it destructs _before_ calling `CoUninitialize()`. Wrap your COM logic in `{ }` blocks.
-    
-- **DO use Kernel Path Parsing:** Always use `CommandLineToArgvW(GetCommandLineW(), ...)` to parse incoming file paths. Standard C++ `argv` will corrupt Unicode characters and paths with spaces.
-    
-- **DO clear OS memory before checking Mutexes:** Windows often leaves garbage error codes (like `183`) in memory during boot. Always call `SetLastError(0)` before checking `GetLastError()` for your application Mutex.
-    
-- **DO use `std::error_code` for filesystem checks:** Never use throwing versions of `std::filesystem` functions. Wrap them in `std::error_code` to prevent the app from silently crashing on corrupted or protected directories.
-    
+## Settings that matter
 
-### The Don'ts
+**Settings → Cache & memory**
 
-- **DON'T use CMake Linker Hacks to hide the console:** Do not use `/ENTRY:mainCRTStartup` to force a graphical subsystem. It bypasses the Windows C-Runtime initialization. Write a proper `WinMain` entry point instead.
-    
-- **DON'T assume `__argc` and `__wargv` are populated:** When using `WinMain`, the C-Runtime does not guarantee these global variables are safely initialized, leading to instant `NULL` pointer Segfaults.
-    
-- **DON'T suppress errors while debugging:** If the app is silently failing, comment out `SetErrorMode(SEM_FAILCRITICALERRORS)` to allow Windows to show you missing DLL popups.
-    
+- **Prefetch ahead** (default 4) and **Keep behind** (default 5). The window follows your direction of travel.
+- **Memory budget:** *Automatic* picks a safe size for your hardware. Manual sliders only go up to what the hardware can handle:
+  - VRAM: *n − 1* GB on cards with 2 GB or more, half the card below that, and never above the OS budget.
+  - RAM: total minus max(2 GB, 25 %).
+  - On integrated GPUs, textures live in system RAM, so a single shared budget is shown.
+- **Resolution:** *Fit to screen* (recommended) or *Full resolution*.
+- **Release cache when minimized**, and **Don't prefetch online-only files**.
 
-## 🐛 The "Silent Crash" Debugging Chronicle
+Settings are stored in `%LOCALAPPDATA%\FastImageViewer\settings.ini`.
 
-During the transition from a console application to a native, silent DWM-integrated GUI, the application compiled perfectly but suffered from immediate, silent shutdowns.
+## Building
 
-Here is the exact ordered list of what we tried, and what ultimately fixed it:
+See [GETTING_STARTED.md](GETTING_STARTED.md). In short, from a VS 2022+ x64 developer prompt with `VCPKG_ROOT` set:
 
-1. **The CMake Linker Hack:** We initially tried linking `/SUBSYSTEM:WINDOWS` while using a standard `main()` function by overriding the entry point via CMake.
-    
-    - _Result:_ Failed. Bypassing the C-Runtime caused the OS to instantly terminate the app when requesting DWM window transparency.
-        
-2. **The `WinMain` Migration & MSVC Globals:** We switched to the correct `WinMain` entry point and tried reading arguments using the MSVC global variables `__wargv`.
-    
-    - _Result:_ Failed. `WinMain` left `__wargv` uninitialized (as a `NULL` pointer). Dereferencing it caused a fatal Memory Access Violation (Segfault) before the engine could boot.
-        
-3. **The Try-Catch & DLL Drop:** We implemented the Kernel `CommandLineToArgvW` parser, wrapped the boot sequence in a master `try-catch`, and manually ensured `glfw3.dll` was in the root directory.
-    
-    - _Result:_ Failed. The application still refused to open and threw zero C++ exceptions, meaning the OS was killing it.
-        
-4. **The Mutex Zombie Hunt:** We checked the OS exit code (`echo %ERRORLEVEL%`), which returned `0` (a clean, intentional exit). We assumed a background zombie process was holding the Mutex.
-    
-    - _Result:_ Failed. No zombie process existed. The Windows OS boot sequence was leaving garbage data in memory, causing `GetLastError()` to falsely trigger our "App Already Open" Mutex check. We patched it by adding `SetLastError(0)`.
-        
-5. **The Final Boss (What Actually Worked):**
-    
-    - After bypassing the Mutex, the app _still_ died silently. Using `MessageBoxA` tracers, we pinpointed the exact moment of death: immediately after `DetectInstalledCodecs()` finished.
-        
-    - **The Fix:** C++ Smart Pointers (`ComPtr`) used to query the Windows Registry do not destruct until they hit the bottom of the function. We were calling `CoUninitialize()` to shut down the Windows COM subsystem _while the pointer was still holding onto it_. This triggered an immediate, untraceable OS-level Segfault. We fixed it by wrapping all `ComPtr` initializations inside explicit `{ }` scope blocks, forcing them to safely destruct in RAM before the subsystem went offline.
+```
+cmake --preset release
+cmake --build --preset release
+```
+
+The core logic (cache window, scheduler, budgets, EXIF, pixel ops, settings) is platform independent and unit-tested on every push: `cmake --preset core-tests && cmake --build --preset core-tests && ctest --preset core-tests`.
+
+How it works: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Contributor rules: [.agents/rules/AGENTS.md](.agents/rules/AGENTS.md). History of v1/v2 crash hunting: [docs/HISTORY.md](docs/HISTORY.md).
+
+## Contributor guidelines: do's and don'ts
+
+**Do**
+- Wrap `ComPtr<T>` in explicit scopes, or declare a `ComApartment` first, so every COM object is released before `CoUninitialize()`.
+- Parse the command line with `CommandLineToArgvW(GetCommandLineW(), ...)`.
+- Call `SetLastError(0)` before creating the single-instance mutex.
+- Use non-throwing Win32 file APIs, or `std::error_code` overloads.
+- Open files with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` (`OpenShared`), so Explorer can always move or delete them.
+- Route every new cache allocation through the scheduler's accounting: size it with `core::PlanDecode` / `core::TransientBytes`.
+
+**Don't**
+- Don't start threads per image, or allocate decode buffers outside a budgeted job.
+- Don't write files (logs, thumbnails, caches) to disk.
+- Don't render continuously: request frames with `RequestFrames()`.
+- Don't use `/ENTRY` linker hacks to hide the console. The app uses a real `wWinMain`.

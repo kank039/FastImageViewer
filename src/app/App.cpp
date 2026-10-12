@@ -1,0 +1,1153 @@
+#include "App.h"
+
+#include <imgui_impl_dx11.h>
+#include <imgui_impl_win32.h>
+#include <shellapi.h>
+#include <shobjidl.h>
+#include <windowsx.h>
+
+#include <algorithm>
+#include <cmath>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+namespace fiv {
+
+namespace {
+
+constexpr UINT WM_APP_WAKE = WM_APP + 1;        // worker results are waiting
+constexpr UINT WM_APP_DIRCHANGED = WM_APP + 2;  // folder contents changed
+
+constexpr uint64_t kSettleMs = 120;        // prefetch resumes this long after the last navigation
+constexpr uint64_t kStableMs = 1500;       // a file changed this recently may still be being written
+constexpr uint64_t kRetryMs = 2000;        // transient failures (locked file, low memory)
+constexpr uint64_t kTrimAfterMs = 10000;   // release cache this long after minimizing
+constexpr uint64_t kGovernorMs = 1000;     // live memory check while images are open
+constexpr uint64_t kSaveDelayMs = 1500;    // settings are written once, after changes settle
+
+bool IsTransientError(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) || hr == HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION) ||
+           hr == E_OUTOFMEMORY || hr == HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+}
+
+}  // namespace
+
+App::App() = default;
+
+App::~App() { Shutdown(); }
+
+// ---- Lifecycle ----------------------------------------------------------------
+
+int App::Run(HINSTANCE inst, const std::wstring& initialPath) {
+    inst_ = inst;
+    LoadSettings();
+    formats_.Detect();
+    formats_.ApplyDisabled(settings_.disabledFormats);
+
+    if (!CreateMainWindow(inst)) {
+        MessageBoxW(nullptr, L"Could not create the main window.", L"FastImageViewer", MB_ICONERROR);
+        return 1;
+    }
+    std::string error;
+    if (!InitGraphics(error)) {
+        MessageBoxW(hwnd_, FromUtf8(error).c_str(), L"FastImageViewer", MB_ICONERROR);
+        return 1;
+    }
+    InitImGui();
+
+    // One express thread for the image on screen + general workers sized to the CPU.
+    const int cores = LogicalCores();
+    const int general = cores >= 8 ? 3 : cores >= 4 ? 2 : 1;
+    jobs_.Start(general + 1);
+    sched_.SetConfig({general, 2});
+    lowMemory_ = CreateMemoryResourceNotification(LowMemoryResourceNotification);
+
+    // Restore placement (only if it is still on a connected monitor).
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof wp;
+    GetWindowPlacement(hwnd_, &wp);
+    RECT saved{settings_.winX, settings_.winY, settings_.winX + settings_.winW, settings_.winY + settings_.winH};
+    if (settings_.winW > 200 && settings_.winH > 150 && MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
+        wp.rcNormalPosition = saved;
+        wp.showCmd = settings_.winMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        SetWindowPlacement(hwnd_, &wp);
+    } else {
+        ShowWindow(hwnd_, SW_SHOWNORMAL);
+    }
+    UpdateWindow(hwnd_);
+    UpdateMonitor();
+    UpdateLimits();
+
+    if (!initialPath.empty()) OpenPath(initialPath);
+    UpdateTitle();
+
+    while (running_) {
+        if (framesToRender_ <= 0 || minimized_) {
+            HANDLE handles[1];
+            DWORD count = 0;
+            if (gpu_.BudgetEvent()) handles[count++] = gpu_.BudgetEvent();
+            const uint64_t now = NowMs();
+            const DWORD timeout = wakeAt_ == 0 ? INFINITE : wakeAt_ <= now ? 0 : DWORD(std::min<uint64_t>(wakeAt_ - now, 60000));
+            const DWORD r = MsgWaitForMultipleObjectsEx(count, handles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (count && r == WAIT_OBJECT_0) nextGovernorMs_ = 0;  // the OS changed our VRAM budget
+        }
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                running_ = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!running_) break;
+        Tick();
+        if (framesToRender_ > 0 && !minimized_) {
+            RenderFrame();
+            --framesToRender_;
+        }
+    }
+    Shutdown();
+    return 0;
+}
+
+void App::Shutdown() {
+    if (!hwnd_ && !gpu_.Alive()) return;
+    if (settingsDirtyAt_ || hwnd_) SaveSettingsNow();
+    watcher_.Stop();
+    jobs_.Stop();
+    {
+        std::lock_guard lk(completionsMutex_);
+        completions_.clear();  // drops any textures produced after shutdown began
+    }
+    textures_.clear();
+    preview_ = {};
+    if (ImGui::GetCurrentContext()) {
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+    }
+    gpu_.Destroy();
+    if (lowMemory_) CloseHandle(lowMemory_);
+    lowMemory_ = nullptr;
+    if (hwnd_) {
+        HWND h = hwnd_;
+        hwnd_ = nullptr;
+        DestroyWindow(h);
+    }
+}
+
+bool App::CreateMainWindow(HINSTANCE inst) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof wc;
+    wc.style = CS_DBLCLKS;
+    wc.lpfnWndProc = StaticWndProc;
+    wc.hInstance = inst;
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    wc.hIconSm = wc.hIcon;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kWindowClass;
+    if (!RegisterClassExW(&wc)) return false;
+
+    // WS_EX_NOREDIRECTIONBITMAP: no GDI surface; DirectComposition owns the client area.
+    const int w = MulDiv(1280, int(GetDpiForSystem()), 96), h = MulDiv(800, int(GetDpiForSystem()), 96);
+    hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_ACCEPTFILES, kWindowClass, L"FastImageViewer",
+                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h, nullptr, nullptr, inst, this);
+    return hwnd_ != nullptr;
+}
+
+bool App::InitGraphics(std::string& error) {
+    if (!gpu_.Create(hwnd_, error)) return false;
+    caps_ = core::ComputeCaps(GatherMemoryFacts(gpu_));
+    core::Validate(settings_, caps_);
+    ApplyBackdropSetting();
+    return true;
+}
+
+void App::InitImGui() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;  // no imgui.ini written behind the user's back
+    io.LogFilename = nullptr;
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;  // arrow keys belong to navigation
+    ImGui::StyleColorsDark();
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding = 8;
+    s.FrameRounding = 4;
+    s.GrabRounding = 4;
+    s.WindowBorderSize = 0;
+    s.Colors[ImGuiCol_WindowBg].w = 0.92f;
+    baseStyle_ = s;
+    ImGui_ImplWin32_Init(hwnd_);
+    ImGui_ImplDX11_Init(gpu_.Device(), gpu_.Context());
+    ApplyDpi(GetDpiForWindow(hwnd_));
+}
+
+void App::ApplyDpi(UINT dpi) {
+    dpiScale_ = dpi ? float(dpi) / 96.0f : 1.0f;
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = baseStyle_;
+    style.ScaleAllSizes(dpiScale_);
+    ImGuiIO& io = ImGui::GetIO();
+    const char* font = "C:\\Windows\\Fonts\\segoeui.ttf";
+    const bool haveFont = GetFileAttributesA(font) != INVALID_FILE_ATTRIBUTES;
+#if IMGUI_VERSION_NUM >= 19200
+    // Dynamic fonts: load once, scale per DPI.
+    if (io.Fonts->Fonts.empty()) {
+        if (!haveFont || !io.Fonts->AddFontFromFileTTF(font, 16.0f)) io.Fonts->AddFontDefault();
+    }
+    style.FontScaleDpi = dpiScale_;
+#else
+    io.Fonts->Clear();
+    if (!haveFont || !io.Fonts->AddFontFromFileTTF(font, std::round(16.0f * dpiScale_))) {
+        ImFontConfig cfg;
+        cfg.SizePixels = std::round(13.0f * dpiScale_);
+        io.Fonts->AddFontDefault(&cfg);
+    }
+    ImGui_ImplDX11_InvalidateDeviceObjects();  // font atlas is rebuilt on the next frame
+#endif
+    RequestFrames();
+}
+
+void App::ApplyBackdropSetting() {
+    translucent_ = ApplyBackdrop(hwnd_, settings_.backdrop == int(core::Backdrop::Mica), gpu_.Composited());
+    RequestFrames();
+}
+
+void App::RecreateDevice() {
+    suspended_ = true;
+    jobs_.CancelAll();
+    jobs_.WaitIdle();
+    DrainCompletions();
+    sched_.Clear();
+    textures_.clear();
+    preview_ = {};
+    previewItem_ = 0;
+    ImGui_ImplDX11_Shutdown();
+    gpu_.Destroy();
+    std::string error;
+    if (!gpu_.Create(hwnd_, error)) {
+        MessageBoxW(hwnd_, FromUtf8(error).c_str(), L"FastImageViewer", MB_ICONERROR);
+        running_ = false;
+        return;
+    }
+    ImGui_ImplDX11_Init(gpu_.Device(), gpu_.Context());
+    caps_ = core::ComputeCaps(GatherMemoryFacts(gpu_));
+    core::Validate(settings_, caps_);
+    ApplyBackdropSetting();
+    suspended_ = false;
+    nextGovernorMs_ = 0;
+    UpdateLimits();
+    UpdateCache();
+    Toast("Graphics device was reset");
+}
+
+// ---- Settings -------------------------------------------------------------------
+
+void App::LoadSettings() {
+    settingsPath_ = SettingsFilePath();
+    std::string text;
+    if (!settingsPath_.empty() && ReadTextFile(settingsPath_, text)) {
+        core::Deserialize(text, settings_);
+        lastSavedSettings_ = text;
+    }
+}
+
+void App::SaveSettingsNow() {
+    settingsDirtyAt_ = 0;
+    settings_.disabledFormats = formats_.DisabledNames();
+    if (hwnd_ && !fullscreen_) {
+        WINDOWPLACEMENT wp{};
+        wp.length = sizeof wp;
+        if (GetWindowPlacement(hwnd_, &wp)) {
+            settings_.winX = wp.rcNormalPosition.left;
+            settings_.winY = wp.rcNormalPosition.top;
+            settings_.winW = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+            settings_.winH = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+            settings_.winMaximized = wp.showCmd == SW_SHOWMAXIMIZED;
+        }
+    }
+    const std::string text = core::Serialize(settings_);
+    if (text == lastSavedSettings_ || settingsPath_.empty()) return;  // never rewrite an identical file
+    if (WriteTextFileAtomic(settingsPath_, text)) lastSavedSettings_ = text;
+}
+
+void App::OnCacheSettingsChanged() {
+    core::Validate(settings_, caps_);
+    MarkSettingsDirty();
+    fullItem_ = 0;  // plans depend on the budget
+    nextGovernorMs_ = 0;
+    UpdateLimits();
+    UpdateCache();
+}
+
+// ---- Folder & navigation ----------------------------------------------------------
+
+const FileEntry* App::Current() const {
+    if (current_ < 0 || current_ >= folder_.Count()) return nullptr;
+    return &folder_.Files()[size_t(current_)];
+}
+
+void App::OpenPath(const std::wstring& raw) {
+    std::wstring path = raw;
+    if (path.size() >= 2 && path.front() == L'"' && path.back() == L'"') path = path.substr(1, path.size() - 2);
+    const std::wstring full = FullPath(path);
+    std::wstring folder, select;
+    if (IsDirectory(full)) {
+        folder = full;
+    } else {
+        folder = ParentFolder(full);
+        select = full;
+    }
+    if (folder.empty() || !IsDirectory(folder)) {
+        Toast("Cannot open " + ToUtf8(path));
+        return;
+    }
+    const bool same = CompareStringOrdinal(folder.c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL;
+    if (!same) {
+        sched_.Clear();
+        textures_.clear();
+        preview_ = {};
+        previewItem_ = 0;
+        watcher_.Stop();
+    }
+    if (!folder_.Load(folder, formats_)) Toast("Could not read the folder");
+    storage_ = DetectStorage(folder);
+    gate_.SetSlots(ReadersFor(storage_));
+    if (!same) watcher_.Start(folder, hwnd_, WM_APP_DIRCHANGED);
+
+    int index = 0;
+    if (!select.empty()) {
+        index = folder_.IndexOfPath(select);
+        if (index < 0) {
+            index = 0;
+            if (GetFileAttributesW(select.c_str()) != INVALID_FILE_ATTRIBUTES)
+                Toast("That file type is turned off or not supported (see Settings > Formats)");
+        }
+    }
+    current_ = index;
+    currentPath_ = folder_.Count() ? folder_.Files()[size_t(index)].path : L"";
+    direction_ = 1;
+    lastNavMs_ = 0;
+    scrollSidebarToCurrent_ = true;
+    ResetView();
+    UpdateTitle();
+    UpdateCache();
+    RequestFrames();
+}
+
+void App::ReloadFolder() {
+    if (folder_.Folder().empty()) return;
+    folder_.Load(folder_.Folder(), formats_);
+    SyncCurrentIndex();
+    UpdateCache();
+    RequestFrames();
+    CheckEmpty();
+}
+
+void App::ApplyDirChanges() {
+    bool overflow = false;
+    const auto names = watcher_.Take(overflow);
+    if (overflow) {
+        ReloadFolder();
+        return;
+    }
+    bool changed = false;
+    const uint64_t now = NowMs();
+    for (const auto& n : names) changed |= folder_.Refresh(n, formats_, now);
+    if (!changed) return;
+    SyncCurrentIndex();
+    UpdateCache();
+    RequestFrames();
+    CheckEmpty();
+}
+
+void App::CheckEmpty() {
+    if (folder_.Count() == 0 && settings_.closeWhenEmpty && !folder_.Folder().empty()) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+}
+
+void App::SyncCurrentIndex() {
+    const int n = folder_.Count();
+    const int i = folder_.IndexOfPath(currentPath_);
+    if (i >= 0) {
+        current_ = i;
+    } else {
+        // Current file vanished: whatever now sits at its position (the next file) takes over.
+        current_ = n ? std::clamp(current_, 0, n - 1) : 0;
+        currentPath_ = n ? folder_.Files()[size_t(current_)].path : L"";
+        ResetView();
+    }
+    UpdateTitle();
+}
+
+void App::Navigate(int delta) {
+    const int n = folder_.Count();
+    if (n == 0) return;
+    int next = current_ + delta;
+    if (settings_.wrapAround)
+        next = ((next % n) + n) % n;
+    else
+        next = std::clamp(next, 0, n - 1);
+    if (next != current_) JumpTo(next, delta > 0 ? 1 : -1);
+}
+
+void App::JumpTo(int index, int direction) {
+    if (index < 0 || index >= folder_.Count()) return;
+    current_ = index;
+    currentPath_ = folder_.Files()[size_t(index)].path;
+    direction_ = direction < 0 ? -1 : 1;
+    lastNavMs_ = NowMs();
+    settleArmed_ = true;
+    scrollSidebarToCurrent_ = true;
+    ResetView();
+    UpdateTitle();
+    UpdateCache();
+    RequestFrames();
+}
+
+void App::RecycleCurrent() {
+    const FileEntry* f = Current();
+    if (!f) return;
+    const std::wstring path = f->path;
+    const std::string name = ToUtf8(f->name);
+    if (RecycleFile(hwnd_, path)) {
+        folder_.RemovePath(path);
+        SyncCurrentIndex();
+        UpdateCache();
+        Toast("Deleted " + name);
+        CheckEmpty();
+    } else {
+        Toast("Could not delete " + name);
+    }
+    RequestFrames();
+}
+
+void App::MoveCurrent(int number) {
+    const FileEntry* f = Current();
+    if (!f) return;
+    const std::wstring path = f->path;
+    const std::string name = ToUtf8(f->name);
+    const DWORD err = MoveIntoSubfolder(path, std::to_wstring(number));
+    if (err == ERROR_SUCCESS) {
+        folder_.RemovePath(path);
+        SyncCurrentIndex();
+        UpdateCache();
+        Toast("Moved " + name + " to folder " + std::to_string(number));
+        CheckEmpty();
+    } else if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) {
+        Toast("Folder " + std::to_string(number) + " already has a file named " + name);
+    } else {
+        Toast("Could not move " + name + ": " + DescribeError(HRESULT_FROM_WIN32(err)));
+    }
+    RequestFrames();
+}
+
+void App::ShowOpenDialog(bool pickFolder) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | (pickFolder ? DWORD(FOS_PICKFOLDERS) : 0u));
+    std::wstring spec;
+    if (!pickFolder) {
+        for (const auto& fmt : formats_.All()) {
+            if (!fmt.enabled) continue;
+            for (const auto& e : fmt.extensions) spec += (spec.empty() ? L"*" : L";*") + e;
+        }
+        COMDLG_FILTERSPEC filters[] = {{L"Images", spec.c_str()}, {L"All files", L"*.*"}};
+        dlg->SetFileTypes(spec.empty() ? 0 : 2, filters + (spec.empty() ? 1 : 0));
+        if (spec.empty()) dlg->SetFileTypes(1, filters + 1);
+    }
+    if (FAILED(dlg->Show(hwnd_))) return;
+    ComPtr<IShellItem> item;
+    PWSTR path = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        OpenPath(path);
+        CoTaskMemFree(path);
+    }
+}
+
+void App::ToggleFullscreen() {
+    if (!fullscreen_) {
+        savedPlacement_.length = sizeof savedPlacement_;
+        GetWindowPlacement(hwnd_, &savedPlacement_);
+        savedStyle_ = GetWindowLongPtrW(hwnd_, GWL_STYLE);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof mi;
+        GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongPtrW(hwnd_, GWL_STYLE, (savedStyle_ & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        fullscreen_ = true;
+    } else {
+        SetWindowLongPtrW(hwnd_, GWL_STYLE, savedStyle_);
+        SetWindowPlacement(hwnd_, &savedPlacement_);
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        fullscreen_ = false;
+    }
+    ResetView();
+    RequestFrames();
+}
+
+void App::UpdateTitle() {
+    std::wstring title = L"FastImageViewer";
+    if (const FileEntry* f = Current())
+        title = f->name + L"  \u2014  " + std::to_wstring(current_ + 1) + L" / " + std::to_wstring(folder_.Count()) +
+                L"  \u2014  FastImageViewer";
+    SetWindowTextW(hwnd_, title.c_str());
+}
+
+void App::UpdateMonitor() {
+    MONITORINFO mi{};
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    const core::Size m{uint32_t(mi.rcMonitor.right - mi.rcMonitor.left), uint32_t(mi.rcMonitor.bottom - mi.rcMonitor.top)};
+    if (m != monitor_ && !m.empty()) {
+        monitor_ = m;  // decode size follows the monitor, not the window: resizing never re-decodes
+        fullItem_ = 0;
+        UpdateCache();
+    }
+}
+
+// ---- Cache --------------------------------------------------------------------------
+
+uint64_t App::PerImageCap() const {
+    const uint64_t ram = core::EffectiveRamSetting(settings_, caps_);
+    if (caps_.unified) return ram / 4;
+    // Decoding needs about twice the texture size in RAM, so one image may use
+    // at most a third of the decode pool and never more than the texture pool.
+    return std::min(core::EffectiveVramSetting(settings_, caps_), ram / 3);
+}
+
+core::DecodePlan App::PlanFor(const FileEntry& f, core::Variant v) const {
+    core::PlanRequest r;
+    r.source = f.Oriented();
+    const bool fit = v == core::Variant::Fit && settings_.decodeMode == int(core::DecodeMode::FitScreen);
+    if (fit) r.target = monitor_;
+    r.maxTextureDim = gpu_.MaxTextureDim();
+    r.maxGpuBytes = PerImageCap();
+    return core::PlanDecode(r);
+}
+
+uint64_t App::TransientFor(const FileEntry& f, const core::DecodePlan& plan) const {
+    core::TransientRequest t;
+    t.fileBytes = f.size;
+    t.readIntoMemory = f.size <= core::kMaxInMemoryFile;
+    t.stored = f.stored;
+    t.canPrescale = f.canPrescale;
+    t.reorients = f.orientation != 1;
+    t.plan = plan;
+    return core::TransientBytes(t);
+}
+
+std::vector<core::Want> App::BuildWants() {
+    std::vector<core::Want> out;
+    const int n = folder_.Count();
+    if (n == 0) return out;
+    const bool trim = minimized_ && trimmed_;
+
+    core::WindowParams p;
+    p.count = n;
+    p.current = current_;
+    p.direction = direction_;
+    p.ahead = trim ? 0 : settings_.ahead;
+    p.behind = trim ? 0 : settings_.behind;
+    p.wrap = settings_.wrapAround;
+
+    const uint64_t now = NowMs();
+    uint64_t recheck = 0;
+    auto later = [&](uint64_t t) { recheck = recheck ? std::min(recheck, t) : t; };
+
+    for (const core::WindowSlot& slot : core::ComputeWindow(p)) {
+        FileEntry& f = folder_.Files()[size_t(slot.index)];
+        const bool isCurrent = slot.rank == 0;
+        const bool stable = f.changedAt == 0 || now >= f.changedAt + kStableMs;
+        const bool waiting = f.retryAt > now;
+        // Reading an online-only file makes OneDrive download it to disk: only on request.
+        const bool cloudBlocked = !isCurrent && settings_.skipCloudFiles && f.CloudOnly();
+        if (!stable) later(f.changedAt + kStableMs);
+        if (waiting) later(f.retryAt);
+
+        core::Want w;
+        w.key = {f.id, core::Variant::Fit};
+        w.rank = isCurrent ? 0 : slot.rank + 1;  // rank 1 is reserved for the current image at full size
+        w.sizeKnown = f.probed && SUCCEEDED(f.probeHr);
+        w.mayProbe = stable && !waiting && !cloudBlocked && !(f.probed && FAILED(f.probeHr));
+        w.mayLoad = stable && !waiting && !cloudBlocked;
+        if (w.sizeKnown) {
+            w.plan = PlanFor(f, core::Variant::Fit);
+            if (!w.plan.valid()) continue;
+            w.transientBytes = TransientFor(f, w.plan);
+        }
+        out.push_back(w);
+
+        if (isCurrent && wantFull_ && w.sizeKnown) {
+            if (fullItem_ != f.id) {  // frozen per image so budget jitter never causes re-decodes
+                fullItem_ = f.id;
+                fullPlan_ = PlanFor(f, core::Variant::Full);
+            }
+            if (fullPlan_.valid() && fullPlan_.gpuBytes > w.plan.gpuBytes) {
+                core::Want full = w;
+                full.key.variant = core::Variant::Full;
+                full.rank = 1;
+                full.plan = fullPlan_;
+                full.transientBytes = TransientFor(f, fullPlan_);
+                out.push_back(full);
+            }
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [](const core::Want& a, const core::Want& b) { return a.rank < b.rank; });
+    recheckAt_ = recheck;
+    return out;
+}
+
+void App::UpdateCache() {
+    if (suspended_ || !gpu_.Alive()) return;
+    const bool settled = NowMs() >= lastNavMs_ + kSettleMs;
+    sched_.Pump(BuildWants(), limits_, settled);
+    if (settings_.showStats || settings_.showSidebar) RequestFrames(1);
+}
+
+void App::UpdateLimits() {
+    live_ = QueryLiveMemory(gpu_, lowMemory_);
+    core::OurUsage ours;
+    ours.gpu = sched_.ResidentGpu();
+    ours.ram = sched_.TransientInUse() + (caps_.unified ? ours.gpu : 0);
+    const core::Limits l = core::ComputeLimits(core::EffectiveRamSetting(settings_, caps_),
+                                               core::EffectiveVramSetting(settings_, caps_), caps_, live_, ours);
+    if (l.ram != limits_.ram || l.gpu != limits_.gpu || l.unified != limits_.unified) {
+        limits_ = l;
+        UpdateCache();
+    }
+    if (settings_.showStats) RequestFrames(1);
+}
+
+void App::Post(std::function<void()> fn) {
+    {
+        std::lock_guard lk(completionsMutex_);
+        completions_.push_back(std::move(fn));
+    }
+    if (!wakePosted_.exchange(true)) PostMessageW(hwnd_, WM_APP_WAKE, 0, 0);
+}
+
+void App::DrainCompletions() {
+    wakePosted_ = false;
+    std::vector<std::function<void()>> batch;
+    {
+        std::lock_guard lk(completionsMutex_);
+        batch.swap(completions_);
+    }
+    for (auto& fn : batch) fn();
+}
+
+void App::StartProbe(uint64_t job, uint64_t item, int rank) {
+    const FileEntry* f = folder_.FindById(item);
+    if (!f) {
+        Post([this, job, item] { OnProbeResult(job, item, ProbeResult{E_ABORT}); });
+        return;
+    }
+    const ImageFormat* fmt = formats_.ForExtension(f->ext);
+    const bool honorExif = fmt ? fmt->honorsExif : true;
+    // The embedded thumbnail is only worth reading for the image on screen.
+    ComPtr<ID3D11Device> thumbDevice;
+    if (rank == 0 && !TextureFor(item)) thumbDevice = gpu_.Device();
+    std::wstring path = f->path;
+    jobs_.Submit(job, rank, [this, job, item, path, honorExif, thumbDevice, rank](WorkerContext& ctx, const CancelFlag& cancel) {
+        ProbeResult r;
+        r.hr = E_ABORT;
+        if (!cancel) {
+            IoGateLock io(gate_, rank, cancel);
+            if (io.held()) {
+                BackgroundMode bg(rank > 1);
+                r = ProbeImage(ctx, thumbDevice.Get(), path, honorExif);
+            }
+        }
+        Post([this, job, item, r] { OnProbeResult(job, item, r); });
+    });
+}
+
+void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r) {
+    sched_.OnProbeDone(job);
+    FileEntry* f = folder_.FindById(item);
+    if (f && r.hr != E_ABORT) {
+        ++probes_;
+        if (SUCCEEDED(r.hr)) {
+            f->probed = true;
+            f->probeHr = S_OK;
+            f->stored = r.stored;
+            f->orientation = r.orientation;
+            f->canPrescale = r.canPrescale;
+            f->error.clear();
+        } else if (IsTransientError(r.hr)) {
+            f->retryAt = NowMs() + kRetryMs;
+            f->error = DescribeError(r.hr);
+        } else {
+            f->probed = true;
+            f->probeHr = r.hr;
+            f->error = DescribeError(r.hr);
+        }
+        if (r.thumb && Current() && Current()->id == item && !TextureFor(item)) {
+            preview_ = {r.thumb, r.thumbSize};
+            previewItem_ = item;
+        }
+        if (Current() && Current()->id == item) RequestFrames();
+    }
+    UpdateCache();
+}
+
+void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::DecodePlan& plan, int rank) {
+    const FileEntry* f = folder_.FindById(key.item);
+    if (!f) {
+        Post([this, job, key, plan] {
+            DecodeResult r;
+            r.hr = E_ABORT;
+            OnDecodeResult(job, key, plan, r, 0);
+        });
+        return;
+    }
+    DecodeRequest req;
+    req.path = f->path;
+    req.fileBytes = f->size;
+    req.readIntoMemory = f->size <= core::kMaxInMemoryFile;
+    req.stored = f->stored;
+    req.orientation = f->orientation;
+    req.canPrescale = f->canPrescale;
+    req.plan = plan;
+    req.priority = rank;
+    req.background = rank > 1;  // everything except the image on screen runs at background priority
+    ComPtr<ID3D11Device> device = gpu_.Device();
+    jobs_.Submit(job, rank, [this, job, key, plan, req, device](WorkerContext& ctx, const CancelFlag& cancel) {
+        DecodeResult r = DecodeImage(ctx, device.Get(), gate_, req, cancel);
+        const uint64_t bytes = SUCCEEDED(r.hr) && req.readIntoMemory ? req.fileBytes : 0;
+        Post([this, job, key, plan, r, bytes] { OnDecodeResult(job, key, plan, r, bytes); });
+    });
+}
+
+void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan, DecodeResult r, uint64_t bytesRead) {
+    core::Outcome outcome = core::Outcome::Ok;
+    if (FAILED(r.hr)) {
+        if (r.hr == E_ABORT)
+            outcome = core::Outcome::Cancelled;
+        else if (r.retry || Gpu::IsDeviceLost(r.hr))
+            outcome = core::Outcome::Retry;
+        else
+            outcome = core::Outcome::Failed;
+    }
+    const bool keep = sched_.OnDecodeDone(job, outcome);
+    const FileEntry* cur = Current();
+    if (keep) {
+        textures_[key] = {r.srv, plan.size};
+        ++decodes_;
+        lastDecodeMs_ = r.ms;
+        if (bytesRead) {
+            ++filesRead_;
+            bytesRead_ += bytesRead;
+        }
+        if (cur && cur->id == key.item) {
+            preview_ = {};
+            previewItem_ = 0;
+            RequestFrames();
+        }
+    }
+    if (FileEntry* f = folder_.FindById(key.item)) {
+        if (outcome == core::Outcome::Failed) f->error = DescribeError(r.hr);
+        if (outcome == core::Outcome::Retry) {
+            f->retryAt = NowMs() + kRetryMs;
+            if (r.hr == HRESULT_FROM_WIN32(ERROR_FILE_INVALID)) {
+                const std::wstring name = f->name;  // Refresh may move or erase *f
+                folder_.Refresh(name, formats_, NowMs());  // file changed under us: re-stat it
+                SyncCurrentIndex();
+            }
+        }
+        if (cur && cur->id == key.item) RequestFrames();
+    }
+    if (Gpu::IsDeviceLost(r.hr) && !suspended_) {
+        RecreateDevice();
+        return;
+    }
+    UpdateCache();
+}
+
+void App::CancelJob(uint64_t job) { jobs_.Cancel(job); }
+
+void App::SetJobPriority(uint64_t job, int rank) { jobs_.SetPriority(job, rank); }
+
+void App::ReleaseEntry(const core::EntryKey& key) { textures_.erase(key); }
+
+const App::Texture* App::TextureFor(uint64_t item) const {
+    auto full = textures_.find({item, core::Variant::Full});
+    if (full != textures_.end()) return &full->second;
+    auto fit = textures_.find({item, core::Variant::Fit});
+    if (fit != textures_.end()) return &fit->second;
+    return nullptr;
+}
+
+// ---- View -----------------------------------------------------------------------------
+
+float App::SidebarWidthPx() const {
+    return settings_.showSidebar ? std::round(float(settings_.sidebarWidth) * dpiScale_) : 0.0f;
+}
+
+App::ViewGeometry App::Geometry() const {
+    ViewGeometry g;
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    g.viewMin = ImVec2(SidebarWidthPx(), 0);
+    g.viewMax = ImVec2(float(rc.right), float(rc.bottom));
+    if (const FileEntry* f = Current()) {
+        if (f->probed && SUCCEEDED(f->probeHr)) {
+            g.source = f->Oriented();
+        } else if (const Texture* t = TextureFor(f->id)) {
+            g.source = t->size;
+        } else if (previewItem_ == f->id && preview_.srv) {
+            g.source = preview_.size;
+        }
+    }
+    if (g.source.empty()) return g;
+    const float vw = std::max(1.0f, g.viewMax.x - g.viewMin.x), vh = std::max(1.0f, g.viewMax.y - g.viewMin.y);
+    const float sw = float(g.source.w), sh = float(g.source.h);
+    g.fitZoom = std::min(vw / sw, vh / sh);
+    if (!settings_.upscaleSmall) g.fitZoom = std::min(g.fitZoom, 1.0f);
+    g.zoom = zoomMode_ == ZoomMode::Fit ? g.fitZoom : zoom_;
+    ImVec2 c = zoomMode_ == ZoomMode::Fit ? ImVec2(sw * 0.5f, sh * 0.5f) : center_;
+    // Keep the image inside the view: centred when smaller, edges clamped when larger.
+    const float hw = vw * 0.5f / g.zoom, hh = vh * 0.5f / g.zoom;
+    c.x = sw * g.zoom <= vw ? sw * 0.5f : std::clamp(c.x, hw, sw - hw);
+    c.y = sh * g.zoom <= vh ? sh * 0.5f : std::clamp(c.y, hh, sh - hh);
+    g.center = c;
+    return g;
+}
+
+void App::ResetView() {
+    zoomMode_ = ZoomMode::Fit;
+    zoom_ = 1.0f;
+    wantFull_ = false;
+    dragging_ = false;
+}
+
+void App::ZoomAt(float factor, ImVec2 screen) {
+    ViewGeometry g = Geometry();
+    if (g.source.empty()) return;
+    const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
+    const ImVec2 under(g.center.x + (screen.x - vc.x) / g.zoom, g.center.y + (screen.y - vc.y) / g.zoom);
+    const float minZoom = std::min(g.fitZoom, 1.0f) * 0.25f;
+    float z = std::clamp(g.zoom * factor, minZoom, 64.0f);
+    if (factor < 1 && g.zoom > g.fitZoom && z <= g.fitZoom * 1.01f) {  // zooming out snaps to fit once
+        zoomMode_ = ZoomMode::Fit;
+        RequestFrames();
+        return;
+    }
+    zoom_ = z;
+    center_ = ImVec2(under.x - (screen.x - vc.x) / z, under.y - (screen.y - vc.y) / z);
+    zoomMode_ = ZoomMode::Custom;
+    RequestFrames();
+}
+
+void App::ToggleActualSize(ImVec2 screen) {
+    ViewGeometry g = Geometry();
+    if (g.source.empty()) return;
+    if (zoomMode_ == ZoomMode::Custom && std::fabs(g.zoom - 1.0f) < 0.001f) {
+        zoomMode_ = ZoomMode::Fit;
+        RequestFrames();
+        return;
+    }
+    ZoomAt(1.0f / g.zoom, screen);
+    zoomMode_ = ZoomMode::Custom;
+    zoom_ = 1.0f;
+}
+
+// ---- Frame ------------------------------------------------------------------------------
+
+void App::Toast(std::string text) {
+    toasts_.push_back({std::move(text), NowMs() + 3000});
+    while (toasts_.size() > 4) toasts_.pop_front();
+    RequestFrames();
+}
+
+void App::Tick() {
+    if (pendingOpen_) {
+        const bool folder = pendingOpen_ == 2;
+        pendingOpen_ = 0;
+        ShowOpenDialog(folder);
+    }
+    const uint64_t now = NowMs();
+    if (folder_.Count() && now >= nextGovernorMs_) {
+        nextGovernorMs_ = now + kGovernorMs;
+        UpdateLimits();
+    }
+    if (settleArmed_ && now >= lastNavMs_ + kSettleMs) {
+        settleArmed_ = false;
+        UpdateCache();
+    }
+    if (recheckAt_ && now >= recheckAt_) {
+        recheckAt_ = 0;
+        UpdateCache();
+    }
+    if (minimized_ && settings_.releaseWhenMinimized && !trimmed_ && now >= minimizedAt_ + kTrimAfterMs) {
+        trimmed_ = true;
+        UpdateCache();
+    }
+    if (!toasts_.empty() && toasts_.front().until <= now) {
+        while (!toasts_.empty() && toasts_.front().until <= now) toasts_.pop_front();
+        RequestFrames(1);
+    }
+    if (settingsDirtyAt_ && now >= settingsDirtyAt_ + kSaveDelayMs) SaveSettingsNow();
+
+    // Sleep until the earliest pending deadline; nothing pending means no wakeups at all.
+    uint64_t w = 0;
+    auto consider = [&](uint64_t t) { w = w ? std::min(w, t) : t; };
+    if (folder_.Count()) consider(nextGovernorMs_);
+    if (settleArmed_) consider(lastNavMs_ + kSettleMs);
+    if (recheckAt_) consider(recheckAt_);
+    if (minimized_ && settings_.releaseWhenMinimized && !trimmed_) consider(minimizedAt_ + kTrimAfterMs);
+    if (!toasts_.empty()) consider(toasts_.front().until);
+    if (settingsDirtyAt_) consider(settingsDirtyAt_ + kSaveDelayMs);
+    wakeAt_ = w;
+}
+
+void App::RenderFrame() {
+    if (inRender_ || !gpu_.Alive() || suspended_) return;
+    inRender_ = true;
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    DrawImage();
+    if (settings_.showSidebar) DrawSidebar();
+    DrawOverlay();
+    DrawToasts();
+    if (showSettings_) DrawSettings();
+    if (settings_.showStats) DrawStats();
+    if (showHelp_) DrawHelp();
+
+    ImGui::Render();
+    float clear[4] = {0, 0, 0, 0};
+    if (!translucent_) {
+        const bool black = settings_.backdrop == int(core::Backdrop::Black);
+        clear[0] = clear[1] = clear[2] = black ? 0.0f : 0.075f;
+        clear[3] = 1.0f;
+    }
+    gpu_.BeginFrame(clear);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    const HRESULT hr = gpu_.Present();
+    inRender_ = false;
+    if (Gpu::IsDeviceLost(hr)) RecreateDevice();
+}
+
+// ---- Window procedure ---------------------------------------------------------------------
+
+LRESULT CALLBACK App::StaticWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    App* self = reinterpret_cast<App*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        self = static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, LONG_PTR(self));
+    }
+    if (self) return self->WndProc(hwnd, msg, wp, lp);
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
+    const bool repeat = (lp & (1 << 30)) != 0;
+    const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    const ViewGeometry g = Geometry();
+    const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
+
+    if (sys) {
+        if (vk == VK_RETURN && !repeat) {
+            ToggleFullscreen();
+            return true;
+        }
+        return false;
+    }
+    switch (vk) {
+        case VK_RIGHT: case VK_DOWN: case VK_NEXT: case VK_SPACE: Navigate(+1); return true;
+        case VK_LEFT: case VK_UP: case VK_PRIOR: case VK_BACK: Navigate(-1); return true;
+        case VK_HOME: JumpTo(0, 1); return true;
+        case VK_END: JumpTo(folder_.Count() - 1, -1); return true;
+        case VK_DELETE: if (!repeat) RecycleCurrent(); return true;
+        case VK_ESCAPE:
+            if (showHelp_) showHelp_ = false;
+            else if (showSettings_) showSettings_ = false;
+            else if (fullscreen_) ToggleFullscreen();
+            else PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            RequestFrames();
+            return true;
+        case VK_F1: showHelp_ = !showHelp_; RequestFrames(); return true;
+        case VK_F3: settings_.showStats = !settings_.showStats; MarkSettingsDirty(); RequestFrames(); return true;
+        case VK_F5: ReloadFolder(); return true;
+        case VK_F11: if (!repeat) ToggleFullscreen(); return true;
+        case VK_ADD: case VK_OEM_PLUS: ZoomAt(1.25f, vc); return true;
+        case VK_SUBTRACT: case VK_OEM_MINUS: ZoomAt(0.8f, vc); return true;
+        case VK_NUMPAD0: zoomMode_ = ZoomMode::Fit; RequestFrames(); return true;
+        default: break;
+    }
+    if (vk >= '1' && vk <= '9' && !ctrl) {
+        if (!repeat) MoveCurrent(int(vk - '0'));
+        return true;
+    }
+    if (repeat) return false;
+    switch (vk) {
+        case '0': zoomMode_ = ZoomMode::Fit; RequestFrames(); return true;
+        case 'O':
+            if (ctrl) ShowOpenDialog(shift);
+            else { settings_.showOverlay = !settings_.showOverlay; MarkSettingsDirty(); }
+            RequestFrames();
+            return true;
+        case 'S': showSettings_ = !showSettings_; RequestFrames(); return true;
+        case 'B': settings_.showSidebar = !settings_.showSidebar; scrollSidebarToCurrent_ = true; MarkSettingsDirty(); RequestFrames(); return true;
+        case 'I': settings_.showStats = !settings_.showStats; MarkSettingsDirty(); RequestFrames(); return true;
+        case 'H': showHelp_ = !showHelp_; RequestFrames(); return true;
+        case 'F': ToggleFullscreen(); return true;
+        case 'Z': ToggleActualSize(vc); return true;
+        default: return false;
+    }
+}
+
+LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (ImGui::GetCurrentContext() && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
+    const ImGuiIO* io = ImGui::GetCurrentContext() ? &ImGui::GetIO() : nullptr;
+    const bool uiMouse = io && io->WantCaptureMouse;
+
+    switch (msg) {
+        case WM_APP_WAKE: DrainCompletions(); return 0;
+        case WM_APP_DIRCHANGED: ApplyDirChanges(); return 0;
+
+        case WM_COPYDATA: {
+            const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
+            if (cds && cds->dwData == kCopyDataOpen && cds->cbData >= sizeof(wchar_t)) {
+                std::wstring path(static_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+                path.resize(wcsnlen(path.c_str(), path.size()));
+                OpenPath(path);
+                return TRUE;
+            }
+            break;
+        }
+        case WM_DROPFILES: {
+            HDROP drop = reinterpret_cast<HDROP>(wp);
+            const UINT len = DragQueryFileW(drop, 0, nullptr, 0);
+            std::wstring path(len, L'\0');
+            DragQueryFileW(drop, 0, path.data(), len + 1);
+            DragFinish(drop);
+            OpenPath(path);
+            return 0;
+        }
+
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+            RequestFrames();
+            if (io && io->WantTextInput) break;
+            if (HandleKey(wp, lp, msg == WM_SYSKEYDOWN)) return 0;
+            break;
+
+        case WM_MOUSEWHEEL:
+            RequestFrames();
+            if (!uiMouse) {
+                POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                ScreenToClient(hwnd, &pt);
+                ZoomAt(std::pow(1.2f, float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA), ImVec2(float(pt.x), float(pt.y)));
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+            RequestFrames();
+            if (!uiMouse) {
+                dragging_ = true;
+                dragLast_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                SetCapture(hwnd);
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            RequestFrames();
+            if (dragging_) {
+                const POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                ViewGeometry g = Geometry();
+                const bool larger = float(g.source.w) * g.zoom > g.viewMax.x - g.viewMin.x + 0.5f ||
+                                    float(g.source.h) * g.zoom > g.viewMax.y - g.viewMin.y + 0.5f;
+                if (!g.source.empty() && larger) {  // a fitted image stays fitted (and re-fits on resize)
+                    center_ = ImVec2(g.center.x - float(p.x - dragLast_.x) / g.zoom, g.center.y - float(p.y - dragLast_.y) / g.zoom);
+                    zoom_ = g.zoom;
+                    zoomMode_ = ZoomMode::Custom;
+                }
+                dragLast_ = p;
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            RequestFrames();
+            if (dragging_) {
+                dragging_ = false;
+                ReleaseCapture();
+            }
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            RequestFrames();
+            if (!uiMouse) ToggleActualSize(ImVec2(float(GET_X_LPARAM(lp)), float(GET_Y_LPARAM(lp))));
+            return 0;
+        case WM_XBUTTONUP:
+            Navigate(GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? -1 : +1);
+            return TRUE;
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+        case WM_MOUSELEAVE:
+            RequestFrames();
+            break;
+
+        case WM_SIZE:
+            if (wp == SIZE_MINIMIZED) {
+                minimized_ = true;
+                minimizedAt_ = NowMs();
+            } else {
+                minimized_ = false;
+                if (trimmed_) {
+                    trimmed_ = false;
+                    UpdateCache();
+                }
+                if (gpu_.Alive()) {
+                    const HRESULT hr = gpu_.Resize(LOWORD(lp), HIWORD(lp));
+                    if (Gpu::IsDeviceLost(hr)) RecreateDevice();
+                    RequestFrames();
+                    RenderFrame();  // keeps live resizing smooth (the main loop is blocked in the sizing loop)
+                }
+            }
+            return 0;
+        case WM_EXITSIZEMOVE:
+        case WM_DISPLAYCHANGE:
+            UpdateMonitor();
+            RequestFrames();
+            break;
+        case WM_DPICHANGED: {
+            const RECT* r = reinterpret_cast<const RECT*>(lp);
+            SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (ImGui::GetCurrentContext()) ApplyDpi(HIWORD(wp));
+            UpdateMonitor();
+            return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+            mmi->ptMinTrackSize = {MulDiv(480, int(GetDpiForWindow(hwnd)), 96), MulDiv(320, int(GetDpiForWindow(hwnd)), 96)};
+            return 0;
+        }
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            RequestFrames(1);
+            return 0;
+        }
+        case WM_ACTIVATE:
+            RequestFrames();
+            break;
+        case WM_CLOSE:
+            SaveSettingsNow();
+            running_ = false;
+            PostQuitMessage(0);
+            return 0;
+        default: break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+}  // namespace fiv
