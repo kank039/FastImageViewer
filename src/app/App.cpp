@@ -476,6 +476,8 @@ void App::RebuildView() {
 }
 
 void App::UpdateBursts() {
+    burstsDirty_ = false;
+    burstsAt_ = NowMs() + 250;
     std::vector<core::BurstInput> in;
     in.reserve(view_.size());
     for (int i = 0; i < ViewCount(); ++i) {
@@ -1477,6 +1479,7 @@ std::vector<core::Want> App::BuildWants() {
     // Header-only reads: capture dates for the date sort, and the neighbours
     // of the image Shift+C is waiting on. Lowest priority, never decoded.
     scanLeft_ = 0;
+    int scanQueued = 0;  // only 2 probes run at a time: a few queued wants are plenty
     const bool burstWait = burstWaitStart_ >= 0 && now < burstWaitUntil_;
     for (int i = 0; i < n && !trim; ++i) {
         FileEntry& f = FileAt(i);
@@ -1484,7 +1487,8 @@ std::vector<core::Want> App::BuildWants() {
         const bool forBurst = burstWait && std::abs(i - burstWaitStart_) <= 8;
         if (!NeedsScan() && !forBurst) continue;
         if (NeedsScan()) ++scanLeft_;
-        if (covered[size_t(i)]) continue;
+        if (covered[size_t(i)] || (!forBurst && scanQueued >= 64)) continue;
+        if (!forBurst) ++scanQueued;
         core::Want w;
         w.key = {f.id, core::Variant::Fit};
         w.rank = (forBurst ? 50000 : 100000) + i;
@@ -1601,7 +1605,7 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen
             previewItem_ = item;
         }
         if (IsVisible(item)) RequestFrames();
-        UpdateBursts();
+        burstsDirty_ = true;  // regrouped in Tick, throttled: a date scan delivers thousands of these
         if (settings_.showSidebar || grid_) RequestFrames(1);
     }
     UpdateCache();  // also counts what the date sort still has to read
@@ -2194,6 +2198,10 @@ void App::Tick() {
         UpdateCache();
     }
     if (!readbacks_.empty() && gpu_.Alive() && !suspended_) PumpReadbacks();
+    if (burstsDirty_ && now >= burstsAt_) {
+        UpdateBursts();
+        if (settings_.showSidebar || grid_) RequestFrames(1);
+    }
     if (detailCheckAt_ && now >= detailCheckAt_) {
         detailCheckAt_ = 0;
         UpdateCache();  // the view settled: maybe a sharper detail is due
@@ -2242,6 +2250,7 @@ void App::Tick() {
     if (anim_.playing && !anim_.busy && !minimized_) consider(anim_.nextAt);
     if (detailCheckAt_) consider(detailCheckAt_);
     if (!readbacks_.empty()) consider(now + 2);  // the GPU copy finishes within a frame or two
+    if (burstsDirty_) consider(burstsAt_);
     wakeAt_ = w;
 }
 

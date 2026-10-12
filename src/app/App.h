@@ -352,6 +352,8 @@ private:
     }
     Texture animTex_;  // the animation's current frame, drawn instead of the still image
     std::vector<int> burst_;                   // burst id per view position, -1 none
+    bool burstsDirty_ = false;                 // capture times arrived: regroup (at most 4x a second)
+    uint64_t burstsAt_ = 0;
     int burstWaitStart_ = -1;                  // Shift+C is waiting for capture times around here
     uint64_t burstWaitUntil_ = 0;
     bool sortPending_ = false;                 // date sort re-sorts once every header is read
