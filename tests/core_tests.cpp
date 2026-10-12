@@ -874,6 +874,19 @@ static void TestBc1() {
     CHECK(HasAlpha(img.data(), s));
 }
 
+static void TestFuzzy() {
+    std::puts("fuzzy");
+    CHECK(FuzzyScore("", "Anything") >= 0);
+    CHECK(FuzzyScore("rot", "Rotate view clockwise") > 0);
+    CHECK(FuzzyScore("xyz", "Rotate view clockwise") == -1);
+    CHECK(FuzzyScore("tor", "Rotate") == -1);  // order matters
+    CHECK(FuzzyScore("ROT", "rotate") == FuzzyScore("rot", "rotate"));
+    // Word starts and runs beat scattered letters.
+    CHECK(FuzzyScore("mv k", "Move to Keepers") > FuzzyScore("mv k", "Remove marks (keep)"));
+    CHECK(FuzzyScore("cp", "Copy path") > FuzzyScore("cp", "Compare"));
+    CHECK(FuzzyScore("undo", "Undo history") > FuzzyScore("undo", "Show undone items list here please"));
+}
+
 static void TestKeys() {
     std::puts("keys");
     for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
@@ -894,7 +907,7 @@ static void TestKeys() {
     km.Build({});
     for (const auto& info : AllActions()) {
         std::vector<Chord> d;
-        CHECK(ParseChords(info.defaults, d) && !d.empty());
+        CHECK(ParseChords(info.defaults, d) && (!d.empty() || info.action == Action::ShowWelcome));  // the welcome card has no key
         CHECK(km.Conflicts(info.action, d).empty());
     }
     Chord ctrlZ;
@@ -932,6 +945,7 @@ int main() {
     TestAnimation();
     TestOrganize();
     TestMarks();
+    TestFuzzy();
     TestKeys();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

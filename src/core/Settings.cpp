@@ -93,6 +93,8 @@ std::vector<Field> Fields(Settings& s) {
         {"slideshowSeconds", Field::Int, &s.slideshowSeconds},
         {"editorPath", Field::Str, &s.editorPath},
         {"autoAdvance", Field::Bool, &s.autoAdvance},
+        {"confirmUnappliedMarks", Field::Bool, &s.confirmUnappliedMarks},
+        {"seenWelcome", Field::Bool, &s.seenWelcome},
         {"includeSubfolders", Field::Bool, &s.includeSubfolders},
         {"sortMode", Field::Int, &s.sortMode},
         {"sortDescending", Field::Bool, &s.sortDescending},

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "../core/Bc1.h"
 #include "../platform/FileOps.h"
@@ -86,6 +87,7 @@ int App::Run(HINSTANCE inst, const std::wstring& initialPath) {
 
     if (!initialPath.empty()) OpenPath(initialPath);
     UpdateTitle();
+    showWelcome_ = !settings_.seenWelcome;
 
     while (running_) {
         if (framesToRender_ <= 0 || minimized_) {
@@ -686,6 +688,8 @@ std::wstring LeafOf(const std::wstring& p) {
 
 void App::PushUndo(UndoOp op) {
     if (op.files.empty()) return;
+    op.when = NowMs();
+    nextToastUndo_ = true;  // the toast that reports it gets an Undo button
     undo_.push_back(std::move(op));
     while (undo_.size() > 50) undo_.pop_front();
 }
@@ -806,6 +810,92 @@ void App::SetFilter(core::Filter f) {
     scrollSidebarToCurrent_ = true;
     Toast(std::string("Showing: ") + core::FilterName(f) + "  (" + std::to_string(ViewCount()) + ")");
     RequestFrames();
+}
+
+int App::UnappliedMarks() const {
+    int n = 0;  // marks on files that are still where they were marked
+    for (const auto& [path, mark] : marks_)
+        if (!mark.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) ++n;
+    return n;
+}
+
+std::string App::KeysFor(core::Action a) const {
+    const auto& chords = keymap_.Bindings(a);
+    return chords.empty() ? std::string() : core::ChordToString(chords.front());
+}
+
+void App::ApplyPreset(bool culling) {
+    settings_.autoAdvance = culling;
+    settings_.showSidebar = culling;
+    settings_.compactHistory = culling;  // more images kept for going back and forth
+    if (culling) settings_.pairRawJpeg = true;
+    scrollSidebarToCurrent_ = true;
+    OnCacheSettingsChanged();
+    RequestFrames();
+}
+
+// Everything the palette can run: every action (with its current key), plus
+// settings people look for by name. Runs are deferred to Tick (outside the frame).
+std::vector<App::Command> App::BuildCommands() {
+    using A = core::Action;
+    std::vector<Command> out;
+    for (const auto& info : core::AllActions()) {
+        if (info.action == A::CommandPalette) continue;
+        std::string label = info.label;
+        if (info.action >= A::Move1 && info.action <= A::Move9) {
+            const int key = int(info.action) - int(A::Move1) + 1;
+            label = "Move to " + DestinationLabel(key) + " (destination " + std::to_string(key) + ")";
+        }
+        const A a = info.action;
+        out.push_back({label, KeysFor(a), [this, a] { Execute(a, false); }});
+    }
+    static const char* kSorts[] = {"Name", "Date taken", "Date modified", "File size", "File type"};
+    for (int k = 0; k < 5; ++k)
+        out.push_back({std::string("Sort by ") + kSorts[k], settings_.sortMode == k ? "current" : "", [this, k] {
+                           settings_.sortMode = k;
+                           OnSortChanged();
+                       }});
+    out.push_back({settings_.sortDescending ? "Sort ascending" : "Sort descending", "", [this] {
+                       settings_.sortDescending = !settings_.sortDescending;
+                       OnSortChanged();
+                   }});
+    for (int f = 0; f < int(core::Filter::Count); ++f)
+        out.push_back({std::string("Show: ") + core::FilterName(core::Filter(f)), int(filter_) == f ? "current" : "",
+                       [this, f] { SetFilter(core::Filter(f)); }});
+    auto toggle = [&](const char* name, bool on, std::function<void()> fn) {
+        out.push_back({std::string(name) + (on ? ": turn off" : ": turn on"), "", std::move(fn)});
+    };
+    toggle("Include subfolders", settings_.includeSubfolders, [this] {
+        settings_.includeSubfolders = !settings_.includeSubfolders;
+        MarkSettingsDirty();
+        ApplyFolderOptions();
+    });
+    toggle("Compressed history", settings_.compactHistory, [this] {
+        settings_.compactHistory = !settings_.compactHistory;
+        OnCacheSettingsChanged();
+    });
+    toggle("Show the next image after marking", settings_.autoAdvance, [this] {
+        settings_.autoAdvance = !settings_.autoAdvance;
+        MarkSettingsDirty();
+    });
+    toggle("Mouse wheel changes image", settings_.wheelNavigates, [this] {
+        settings_.wheelNavigates = !settings_.wheelNavigates;
+        MarkSettingsDirty();
+    });
+    toggle("Wrap around at the end of the folder", settings_.wrapAround, [this] {
+        settings_.wrapAround = !settings_.wrapAround;
+        MarkSettingsDirty();
+        UpdateCache();
+    });
+    out.push_back({"Culling mode (auto-advance, sidebar, compressed history)", "", [this] { ApplyPreset(true); }});
+    out.push_back({"Browsing mode (no auto-advance, no sidebar)", "", [this] { ApplyPreset(false); }});
+    out.push_back({"Clear all marks in this folder", "", [this] {
+                       for (const FileEntry& f : folder_.Files()) marks_.erase(ToLower(f.path));
+                       SyncCurrentIndex();
+                       UpdateCache();
+                       Toast("Marks cleared");
+                   }});
+    return out;
 }
 
 std::vector<int> App::SelectionIndices(core::Selection sel) const {
@@ -2138,12 +2228,18 @@ void App::PanBy(float dx, float dy) {
 // ---- Frame ------------------------------------------------------------------------------
 
 void App::Toast(std::string text) {
-    toasts_.push_back({std::move(text), NowMs() + 3000});
+    const bool undo = std::exchange(nextToastUndo_, false) && !undo_.empty();
+    toasts_.push_back({std::move(text), NowMs() + (undo ? 6000 : 3000), undo});
     while (toasts_.size() > 4) toasts_.pop_front();
     RequestFrames();
 }
 
 void App::Tick() {
+    if (pendingRun_) {  // a command chosen in the palette or a menu
+        auto fn = std::move(pendingRun_);
+        pendingRun_ = nullptr;
+        fn();
+    }
     if (pendingOpen_) {
         const bool folder = pendingOpen_ == 2;
         pendingOpen_ = 0;
@@ -2273,6 +2369,11 @@ void App::RenderFrame() {
     if (settings_.showStats) DrawStats();
     if (settings_.showInfo) DrawInfo();
     if (showMarks_) DrawMarksPanel();
+    if (showHistory_) DrawHistory();
+    DrawContextMenu();
+    if (showPalette_) DrawPalette();
+    if (showWelcome_) DrawWelcome();
+    if (closeGuard_) DrawCloseGuard();
     if (showHelp_) DrawHelp();
 
     ImGui::Render();
@@ -2328,10 +2429,23 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         return true;
     }
 
+    // Any key closes the right-click menu; Esc does nothing else then.
+    if (contextMenuOpen_) {
+        closeContextMenu_ = true;
+        RequestFrames();
+        if (vk == VK_ESCAPE) return true;
+    }
     // Esc is fixed, so a bad key map can never lock you in.
     if (vk == VK_ESCAPE && plain) {
         if (repeat) return true;
-        if (showHelp_) showHelp_ = false;
+        if (closeGuard_) closeGuard_ = false;
+        else if (showWelcome_) {
+            showWelcome_ = false;
+            settings_.seenWelcome = true;
+            MarkSettingsDirty();
+        }
+        else if (showHelp_) showHelp_ = false;
+        else if (showHistory_) showHistory_ = false;
         else if (showSettings_) showSettings_ = false;
         else if (showMarks_) showMarks_ = false;
         else if (grid_) ToggleGrid();
@@ -2462,6 +2576,15 @@ void App::Execute(core::Action a, bool repeat) {
         case A::OpenFile: ShowOpenDialog(false); break;
         case A::OpenFolder: ShowOpenDialog(true); break;
         case A::Rescan: ReloadFolder(); break;
+        case A::CommandPalette:
+            showPalette_ = true;
+            paletteFocus_ = true;
+            paletteQuery_[0] = 0;
+            paletteSel_ = 0;
+            RequestFrames();
+            break;
+        case A::UndoHistory: showHistory_ = !showHistory_; RequestFrames(); break;
+        case A::ShowWelcome: showWelcome_ = true; RequestFrames(); break;
         default: break;
     }
 }
@@ -2643,8 +2766,15 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_XBUTTONUP:
             Navigate(GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? -1 : +1);
             return TRUE;
-        case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
+            RequestFrames();
+            if (!uiMouse) {
+                const int s = TileCount() > 1 ? TileAt(ImVec2(float(GET_X_LPARAM(lp)), float(GET_Y_LPARAM(lp)))) : -1;
+                if (s >= 0 && TileIndex(s) >= 0) activeTile_ = s;  // the menu acts on the tile you clicked
+                openContextMenu_ = true;
+            }
+            return 0;
+        case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN:
         case WM_MBUTTONUP:
         case WM_MOUSELEAVE:
@@ -2698,6 +2828,13 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RequestFrames();
             break;
         case WM_CLOSE:
+            // Marks live only in memory: never lose a culling session by accident.
+            if (!closeConfirmed_ && settings_.confirmUnappliedMarks && UnappliedMarks() > 0) {
+                closeGuard_ = true;
+                StopSlideshow();
+                RequestFrames();
+                return 0;
+            }
             SaveSettingsNow();
             running_ = false;
             PostQuitMessage(0);

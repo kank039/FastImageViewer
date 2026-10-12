@@ -359,11 +359,314 @@ void App::DrawToasts() {
     ImGui::SetNextWindowPos(ImVec2((mn.x + mx.x) * 0.5f, mx.y - 16 * dpiScale_), ImGuiCond_Always,
                             ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowBgAlpha(0.75f);
-    ImGui::Begin("##toasts", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
-    for (const auto& t : toasts_) ImGui::TextUnformatted(t.text.c_str());
+    // Only clickable when it offers Undo, so it never swallows clicks otherwise.
+    int undoToast = -1;
+    for (int i = int(toasts_.size()) - 1; i >= 0 && undoToast < 0; --i)
+        if (toasts_[size_t(i)].undo) undoToast = i;
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (undoToast < 0 || undo_.empty()) flags |= ImGuiWindowFlags_NoInputs;
+    ImGui::Begin("##toasts", nullptr, flags);
+    for (int i = 0; i < int(toasts_.size()); ++i) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(toasts_[size_t(i)].text.c_str());
+        if (i == undoToast && !undo_.empty()) {
+            ImGui::SameLine();
+            const std::string keys = KeysFor(core::Action::Undo);
+            const std::string label = "Undo" + (keys.empty() ? std::string() : "  (" + keys + ")");
+            if (ImGui::SmallButton(label.c_str())) {
+                toasts_[size_t(i)].undo = false;
+                RunLater([this] { Undo(); });
+            }
+        }
+    }
+    if (ImGui::IsWindowHovered()) {  // reading it, or reaching for Undo: keep it up
+        const uint64_t keep = NowMs() + 1500;
+        for (auto& t : toasts_) t.until = std::max(t.until, keep);
+    }
     ImGui::End();
+}
+
+// ---- Command palette, context menu, history, welcome, quit guard -----------------------
+
+void App::DrawPalette() {
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    const float width = std::min(std::round(620 * dpiScale_), float(rc.right) - 32 * dpiScale_);
+    ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, std::round(70 * dpiScale_)), ImGuiCond_Always, ImVec2(0.5f, 0));
+    ImGui::SetNextWindowSize(ImVec2(width, 0));
+    ImGui::SetNextWindowBgAlpha(0.96f);
+    ImGui::Begin("##palette", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav);
+    if (paletteFocus_) {
+        ImGui::SetKeyboardFocusHere();
+        ImGui::SetWindowFocus();
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputTextWithHint("##query", "Type a command, e.g. \"rotate\", \"burst\", \"move to\"...", paletteQuery_,
+                                 sizeof paletteQuery_))
+        paletteSel_ = 0;
+
+    // Matches, best first; with no query, recently used commands come first.
+    std::vector<Command> all = BuildCommands();
+    std::vector<std::pair<int, int>> ranked;  // (score, index)
+    const std::string query = paletteQuery_;
+    for (int i = 0; i < int(all.size()); ++i) {
+        int score = core::FuzzyScore(query, all[size_t(i)].label);
+        if (score < 0) continue;
+        auto recent = std::find(recentCommands_.begin(), recentCommands_.end(), all[size_t(i)].label);
+        if (recent != recentCommands_.end()) score += 1000 - int(recent - recentCommands_.begin()) * 10;
+        ranked.push_back({query.empty() && recent == recentCommands_.end() ? -i : score, i});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    const int n = int(ranked.size());
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) paletteSel_ = std::min(paletteSel_ + 1, n - 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) paletteSel_ = std::max(paletteSel_ - 1, 0);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) paletteSel_ = std::min(paletteSel_ + 10, n - 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) paletteSel_ = std::max(paletteSel_ - 10, 0);
+    paletteSel_ = std::clamp(paletteSel_, 0, std::max(0, n - 1));
+    int run = -1;
+    if (n && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) run = paletteSel_;
+    const bool close = ImGui::IsKeyPressed(ImGuiKey_Escape);
+
+    const float rowH = ImGui::GetTextLineHeightWithSpacing();
+    ImGui::BeginChild("##results", ImVec2(0, rowH * float(std::clamp(n, 1, 12)) + 4 * dpiScale_), false, ImGuiWindowFlags_NoNav);
+    if (n == 0) TextDim("No command matches \"%s\"", paletteQuery_);
+    for (int r = 0; r < n; ++r) {
+        const Command& c = all[size_t(ranked[size_t(r)].second)];
+        ImGui::PushID(r);
+        if (ImGui::Selectable(c.label.c_str(), r == paletteSel_)) run = r;
+        if (r == paletteSel_ && (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_UpArrow) ||
+                                 ImGui::IsKeyPressed(ImGuiKey_PageDown) || ImGui::IsKeyPressed(ImGuiKey_PageUp)))
+            ImGui::SetScrollHereY();
+        if (!c.keys.empty()) {
+            const float kw = ImGui::CalcTextSize(c.keys.c_str()).x;
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - kw);
+            TextDim("%s", c.keys.c_str());
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    TextDim("Enter runs  \xC2\xB7  arrows choose  \xC2\xB7  Esc closes");
+    const bool lostFocus = !paletteFocus_ && !ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    paletteFocus_ = false;
+    ImGui::End();
+
+    if (run >= 0 && run < n) {
+        Command c = all[size_t(ranked[size_t(run)].second)];
+        recentCommands_.erase(std::remove(recentCommands_.begin(), recentCommands_.end(), c.label), recentCommands_.end());
+        recentCommands_.insert(recentCommands_.begin(), c.label);
+        if (recentCommands_.size() > 8) recentCommands_.pop_back();
+        showPalette_ = false;
+        RunLater(std::move(c.run));
+    } else if (close || lostFocus) {
+        showPalette_ = false;
+    }
+    RequestFrames(1);
+}
+
+void App::DrawContextMenu() {
+    using A = core::Action;
+    if (openContextMenu_) {
+        openContextMenu_ = false;
+        ImGui::OpenPopup("##context");
+    }
+    contextMenuOpen_ = ImGui::BeginPopup("##context");
+    if (!contextMenuOpen_) {
+        closeContextMenu_ = false;
+        return;
+    }
+    if (closeContextMenu_) {
+        closeContextMenu_ = false;
+        contextMenuOpen_ = false;
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    auto item = [&](const char* label, A a, bool checked = false, bool enabled = true) {
+        if (ImGui::MenuItem(label, KeysFor(a).c_str(), checked, enabled)) RunLater([this, a] { Execute(a, false); });
+    };
+    const FileEntry* f = Active();
+    if (f) {
+        ImGui::TextDisabled("%s", ToUtf8(f->name).c_str());
+        ImGui::Separator();
+        item("Copy image", A::CopyImage);
+        item("Copy path", A::CopyPath);
+        item("Show in Explorer", A::ShowInExplorer);
+        item(settings_.editorPath.empty() ? "Open with..." : "Open in editor", A::OpenInEditor);
+        ImGui::Separator();
+        const core::Mark m = MarkOf(*f);
+        item("Pick", A::Pick, m.flag == core::Flag::Pick);
+        item("Reject", A::Reject, m.flag == core::Flag::Reject);
+        if (ImGui::BeginMenu("Rating")) {
+            static const char* kStars[] = {"No stars", "1 star", "2 stars", "3 stars", "4 stars", "5 stars"};
+            for (int i = 0; i <= 5; ++i) item(kStars[i], A(int(A::Rate0) + i), m.stars == i);
+            ImGui::EndMenu();
+        }
+        item("Clear mark", A::Unflag, false, !m.empty());
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Move to")) {
+            for (int k = 1; k <= 9; ++k) {
+                const std::string label = std::to_string(k) + ": " + DestinationLabel(k);
+                item(label.c_str(), A(int(A::Move1) + k - 1));
+            }
+            ImGui::EndMenu();
+        }
+        item("Move to the Recycle Bin", A::Delete);
+        ImGui::Separator();
+        item("Rotate right", A::RotateCW);
+        item("Rotate left", A::RotateCCW);
+        item("Focus peaking", A::Peaking, peaking_);
+        item("Compare", A::Compare, compareCount_ > 1);
+        item("Compare this burst", A::CompareBurst);
+        item("Grid", A::Grid, grid_);
+        item("Fullscreen", A::Fullscreen, fullscreen_);
+        ImGui::Separator();
+    } else {
+        item("Open image...", A::OpenFile);
+        item("Open folder...", A::OpenFolder);
+        ImGui::Separator();
+    }
+    item("Undo", A::Undo, false, !undo_.empty());
+    item("Find a command...", A::CommandPalette);
+    item("Settings", A::Settings);
+    ImGui::EndPopup();
+}
+
+void App::DrawHistory() {
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, float(rc.bottom) * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(std::round(420 * dpiScale_), 0), ImVec2(FLT_MAX, float(rc.bottom) * 0.8f));
+    if (!ImGui::Begin("Undo history", &showHistory_, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                                     ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+    if (undo_.empty()) {
+        TextDim("Nothing to undo yet. Deletes and moves show up here.");
+    } else {
+        TextDim("Newest first. Undo goes back step by step, so older steps undo everything above them too.");
+        const uint64_t now = NowMs();
+        int undoCount = 0;
+        if (ImGui::BeginTable("##history", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+            int row = 0;
+            for (auto it = undo_.rbegin(); it != undo_.rend(); ++it, ++row) {
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(it->label.c_str());
+                ImGui::TableSetColumnIndex(1);
+                const uint64_t ago = (now - it->when) / 1000;
+                if (ago < 60)
+                    TextDim("%llu s ago", (unsigned long long)ago);
+                else if (ago < 3600)
+                    TextDim("%llu min ago", (unsigned long long)(ago / 60));
+                else
+                    TextDim("%llu h ago", (unsigned long long)(ago / 3600));
+                ImGui::TableSetColumnIndex(2);
+                if (ImGui::SmallButton(row == 0 ? "Undo" : "Undo to here")) undoCount = row + 1;
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (undoCount > 0)
+            RunLater([this, undoCount] {
+                for (int i = 0; i < undoCount && !undo_.empty(); ++i) Undo();
+            });
+    }
+    ImGui::End();
+}
+
+void App::DrawCloseGuard() {
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, float(rc.bottom) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowFocus();
+    ImGui::Begin("Quit with unapplied marks?", nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoMove);
+    const int n = UnappliedMarks();
+    if (n == 1)
+        ImGui::TextUnformatted("1 image is picked, rejected or rated, but nothing was done with it yet.");
+    else
+        ImGui::Text("%d images are picked, rejected or rated, but nothing was done with them yet.", n);
+    TextDim("Marks are kept only while the program runs: quitting forgets them.");
+    ImGui::Spacing();
+    if (ImGui::Button("Review marks")) {
+        closeGuard_ = false;
+        showMarks_ = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Quit and forget them")) {
+        closeGuard_ = false;
+        closeConfirmed_ = true;
+        PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) closeGuard_ = false;
+    bool dontAsk = !settings_.confirmUnappliedMarks;
+    if (ImGui::Checkbox("Don't ask again", &dontAsk)) {
+        settings_.confirmUnappliedMarks = !dontAsk;
+        MarkSettingsDirty();
+    }
+    ImGui::End();
+}
+
+void App::DrawWelcome() {
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, float(rc.bottom) * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    if (!ImGui::Begin("Welcome to Fast Image Viewer", &open,
+                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+    using A = core::Action;
+    TextDim("The keys you will use most (all of them can be changed in Settings > Controls):");
+    struct Row {
+        A a;
+        const char* what;
+    } rows[] = {{A::Next, "Next image (Left goes back)"},
+                {A::ZoomIn, "Zoom (or the mouse wheel; drag to pan)"},
+                {A::Compare, "Compare images side by side"},
+                {A::Pick, "Pick  (X rejects, Ctrl+1-5 rates)"},
+                {A::Move1, "Move to a folder (keys 1-9; Delete = Recycle Bin)"},
+                {A::Undo, "Undo"},
+                {A::Grid, "Grid of thumbnails"},
+                {A::CommandPalette, "Find any command by name"},
+                {A::Help, "All keys"}};
+    if (ImGui::BeginTable("##welcome", 2, ImGuiTableFlags_SizingFixedFit)) {
+        for (const Row& r : rows) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(kBlue, "%s", KeysFor(r.a).c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(r.what);
+        }
+        ImGui::EndTable();
+    }
+    TextDim("Right-click the image for a menu.");
+    ImGui::SeparatorText("How will you mostly use it?");
+    ImGui::RadioButton("Browsing", &welcomePreset_, 0);
+    TextDim("    Look through photos. Marking an image does not move on.");
+    ImGui::RadioButton("Culling a shoot", &welcomePreset_, 1);
+    TextDim("    Pick and reject quickly: the next image follows each mark, the sidebar is on and more");
+    TextDim("    images are kept for going back. Apply the marks with Shift+P.");
+    ImGui::Spacing();
+    const bool start = ImGui::Button("Start");
+    ImGui::SameLine();
+    TextDim("You can switch later with Ctrl+K > \"Culling mode\" or \"Browsing mode\".");
+    ImGui::End();
+    if (start) ApplyPreset(welcomePreset_ == 1);
+    if (start || !open) {
+        showWelcome_ = false;
+        settings_.seenWelcome = true;
+        MarkSettingsDirty();
+    }
 }
 
 // ---- Sidebar ---------------------------------------------------------------------------
@@ -417,6 +720,10 @@ void App::DrawSidebar() {
             bool shown = false;
             for (int t = 0; t < TileCount(); ++t) shown |= TileIndex(t) == i;
             if (ImGui::Selectable("##row", shown, 0, ImVec2(0, rowH))) JumpTo(i, i >= current_ ? 1 : -1);
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                if (!shown) JumpTo(i, i >= current_ ? 1 : -1);
+                openContextMenu_ = true;
+            }
 
             const ImVec2 b0(p.x + pad, p.y + pad), b1(b0.x + box, b0.y + box);
             if (i < int(burst_.size()) && burst_[size_t(i)] >= 0)  // burst members share a coloured bar
@@ -520,6 +827,10 @@ void App::DrawGrid() {
                 const ImVec2 p = ImGui::GetCursorScreenPos();
                 ImGui::InvisibleButton("##cell", ImVec2(cell, cellH));
                 if (ImGui::IsItemClicked()) JumpTo(i, i >= current_ ? 1 : -1);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    JumpTo(i, i >= current_ ? 1 : -1);
+                    openContextMenu_ = true;
+                }
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) open = i;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ToUtf8(e.rel).c_str());
                 const bool selected = i == current_;
@@ -947,6 +1258,7 @@ void App::DrawMarksPanel() {
     TextDim("P pick, X reject, U clear, Ctrl+1-5 stars. Kept in memory for this session only;");
     TextDim("nothing is written to your files.");
     bool changed = ImGui::Checkbox("Show the next image after marking", &settings_.autoAdvance);
+    changed |= ImGui::Checkbox("Ask before quitting with marks not applied", &settings_.confirmUnappliedMarks);
 
     ImGui::SeparatorText("Show (Ctrl+F)");
     for (int i = 0; i < int(core::Filter::Count); ++i) {
@@ -1122,7 +1434,8 @@ void App::DrawHelp() {
     ImGui::SetNextWindowPos(ImVec2(float(rc.right) * 0.5f, float(rc.bottom) * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, float(rc.bottom) * 0.85f));
     ImGui::Begin("Keyboard & mouse", &showHelp_, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
-    TextDim("Keys can be changed in Settings > Controls.");
+    TextDim("Keys can be changed in Settings > Controls. %s finds any command by name; right-click for a menu.",
+            KeysFor(core::Action::CommandPalette).c_str());
     static const char* mouse[][2] = {
         {"Mouse back / forward", "Previous / next image"},
         {"Wheel", "Zoom at the cursor (or change image: Settings > Controls)"},

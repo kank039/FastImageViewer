@@ -135,6 +135,9 @@ const std::vector<ActionInfo>& AllActions() {
         {Action::OpenFile, "OpenFile", "Open image", "Ctrl+O", false},
         {Action::OpenFolder, "OpenFolder", "Open folder", "Ctrl+Shift+O", false},
         {Action::Rescan, "Rescan", "Rescan folder", "F5", false},
+        {Action::CommandPalette, "CommandPalette", "Command palette: find any command", "Ctrl+K", false},
+        {Action::UndoHistory, "UndoHistory", "Undo history", "Ctrl+H", false},
+        {Action::ShowWelcome, "ShowWelcome", "Welcome and quick start", "", false},
     };
     return kActions;
 }
@@ -230,6 +233,44 @@ std::vector<Action> KeyMap::Conflicts(Action a, const std::vector<Chord>& chords
             }
     }
     return out;
+}
+
+int FuzzyScore(const std::string& query, const std::string& text) {
+    auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c; };
+    int score = 0, run = 0;
+    size_t t = 0;
+    for (char qc : query) {
+        if (qc == ' ') {  // spaces separate words: they only reset the run
+            run = 0;
+            continue;
+        }
+        qc = lower(qc);
+        auto wordStart = [&](size_t i) { return i == 0 || !std::isalnum(static_cast<unsigned char>(text[i - 1])); };
+        // Continue a run if possible, else jump to the next word starting with
+        // this letter, else take its first occurrence.
+        size_t hit = std::string::npos;
+        if (run > 0 && t < text.size() && lower(text[t]) == qc) {
+            hit = t;
+        } else {
+            for (size_t i = t; i < text.size(); ++i)
+                if (lower(text[i]) == qc && wordStart(i)) {
+                    hit = i;
+                    break;
+                }
+            if (hit == std::string::npos)
+                for (size_t i = t; i < text.size(); ++i)
+                    if (lower(text[i]) == qc) {
+                        hit = i;
+                        break;
+                    }
+        }
+        if (hit == std::string::npos) return -1;
+        if (hit != t) run = 0;
+        score += 1 + (wordStart(hit) ? 8 : 0) + run * 4;
+        ++run;
+        t = hit + 1;
+    }
+    return score - int(text.size() / 16);  // shorter labels win ties
 }
 
 }  // namespace fiv::core

@@ -94,10 +94,18 @@ private:
     struct UndoOp {
         std::vector<UndoFile> files;  // primary first
         std::string label;
+        uint64_t when = 0;            // NowMs() when it happened
     };
     struct ToastMsg {
         std::string text;
         uint64_t until = 0;
+        bool undo = false;  // reports something Ctrl+Z can take back: shows an Undo button
+    };
+    // A named thing the user can run (command palette, right-click menu).
+    struct Command {
+        std::string label;
+        std::string keys;  // current shortcut, for display
+        std::function<void()> run;
     };
     struct ViewGeometry {
         ImVec2 viewMin, viewMax;   // area available to the image
@@ -261,6 +269,17 @@ private:
     void DrawSortingTab();
     void DrawControlsTab();
     void DrawMarksPanel();
+    // Discoverability & safety
+    std::vector<Command> BuildCommands();
+    void RunLater(std::function<void()> fn) { pendingRun_ = std::move(fn); }  // outside the ImGui frame
+    std::string KeysFor(core::Action a) const;
+    int UnappliedMarks() const;
+    void ApplyPreset(bool culling);
+    void DrawPalette();
+    void DrawContextMenu();
+    void DrawHistory();
+    void DrawCloseGuard();
+    void DrawWelcome();
     void DrawGrid();
     // Pick/reject flag and stars at `pos` (top-left), `size` high. Returns the width used.
     static float DrawMarkBadge(ImDrawList* dl, ImVec2 pos, float size, const core::Mark& m);
@@ -387,6 +406,22 @@ private:
     POINT gestureLast_{};
     ULONGLONG gestureZoomLast_ = 0;
     int gestureSwipe_ = 0;           // horizontal travel of a pan gesture at fit zoom
+
+    std::function<void()> pendingRun_;
+    bool showPalette_ = false;
+    bool paletteFocus_ = false;
+    char paletteQuery_[128] = {};
+    int paletteSel_ = 0;
+    std::vector<std::string> recentCommands_;  // labels, newest first (this session)
+    bool openContextMenu_ = false;
+    bool contextMenuOpen_ = false;   // drawn last frame
+    bool closeContextMenu_ = false;  // a key was pressed while it was open
+    bool showHistory_ = false;
+    bool closeGuard_ = false;      // asking about unapplied marks before quitting
+    bool closeConfirmed_ = false;
+    bool showWelcome_ = false;
+    int welcomePreset_ = 1;        // 0 browsing, 1 culling
+    bool nextToastUndo_ = false;   // the next toast reports an undoable operation
 
     std::deque<UndoOp> undo_;   // newest at the back
     int pendingDestPick_ = 0;   // 1..9: folder picker for that key (run outside the ImGui frame)

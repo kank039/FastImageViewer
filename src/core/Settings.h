@@ -61,6 +61,8 @@ struct Settings {
     int slideshowSeconds = 4;
     std::string editorPath;        // "Open in editor"; empty = Windows "Open with" chooser
     bool autoAdvance = true;       // after marking an image, show the next one
+    bool confirmUnappliedMarks = true;  // quitting with marks that were never applied asks first
+    bool seenWelcome = false;      // the first-run welcome card was shown
     std::map<std::string, std::string> keyBindings;  // action id -> chords, only where changed
 
     // Organise

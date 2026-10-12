@@ -18,6 +18,7 @@ enum class Action : int {
     Slideshow, CopyImage, CopyPath, ShowInExplorer, OpenInEditor,
     ToggleOverlay, ToggleSidebar, ToggleInfo, ToggleStats, Settings, Help,
     OpenFile, OpenFolder, Rescan,
+    CommandPalette, UndoHistory, ShowWelcome,
     Count,
     None = -1,
 };
@@ -47,6 +48,12 @@ std::string ChordsToString(const std::vector<Chord>& chords);  // "Right, Down"
 bool ParseChords(const std::string& text, std::vector<Chord>& out);  // "" = unbound
 
 bool IsModifierKey(uint16_t vk);
+
+// Command palette matching: every query character must appear in order
+// (case-insensitive). Higher is better; -1 = no match. Rewards matches at
+// word starts and runs of consecutive characters, so "mv k" finds
+// "Move to Keepers" before "Remove marks".
+int FuzzyScore(const std::string& query, const std::string& text);
 
 class KeyMap {
 public:
