@@ -1,5 +1,6 @@
 #include "Gpu.h"
 
+#include <d3dcompiler.h>
 #include <dwmapi.h>
 #if __has_include(<d3d11_3.h>)
 #include <d3d11_3.h>  // D3D11_FEATURE_DATA_D3D11_OPTIONS2 on some SDK versions
@@ -122,6 +123,7 @@ bool Gpu::Create(HWND hwnd, std::string& error) {
     samp.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
     samp.MaxLOD = D3D11_FLOAT32_MAX;
     device_->CreateSamplerState(&samp, &pointSampler_);
+    CreatePeakingShader();
 
     if (FAILED(CreateTarget())) {
         error = "Could not create the render target.";
@@ -137,6 +139,31 @@ HRESULT Gpu::CreateTarget() {
     return hr;
 }
 
+// Focus peaking: edges with a strong local gradient are painted red over a
+// dimmed picture. Same inputs as Dear ImGui's own pixel shader, so it can be
+// swapped in for a single draw call; it needs no extra texture memory.
+void Gpu::CreatePeakingShader() {
+    static const char kSource[] = R"(
+struct PS_INPUT { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };
+sampler sampler0;
+Texture2D texture0;
+float L(float2 uv) { return dot(texture0.SampleLevel(sampler0, uv, 0).rgb, float3(0.299, 0.587, 0.114)); }
+float4 main(PS_INPUT input) : SV_Target {
+    float w, h;
+    texture0.GetDimensions(w, h);
+    float2 t = float2(1.0 / w, 1.0 / h);
+    float4 c = texture0.Sample(sampler0, input.uv);
+    float gx = L(input.uv + float2(t.x, 0)) - L(input.uv - float2(t.x, 0));
+    float gy = L(input.uv + float2(0, t.y)) - L(input.uv - float2(0, t.y));
+    float edge = smoothstep(0.16, 0.30, sqrt(gx * gx + gy * gy));
+    return float4(lerp(c.rgb * 0.55, float3(1.0, 0.12, 0.08), edge), c.a) * input.col;
+})";
+    ComPtr<ID3DBlob> code, errors;
+    if (FAILED(D3DCompile(kSource, sizeof kSource - 1, nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &code, &errors)))
+        return;  // the feature is simply unavailable
+    device_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &peakingPS_);
+}
+
 void Gpu::Destroy() {
     if (adapter3_ && budgetCookie_) adapter3_->UnregisterVideoMemoryBudgetChangeNotification(budgetCookie_);
     budgetCookie_ = 0;
@@ -148,6 +175,7 @@ void Gpu::Destroy() {
     }
     rtv_.Reset();
     pointSampler_.Reset();
+    peakingPS_.Reset();
     visual_.Reset();
     target_.Reset();
     dcomp_.Reset();

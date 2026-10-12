@@ -61,6 +61,13 @@ struct Settings {
     bool autoAdvance = true;       // after marking an image, show the next one
     std::map<std::string, std::string> keyBindings;  // action id -> chords, only where changed
 
+    // Organise
+    bool includeSubfolders = false;  // show images of subfolders too (move destinations excluded)
+    int sortMode = 0;                // core::SortKey
+    bool sortDescending = false;
+    int burstGapSeconds = 2;         // shots at most this far apart form a burst
+    int gridSize = 200;              // grid cell size in px at 100% scaling
+
     // Camera RAW is off by default: RAW+JPEG pairs would otherwise show every photo twice.
     std::vector<std::string> disabledFormats = {"Camera RAW"};
 

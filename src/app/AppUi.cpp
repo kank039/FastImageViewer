@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cfloat>
+#include <climits>
 #include <cstdarg>
 #include <cstdio>
 
@@ -87,6 +88,19 @@ void AddStar(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
     dl->Flags = saved;
 }
 
+void SetPeakingShader(const ImDrawList*, const ImDrawCmd* cmd) {
+    auto* gpu = static_cast<Gpu*>(cmd->UserCallbackData);
+    gpu->Context()->PSSetShader(gpu->PeakingShader(), nullptr, 0);
+}
+
+// Fits `content` into a box, centred.
+void FitInBox(core::Size content, ImVec2 b0, float box, ImVec2& o0, ImVec2& o1) {
+    const float a = float(content.w) / float(std::max(1u, content.h));
+    const ImVec2 sz = a >= 1 ? ImVec2(box, box / a) : ImVec2(box * a, box);
+    o0 = ImVec2(std::round(b0.x + (box - sz.x) * 0.5f), std::round(b0.y + (box - sz.y) * 0.5f));
+    o1 = ImVec2(o0.x + sz.x, o0.y + sz.y);
+}
+
 void SetPointSampler(const ImDrawList*, const ImDrawCmd* cmd) {
     auto* gpu = static_cast<Gpu*>(cmd->UserCallbackData);
     ID3D11SamplerState* s = gpu->PointSampler();
@@ -136,6 +150,23 @@ void App::DrawImage() {
     }
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     const bool compare = compareCount_ > 1;
+    // In compare mode the sharpest image of the set is marked (once all are scored).
+    int sharpestSlot = -1;
+    if (compare) {
+        float best = -1;
+        bool all = true;
+        for (const Tile& t : Tiles()) {
+            if (t.index < 0) continue;
+            const float sc = FileAt(t.index).sharpness;
+            all &= sc >= 0;
+            if (sc > best) {
+                best = sc;
+                sharpestSlot = t.slot;
+            }
+        }
+        if (!all || VisibleTiles() < 2) sharpestSlot = -1;
+    }
+    const bool peaking = peaking_ && gpu_.PeakingShader();
     for (const Tile& tile : Tiles()) {
         if (tile.index < 0) continue;
         const FileEntry& f = FileAt(tile.index);
@@ -143,7 +174,11 @@ void App::DrawImage() {
         const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
 
         const Texture* tex = TextureFor(f.id);
-        const Texture* shown = tex ? tex : (previewItem_ == f.id && preview_.srv ? &preview_ : nullptr);
+        auto thumbIt = textures_.find({f.id, core::Variant::Thumb});
+        const Texture* shown = tex                                        ? tex
+                               : previewItem_ == f.id && preview_.srv     ? &preview_
+                               : thumbIt != textures_.end()               ? &thumbIt->second
+                                                                          : nullptr;
         const int rot = RotationOf(f);
         if (shown && !g.source.empty()) {
             const ImVec2 size(float(g.source.w) * g.zoom, float(g.source.h) * g.zoom);
@@ -151,11 +186,12 @@ void App::DrawImage() {
             const ImVec2 pmax(pmin.x + size.x, pmin.y + size.y);
             const core::Size texSize = Turned(shown->size, rot);  // as displayed
             const float texelScale = size.x / float(std::max(1u, texSize.w));  // screen pixels per texel
-            const bool point = settings_.pixelatedZoom && shown != &preview_ && texelScale > 1.01f;
+            const bool point = settings_.pixelatedZoom && shown == tex && texelScale > 1.01f;
             dl->PushClipRect(g.viewMin, g.viewMax, false);
             if (point) dl->AddCallback(SetPointSampler, &gpu_);
+            if (peaking && shown == tex) dl->AddCallback(SetPeakingShader, &gpu_);
             AddRotatedImage(dl, ToTex(shown->srv.Get()), pmin, pmax, rot);
-            if (point) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+            if (point || (peaking && shown == tex)) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
             dl->PopClipRect();
 
             // Zoomed past the screen-sized texture: fetch full-resolution versions of the visible images.
@@ -199,6 +235,13 @@ void App::DrawImage() {
                               ImVec2(tile.min.x + 3 * pad + ts.x, tile.min.y + 2 * pad + ts.y + pad * 0.5f),
                               active ? IM_COL32(40, 90, 170, 220) : IM_COL32(0, 0, 0, 150), 4 * dpiScale_);
             dl->AddText(ImVec2(tile.min.x + 2 * pad, tile.min.y + 1.5f * pad), IM_COL32_WHITE, text.c_str());
+            if (tile.slot == sharpestSlot) {
+                const char* label = "Sharpest";
+                const ImVec2 ls = ImGui::CalcTextSize(label);
+                const ImVec2 l0(tile.max.x - 3 * pad - ls.x, tile.min.y + pad);
+                dl->AddRectFilled(l0, ImVec2(tile.max.x - pad, l0.y + ls.y + pad), IM_COL32(40, 150, 70, 230), 4 * dpiScale_);
+                dl->AddText(ImVec2(l0.x + pad, l0.y + pad * 0.5f), IM_COL32_WHITE, label);
+            }
             const core::Mark mark = MarkOf(f);
             if (!mark.empty()) {
                 const float bs = ts.y;
@@ -268,6 +311,9 @@ void App::DrawOverlay() {
     if (TileCount() > 1) ImGui::TextColored(kBlue, "Compare %d  \xC2\xB7  tile %d", TileCount(), activeTile_ + 1);
     if (slideshow_) ImGui::TextColored(kBlue, "Slideshow  \xC2\xB7  %d s", settings_.slideshowSeconds);
     if (settings_.ovName) ImGui::TextUnformatted(ToUtf8(f->name).c_str());
+    if (settings_.ovName && f->rel.size() > f->name.size())
+        TextDim("in %s", ToUtf8(f->rel.substr(0, f->rel.size() - f->name.size() - 1)).c_str());
+    if (peaking_) ImGui::TextColored(kRed, "Focus peaking");
     if (const core::Mark mark = MarkOf(*f); !mark.empty()) {
         const float bs = ImGui::GetTextLineHeight();
         const float bw = DrawMarkBadge(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(), bs, mark);
@@ -327,6 +373,7 @@ void App::DrawSidebar() {
     ImGui::TextUnformatted(ToUtf8(slash == std::wstring::npos ? folder : folder.substr(slash + 1)).c_str());
     TextDim("%d images  |  %s", folder_.Count(), StorageName(storage_));
     if (filter_ != core::Filter::All) ImGui::TextColored(kBlue, "Showing %s: %d", core::FilterName(filter_), ViewCount());
+    if (NeedsScan() && scanLeft_ > 0) ImGui::TextColored(kAmber, "Reading capture dates: %d left", scanLeft_);
     TextDim("Cache %s of %s %s", FormatBytes(sched_.ResidentGpu()).c_str(), FormatBytes(limits_.gpu).c_str(),
             caps_.unified ? "(shared RAM)" : "VRAM");
     ImGui::Separator();
@@ -344,8 +391,11 @@ void App::DrawSidebar() {
     const float pad = 4 * dpiScale_, box = rowH - 2 * pad;
     ImGuiListClipper clip;
     clip.Begin(n, rowH);
+    int firstRow = INT_MAX, lastRow = -1;
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+            firstRow = std::min(firstRow, i);
+            lastRow = std::max(lastRow, i);
             const FileEntry& e = FileAt(i);
             ImGui::PushID(i);
             const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -355,13 +405,14 @@ void App::DrawSidebar() {
             if (ImGui::Selectable("##row", shown, 0, ImVec2(0, rowH))) JumpTo(i, i >= current_ ? 1 : -1);
 
             const ImVec2 b0(p.x + pad, p.y + pad), b1(b0.x + box, b0.y + box);
-            if (const Texture* t = TextureFor(e.id)) {
+            if (i < int(burst_.size()) && burst_[size_t(i)] >= 0)  // burst members share a coloured bar
+                dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + 3 * dpiScale_, p.y + rowH),
+                                  burst_[size_t(i)] % 2 ? IM_COL32(230, 160, 40, 255) : IM_COL32(70, 140, 255, 255));
+            if (const Texture* t = ThumbFor(e.id)) {
                 const int rot = RotationOf(e);
-                const core::Size ts = Turned(t->size, rot);
-                const float a = float(ts.w) / float(std::max(1u, ts.h));
-                const ImVec2 s = a >= 1 ? ImVec2(box, box / a) : ImVec2(box * a, box);
-                const ImVec2 o(b0.x + (box - s.x) * 0.5f, b0.y + (box - s.y) * 0.5f);
-                AddRotatedImage(dl, ToTex(t->srv.Get()), o, ImVec2(o.x + s.x, o.y + s.y), rot);
+                ImVec2 o0, o1;
+                FitInBox(Turned(t->size, rot), b0, box, o0, o1);
+                AddRotatedImage(dl, ToTex(t->srv.Get()), o0, o1, rot);
             } else {
                 ImVec4 c(0.18f, 0.18f, 0.20f, 1);
                 if (sched_.IsDecoding({e.id, core::Variant::Fit}) || sched_.IsProbing(e.id)) c = ImVec4(0.45f, 0.36f, 0.15f, 1);
@@ -375,7 +426,7 @@ void App::DrawSidebar() {
             char line[64];
             std::snprintf(line, sizeof line, "%d", i + 1);
             const float lh = ImGui::GetTextLineHeight();
-            dl->AddText(ImVec2(tx, p.y + pad), ImGui::GetColorU32(ImGuiCol_Text), ToUtf8(e.name).c_str());
+            dl->AddText(ImVec2(tx, p.y + pad), ImGui::GetColorU32(ImGuiCol_Text), ToUtf8(e.rel).c_str());
             if (const core::Mark mark = MarkOf(e); !mark.empty()) {  // badge on its own line under the details
                 const float bs = std::round(ImGui::GetTextLineHeight() * 0.85f);
                 const float by = std::min(p.y + pad + 2 * ImGui::GetTextLineHeight(), p.y + rowH - bs - pad);
@@ -395,6 +446,115 @@ void App::DrawSidebar() {
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::End();
+    if (lastRow >= 0 && (firstRow != sidebarFirst_ || lastRow != sidebarLast_)) {
+        sidebarFirst_ = firstRow;
+        sidebarLast_ = lastRow;
+        UpdateCache();  // thumbnails for the rows now in view
+    }
+}
+
+// ---- Grid ------------------------------------------------------------------------------
+
+void App::DrawGrid() {
+    ImVec2 mn, mx;
+    ViewArea(mn, mx);
+    ImGui::SetNextWindowPos(mn);
+    ImGui::SetNextWindowSize(ImVec2(mx.x - mn.x, mx.y - mn.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+    ImGui::Begin("##grid", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground);
+    ImGui::PopStyleVar();
+    const int n = ViewCount();
+    if (n == 0) {
+        ImGui::End();
+        DrawEmpty();
+        return;
+    }
+    const float cell = std::round(float(settings_.gridSize) * dpiScale_), gap = std::round(8 * dpiScale_);
+    const float lineH = ImGui::GetTextLineHeight();
+    const float cellH = cell + lineH + gap * 0.5f;
+    const int cols = std::max(1, int((ImGui::GetContentRegionAvail().x + gap) / (cell + gap)));
+    gridCols_ = cols;
+    const int rows = (n + cols - 1) / cols;
+    if (scrollGridToCurrent_) {
+        scrollGridToCurrent_ = false;
+        const float rowTop = float(current_ / cols) * (cellH + gap), viewH = ImGui::GetWindowHeight();
+        const float y = ImGui::GetScrollY();
+        if (rowTop < y)
+            ImGui::SetScrollY(rowTop);
+        else if (rowTop + cellH > y + viewH - gap)
+            ImGui::SetScrollY(rowTop + cellH - viewH + 2 * gap);
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));
+    int first = INT_MAX, last = -1;
+    int open = -1;
+    ImGuiListClipper clip;
+    clip.Begin(rows, cellH + gap);
+    while (clip.Step()) {
+        for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                const int i = r * cols + c;
+                if (i >= n) break;
+                if (c) ImGui::SameLine();
+                first = std::min(first, i);
+                last = std::max(last, i);
+                const FileEntry& e = FileAt(i);
+                ImGui::PushID(i);
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                ImGui::InvisibleButton("##cell", ImVec2(cell, cellH));
+                if (ImGui::IsItemClicked()) JumpTo(i, i >= current_ ? 1 : -1);
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) open = i;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ToUtf8(e.rel).c_str());
+                const bool selected = i == current_;
+                dl->AddRectFilled(p, ImVec2(p.x + cell, p.y + cell),
+                                  selected ? IM_COL32(45, 70, 115, 255) : IM_COL32(32, 32, 36, 235), 4 * dpiScale_);
+                if (const Texture* t = ThumbFor(e.id)) {
+                    const int rot = RotationOf(e);
+                    ImVec2 o0, o1;
+                    FitInBox(Turned(t->size, rot), ImVec2(p.x + gap * 0.5f, p.y + gap * 0.5f), cell - gap, o0, o1);
+                    AddRotatedImage(dl, ToTex(t->srv.Get()), o0, o1, rot);
+                } else {
+                    const char* msg = !e.error.empty() ? "Cannot open" : e.CloudOnly() && settings_.skipCloudFiles ? "Online only" : "";
+                    if (*msg) {
+                        const ImVec2 ts = ImGui::CalcTextSize(msg);
+                        dl->AddText(ImVec2(p.x + (cell - ts.x) * 0.5f, p.y + (cell - ts.y) * 0.5f),
+                                    ImGui::ColorConvertFloat4ToU32(e.error.empty() ? kBlue : kRed), msg);
+                    }
+                }
+                if (selected)
+                    dl->AddRect(p, ImVec2(p.x + cell, p.y + cell), IM_COL32(70, 140, 255, 255), 4 * dpiScale_, 0, 2 * dpiScale_);
+                if (i < int(burst_.size()) && burst_[size_t(i)] >= 0)
+                    dl->AddRectFilled(ImVec2(p.x, p.y + cell - 3 * dpiScale_), ImVec2(p.x + cell, p.y + cell),
+                                      burst_[size_t(i)] % 2 ? IM_COL32(230, 160, 40, 255) : IM_COL32(70, 140, 255, 255));
+                if (const core::Mark mark = MarkOf(e); !mark.empty()) {
+                    const float bs = std::round(lineH * 0.9f);
+                    const ImVec2 b0(p.x + gap * 0.5f, p.y + cell - bs - gap * 0.5f);
+                    dl->AddRectFilled(ImVec2(b0.x - 2, b0.y - 2), ImVec2(b0.x + MarkBadgeWidth(bs, mark) + 2, b0.y + bs + 2),
+                                      IM_COL32(0, 0, 0, 160), 3 * dpiScale_);
+                    DrawMarkBadge(dl, b0, bs, mark);
+                }
+                dl->PushClipRect(ImVec2(p.x, p.y + cell), ImVec2(p.x + cell, p.y + cellH), true);
+                dl->AddText(ImVec2(p.x + 2, p.y + cell + 2), selected ? IM_COL32_WHITE : ImGui::ColorConvertFloat4ToU32(kDim),
+                            ToUtf8(e.name).c_str());
+                dl->PopClipRect();
+                ImGui::PopID();
+            }
+        }
+    }
+    ImGui::PopStyleVar();
+    ImGui::End();
+    if (last >= 0 && (first != gridFirst_ || last != gridLast_)) {
+        gridFirst_ = first;
+        gridLast_ = last;
+        UpdateCache();
+    }
+    if (open >= 0) {
+        JumpTo(open, 1);
+        ToggleGrid();
+    }
 }
 
 // ---- Settings --------------------------------------------------------------------------
@@ -562,6 +722,35 @@ void App::DrawSettings() {
 
 void App::DrawSortingTab() {
     bool changed = false;
+    ImGui::SeparatorText("Order");
+    const char* keys[] = {"Name", "Date taken", "Date modified", "File size", "File type"};
+    ImGui::SetNextItemWidth(std::round(200 * dpiScale_));
+    bool sort = ImGui::Combo("Sort by", &settings_.sortMode, keys, IM_ARRAYSIZE(keys));
+    ImGui::SameLine();
+    sort |= ImGui::Checkbox("Descending", &settings_.sortDescending);
+    if (sort) OnSortChanged();
+    HelpMarker("Date taken reads the capture time from each file's header (a small read per image, in the background, "
+               "at low priority). Images without one use their modified date.");
+    if (ImGui::Checkbox("Include subfolders", &settings_.includeSubfolders)) {
+        MarkSettingsDirty();
+        ApplyFolderOptions();
+    }
+    HelpMarker("Shows the images of every subfolder too (up to 8 levels, 50,000 images). The folders of keys 1-9 are "
+               "left out, so sorted images do not come back.");
+    ImGui::SetNextItemWidth(std::round(200 * dpiScale_));
+    if (ImGui::SliderInt("Burst: shots within", &settings_.burstGapSeconds, 1, 30, "%d s", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+        UpdateBursts();
+    }
+    HelpMarker("Consecutive shots from the same camera this close together form a burst: a coloured bar in the sidebar "
+               "and grid, and Shift+C compares them side by side with the sharpest one marked.");
+    ImGui::SetNextItemWidth(std::round(200 * dpiScale_));
+    if (ImGui::SliderInt("Grid cell size", &settings_.gridSize, 96, 400, "%d px", ImGuiSliderFlags_AlwaysClamp)) {
+        changed = true;
+        UpdateCache();
+    }
+
+    ImGui::SeparatorText("Pairs");
     if (ImGui::Checkbox("Keep RAW + JPEG pairs together", &settings_.pairRawJpeg)) {
         changed = true;
         ReloadFolder();
@@ -673,6 +862,7 @@ void App::DrawInfo() {
                 FormatBytes(f->size).c_str(), fmt ? fmt->name.c_str() : "", f->progressive ? " (progressive)" : "");
     }
     if (camera.empty() && exposure.empty() && f->probed) TextDim("No camera data in this file");
+    if (f->sharpness >= 0) TextDim("Focus score %.0f (higher is sharper; compare shots of the same scene)", double(f->sharpness));
 
     // Histogram of the decoded image (computed when it was decoded; no extra work here).
     const Texture* tex = nullptr;
@@ -898,6 +1088,7 @@ void App::DrawHelp() {
         {"Drag, one-finger drag", "Pan"},
         {"Double-click, two-finger tap", "Toggle 100% / fit"},
         {"Click a tile", "Pick the active image in compare mode"},
+        {"Grid: arrows, Enter, double-click", "Move, open the image (+ / - change the cell size)"},
         {"Esc", "Close panel / stop slideshow / leave compare / leave fullscreen / quit"},
     };
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {

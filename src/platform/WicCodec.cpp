@@ -1,5 +1,7 @@
 #include "WicCodec.h"
 
+#include "../core/Organize.h"
+
 #include <propidl.h>
 
 #include "WicCompat.h"
@@ -423,6 +425,12 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         core::ComputeHistogram(chain.get() + core::MipChainBytes(req.plan.size, level),
                                core::MipLevelSize(req.plan.size, level), *h);
         res.histogram = std::move(h);
+    }
+    if (req.wantSharpness) {  // focus score from a <=1024 px level (a few ms)
+        const uint32_t level = core::HistogramLevel(req.plan.size, req.plan.mipLevels, 1024);
+        const core::Size ls = core::MipLevelSize(req.plan.size, level);
+        if (std::max(ls.w, ls.h) <= 2048)
+            res.sharpness = core::Sharpness(chain.get() + core::MipChainBytes(req.plan.size, level), ls);
     }
     if (aborted()) return fail(E_ABORT);
 

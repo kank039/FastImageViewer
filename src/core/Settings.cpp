@@ -19,6 +19,9 @@ void Validate(Settings& s, const MemoryCaps& caps) {
     s.decodeMode = std::clamp(s.decodeMode, 0, 1);
     s.backdrop = std::clamp(s.backdrop, 0, 2);
     s.slideshowSeconds = std::clamp(s.slideshowSeconds, 1, 120);
+    s.sortMode = std::clamp(s.sortMode, 0, 4);
+    s.burstGapSeconds = std::clamp(s.burstGapSeconds, 1, 30);
+    s.gridSize = std::clamp(s.gridSize, 96, 400);
 
     const uint32_t maxRam = std::max(kMinBudgetMB, ToMB(caps.maxRam));
     const uint32_t maxVram = std::max(kMinBudgetMB, ToMB(caps.maxVram));
@@ -87,6 +90,11 @@ std::vector<Field> Fields(Settings& s) {
         {"slideshowSeconds", Field::Int, &s.slideshowSeconds},
         {"editorPath", Field::Str, &s.editorPath},
         {"autoAdvance", Field::Bool, &s.autoAdvance},
+        {"includeSubfolders", Field::Bool, &s.includeSubfolders},
+        {"sortMode", Field::Int, &s.sortMode},
+        {"sortDescending", Field::Bool, &s.sortDescending},
+        {"burstGapSeconds", Field::Int, &s.burstGapSeconds},
+        {"gridSize", Field::Int, &s.gridSize},
     };
     for (int i = 0; i < 9; ++i) f.push_back({kDest[i], Field::Str, &s.destinations[size_t(i)]});
     return f;

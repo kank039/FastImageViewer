@@ -11,6 +11,7 @@
 #include "../src/core/Histogram.h"
 #include "../src/core/Keys.h"
 #include "../src/core/Marks.h"
+#include "../src/core/Organize.h"
 #include "../src/core/MemoryLimits.h"
 #include "../src/core/Pixels.h"
 #include "../src/core/Scheduler.h"
@@ -697,6 +698,54 @@ static void TestMarks() {
     for (int i = 0; i < int(Selection::Count); ++i) CHECK(SelectionName(Selection(i))[0] != 0);
 }
 
+static void TestOrganize() {
+    std::puts("organize");
+    CHECK(ParseExifTime("1970:01:01 00:00:00") == 0);
+    CHECK(ParseExifTime("2024:05:01 12:34:56") == 1714566896);
+    CHECK(ParseExifTime("2024:02:29 00:00:01") - ParseExifTime("2024:02:28 00:00:01") == 86400);
+    CHECK(ParseExifTime("2024:13:01 00:00:00") == -1 && ParseExifTime("    :  :     :  :  ") == -1 && ParseExifTime("") == -1);
+    CHECK(FileTimeToUnix(116444736000000000ull) == 0);
+
+    std::vector<SortItem> items(4);
+    items[0] = {100, 50, 30, L".jpg"};
+    items[1] = {-1, 90, 10, L".png"};  // unknown capture time: modified (90) is used
+    items[2] = {80, 70, 30, L".cr2"};
+    items[3] = {100, 10, 20, L".jpg"};
+    CHECK((SortOrder(items, SortKey::Name, false) == std::vector<int>{0, 1, 2, 3}));
+    CHECK((SortOrder(items, SortKey::Name, true) == std::vector<int>{3, 2, 1, 0}));
+    CHECK((SortOrder(items, SortKey::Taken, false) == std::vector<int>{2, 1, 0, 3}));  // ties keep name order
+    CHECK((SortOrder(items, SortKey::Taken, true) == std::vector<int>{3, 0, 1, 2}));
+    CHECK((SortOrder(items, SortKey::Modified, false) == std::vector<int>{3, 0, 2, 1}));
+    CHECK((SortOrder(items, SortKey::Size, false) == std::vector<int>{1, 3, 0, 2}));
+    CHECK((SortOrder(items, SortKey::Type, false) == std::vector<int>{2, 0, 3, 1}));
+
+    std::vector<BurstInput> b = {{10, "A"}, {11, "A"}, {12, "A"}, {30, "A"}, {31, "B"}, {32, "B"}, {-1, "B"}, {33, "B"}};
+    const auto id = FindBursts(b, 2);
+    CHECK(id[0] == 0 && id[1] == 0 && id[2] == 0);
+    CHECK(id[3] == -1);                 // 18 s later, and the next one is another camera
+    CHECK(id[4] == 1 && id[5] == 1);
+    CHECK(id[6] == -1 && id[7] == -1);  // unknown time breaks the chain
+    CHECK(FindBursts({}, 2).empty());
+
+    // A sharp checkerboard scores far above the same pattern blurred, and a
+    // flat image scores zero.
+    const uint32_t w = 64, h = 64;
+    std::vector<uint8_t> sharp(w * h * 4), soft(w * h * 4), flat(w * h * 4, 128);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t v = ((x / 2 + y / 2) & 1) ? 255 : 0;
+            const uint8_t s = uint8_t(96 + (int(v) - 128) / 8);
+            for (int c = 0; c < 4; ++c) {
+                sharp[(y * w + x) * 4 + c] = v;
+                soft[(y * w + x) * 4 + c] = s;
+            }
+        }
+    const float a = Sharpness(sharp.data(), {w, h}), c = Sharpness(soft.data(), {w, h});
+    CHECK(a > 10 * c && c > 0);
+    CHECK(Sharpness(flat.data(), {w, h}) == 0);
+    CHECK(Sharpness(flat.data(), {4, 4}) == 0);
+}
+
 static void TestKeys() {
     std::puts("keys");
     for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
@@ -750,6 +799,7 @@ int main() {
     TestGroups();
     TestExifInfo();
     TestHistogram();
+    TestOrganize();
     TestMarks();
     TestKeys();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

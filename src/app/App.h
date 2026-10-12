@@ -13,6 +13,7 @@
 #include "../core/Histogram.h"
 #include "../core/Keys.h"
 #include "../core/Marks.h"
+#include "../core/Organize.h"
 #include "../core/Scheduler.h"
 #include "../core/Settings.h"
 #include "../platform/Folder.h"
@@ -127,7 +128,10 @@ private:
     // All files of a pair move together: if only some succeeded, put those back.
     // Returns the files that could not be put back (they become an undo entry).
     std::vector<UndoFile> RollBack(const std::vector<UndoFile>& done);
-    std::wstring DestinationFor(int key) const;
+    std::wstring DestinationFor(int key) const { return DestinationIn(key, folder_.Folder()); }
+    std::wstring DestinationIn(int key, const std::wstring& base) const;
+    std::vector<std::wstring> DestinationDirs(const std::wstring& base) const;  // excluded from subfolder scans
+    std::wstring RelToFolder(const std::wstring& path) const;  // "" if not shown from the open folder
     std::string DestinationLabel(int key) const;
     std::wstring PickFolder();
     void ShowOpenDialog(bool pickFolder);
@@ -161,7 +165,9 @@ private:
     void OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen);
     void OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan, DecodeResult r, uint64_t bytesRead,
                         uint64_t gen);
-    const Texture* TextureFor(uint64_t item) const;  // best available for an item
+    const Texture* TextureFor(uint64_t item) const;  // best available for an item (Full, then Fit)
+    const Texture* ThumbFor(uint64_t item) const;    // smallest available (Thumb, then Fit, then Full)
+    uint32_t ThumbBox() const;                       // thumbnail size in pixels
 
     // View (single image or 2/4-up compare)
     void ViewArea(ImVec2& mn, ImVec2& mx) const;
@@ -181,6 +187,14 @@ private:
     void ToggleActualSize(ImVec2 screen);
     void PanBy(float dx, float dy);
     void SetCompare(int count);
+    // Organise
+    void ToggleGrid();
+    void UpdateBursts();
+    void CompareBurst();
+    void TryCompareBurst();
+    void ApplyFolderOptions();  // subfolders on/off: rescan and re-watch
+    void OnSortChanged();
+    bool NeedsScan() const { return settings_.sortMode == int(core::SortKey::Taken); }
     bool ZoomedIn() const;  // the active image is larger than its view (pan instead of swipe)
 
     // Frame
@@ -206,6 +220,7 @@ private:
     void DrawSortingTab();
     void DrawControlsTab();
     void DrawMarksPanel();
+    void DrawGrid();
     // Pick/reject flag and stars at `pos` (top-left), `size` high. Returns the width used.
     static float DrawMarkBadge(ImDrawList* dl, ImVec2 pos, float size, const core::Mark& m);
     static float MarkBadgeWidth(float size, const core::Mark& m);
@@ -275,6 +290,18 @@ private:
 
     // Rotation chosen in this session, by lower-case path.
     std::unordered_map<std::wstring, int> rotation_;
+
+    bool grid_ = false;
+    bool scrollGridToCurrent_ = true;
+    int gridCols_ = 1;
+    int gridFirst_ = 0, gridLast_ = -1;        // view positions drawn in the grid
+    int sidebarFirst_ = 0, sidebarLast_ = -1;  // view positions drawn in the sidebar
+    bool peaking_ = false;
+    std::vector<int> burst_;                   // burst id per view position, -1 none
+    int burstWaitStart_ = -1;                  // Shift+C is waiting for capture times around here
+    uint64_t burstWaitUntil_ = 0;
+    bool sortPending_ = false;                 // date sort re-sorts once every header is read
+    int scanLeft_ = 0;                         // headers still to read for the date sort
 
     std::vector<int> view_;   // folder indices in display order
     std::vector<int> posOf_;  // folder index -> view position (-1 hidden)

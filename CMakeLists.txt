@@ -21,6 +21,7 @@ add_library(fiv_core STATIC
     src/core/Histogram.cpp
     src/core/Keys.cpp
     src/core/Marks.cpp
+    src/core/Organize.cpp
     src/core/MemoryLimits.cpp
     src/core/Pixels.cpp
     src/core/Scheduler.cpp
@@ -66,7 +67,7 @@ if(WIN32)
         UNICODE _UNICODE NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00)
     target_link_libraries(FastImageViewer PRIVATE
         fiv_core imgui::imgui
-        d3d11 dxgi dcomp dwmapi windowscodecs shlwapi shell32 ole32 uuid)
+        d3d11 dxgi dcomp d3dcompiler dwmapi windowscodecs shlwapi shell32 ole32 uuid)
 
     if(MSVC)
         # The manifest (DPI awareness, long paths, UTF-8) is merged by the linker.

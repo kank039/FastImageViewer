@@ -312,12 +312,66 @@ const FileEntry* App::Current() const {
 void App::RebuildView() {
     const int n = folder_.Count();
     view_.clear();
-    posOf_.assign(size_t(n), -1);
-    for (int i = 0; i < n; ++i) {
-        if (filter_ != core::Filter::All && !core::Matches(filter_, MarkOf(folder_.Files()[size_t(i)]))) continue;
-        posOf_[size_t(i)] = int(view_.size());
-        view_.push_back(i);
+    for (int i = 0; i < n; ++i)
+        if (filter_ == core::Filter::All || core::Matches(filter_, MarkOf(folder_.Files()[size_t(i)]))) view_.push_back(i);
+    const auto key = core::SortKey(settings_.sortMode);
+    if (key != core::SortKey::Name || settings_.sortDescending) {
+        std::vector<core::SortItem> items;
+        items.reserve(view_.size());
+        for (int i : view_) {
+            const FileEntry& f = folder_.Files()[size_t(i)];
+            items.push_back({f.takenSec, core::FileTimeToUnix(f.mtime), f.size, f.ext});
+        }
+        std::vector<int> sorted;
+        sorted.reserve(view_.size());
+        for (int o : core::SortOrder(items, key, settings_.sortDescending)) sorted.push_back(view_[size_t(o)]);
+        view_.swap(sorted);
     }
+    posOf_.assign(size_t(n), -1);
+    for (size_t p = 0; p < view_.size(); ++p) posOf_[size_t(view_[p])] = int(p);
+    UpdateBursts();
+}
+
+void App::UpdateBursts() {
+    std::vector<core::BurstInput> in;
+    in.reserve(view_.size());
+    for (int i = 0; i < ViewCount(); ++i) {
+        const FileEntry& f = FileAt(i);
+        in.push_back({f.takenSec, f.photo.make + "|" + f.photo.model});
+    }
+    burst_ = core::FindBursts(in, settings_.burstGapSeconds);
+}
+
+void App::OnSortChanged() {
+    core::Validate(settings_, caps_);
+    MarkSettingsDirty();
+    sortPending_ = NeedsScan();
+    SyncCurrentIndex();
+    UpdateCache();
+    scrollSidebarToCurrent_ = scrollGridToCurrent_ = true;
+    if (sortPending_ && scanLeft_ > 0) Toast("Reading capture dates of " + std::to_string(scanLeft_) + " images...");
+    RequestFrames();
+}
+
+void App::ApplyFolderOptions() {
+    if (folder_.Folder().empty()) return;
+    watcher_.Stop();
+    folder_.SetRecursive(settings_.includeSubfolders, DestinationDirs(folder_.Folder()));
+    ReloadFolder();
+    watcher_.Start(folder_.Folder(), hwnd_, WM_APP_DIRCHANGED, settings_.includeSubfolders);
+    if (folder_.Truncated()) Toast("Stopped after " + std::to_string(FolderModel::kMaxFiles) + " images");
+}
+
+std::wstring App::RelToFolder(const std::wstring& path) const {
+    const std::wstring& root = folder_.Folder();
+    if (root.empty() || path.size() <= root.size() + 1) return {};
+    const size_t cut = root.back() == L'\\' ? root.size() : root.size() + 1;
+    if (CompareStringOrdinal(path.c_str(), int(root.size()), root.c_str(), int(root.size()), TRUE) != CSTR_EQUAL ||
+        (cut > root.size() && path[root.size()] != L'\\'))
+        return {};
+    std::wstring rel = path.substr(cut);
+    if (!settings_.includeSubfolders && rel.find(L'\\') != std::wstring::npos) return {};
+    return rel;
 }
 
 int App::PosOfPath(const std::wstring& path) const {
@@ -349,12 +403,15 @@ void App::OpenPath(const std::wstring& raw) {
         watcher_.Stop();
     }
     folder_.SetPairing(settings_.pairRawJpeg);
+    folder_.SetRecursive(settings_.includeSubfolders, DestinationDirs(folder));
     if (!folder_.Load(folder, formats_)) Toast("Could not read the folder");
-    filter_ = core::Filter::All;  // whatever was asked for must be visible
+    if (folder_.Truncated()) Toast("Stopped after " + std::to_string(FolderModel::kMaxFiles) + " images");
+    filter_ = core::Filter::All;
+    sortPending_ = NeedsScan();  // whatever was asked for must be visible
     RebuildView();
     storage_ = DetectStorage(folder);
     gate_.SetSlots(ReadersFor(storage_));
-    if (!same) watcher_.Start(folder, hwnd_, WM_APP_DIRCHANGED);
+    if (!same) watcher_.Start(folder, hwnd_, WM_APP_DIRCHANGED, settings_.includeSubfolders);
 
     int index = 0;
     if (!select.empty()) {
@@ -396,7 +453,12 @@ void App::ApplyDirChanges() {
     }
     bool changed = false;
     const uint64_t now = NowMs();
-    for (const auto& n : names) changed |= folder_.Refresh(n, formats_, now);
+    bool reload = false;
+    for (const auto& n : names) changed |= folder_.Refresh(n, formats_, now, &reload);
+    if (reload) {
+        ReloadFolder();
+        return;
+    }
     if (!changed) return;
     SyncCurrentIndex();
     UpdateCache();
@@ -444,6 +506,7 @@ void App::JumpTo(int index, int direction) {
     settleArmed_ = true;
     scrollSidebarToCurrent_ = true;
     slideShownAt_ = 0;  // a slide's time starts when it appears
+    scrollGridToCurrent_ = true;
     activeTile_ = std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1));
     if (compareCount_ == 1)
         ResetView();
@@ -703,7 +766,14 @@ void App::RunBatch(const BatchRequest& req) {
     RequestFrames();
 }
 
-std::wstring App::DestinationFor(int key) const {
+std::vector<std::wstring> App::DestinationDirs(const std::wstring& base) const {
+    std::vector<std::wstring> out;
+    for (int k = 1; k <= 9; ++k)
+        if (std::wstring d = DestinationIn(k, base); !d.empty()) out.push_back(std::move(d));
+    return out;
+}
+
+std::wstring App::DestinationIn(int key, const std::wstring& base) const {
     const std::string& s = settings_.destinations[size_t(key - 1)];
     std::wstring d = s.empty() ? std::to_wstring(key) : FromUtf8(s);
     const DWORD need = ExpandEnvironmentStringsW(d.c_str(), nullptr, 0);
@@ -715,8 +785,8 @@ std::wstring App::DestinationFor(int key) const {
         d = expanded;
     }
     if (PathIsRelativeW(d.c_str())) {
-        const std::wstring& folder = folder_.Folder();
-        d = folder + (folder.empty() || folder.back() == L'\\' ? L"" : L"\\") + d;
+        if (base.empty()) return {};
+        d = base + (base.back() == L'\\' ? L"" : L"\\") + d;
     }
     return FullPath(d);
 }
@@ -822,8 +892,9 @@ void App::Undo() {
     if (restored == 0 && !retry.empty()) undo_.push_back({retry, op.label});
     // Show the restored image right away (the folder watcher would also catch it).
     const std::wstring& primary = op.files.front().original;
-    if (CompareStringOrdinal(ParentFolder(primary).c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
-        for (const auto& f : op.files) folder_.Refresh(LeafOf(f.original), formats_, 0);
+    if (!RelToFolder(primary).empty()) {
+        for (const auto& f : op.files)
+            if (const std::wstring rel = RelToFolder(f.original); !rel.empty()) folder_.Refresh(rel, formats_, 0);
         RebuildView();
         const int i = PosOfPath(primary);
         if (i >= 0) {
@@ -1050,11 +1121,18 @@ uint64_t App::LiveCapForCurrent() const {
     return pool ? std::min(PerImageCap(), pool) : PerImageCap();
 }
 
+uint32_t App::ThumbBox() const {
+    // One size for the grid and the sidebar, so switching never re-decodes.
+    const float px = float(std::max(settings_.gridSize, settings_.thumbHeight)) * dpiScale_;
+    return std::max(64u, (uint32_t(px) + 31) / 32 * 32);
+}
+
 core::DecodePlan App::PlanFor(const FileEntry& f, core::Variant v, uint64_t maxBytes) const {
     core::PlanRequest r;
     r.source = f.Oriented();
     const bool fit = v == core::Variant::Fit && settings_.decodeMode == int(core::DecodeMode::FitScreen);
     if (fit) r.target = monitor_;
+    if (v == core::Variant::Thumb) r.target = {ThumbBox(), ThumbBox()};
     r.maxTextureDim = gpu_.MaxTextureDim();
     r.maxGpuBytes = maxBytes;
     return core::PlanDecode(r);
@@ -1134,10 +1212,75 @@ std::vector<core::Want> App::BuildWants() {
         }
     };
 
-    for (size_t t = 0; t < visible.size(); ++t) addWant(visible[t], int(t), true, int(t));
-    for (const core::WindowSlot& slot : core::ComputeWindow(p)) {
-        if (std::find(visible.begin(), visible.end(), slot.index) != visible.end()) continue;
-        addWant(slot.index, 2 * tiles + slot.rank, false, 0);
+    auto addThumb = [&](int index, int rank) {
+        FileEntry& f = FileAt(index);
+        const bool stable = f.changedAt == 0 || now >= f.changedAt + kStableMs;
+        const bool waiting = f.retryAt > now;
+        const bool cloudBlocked = settings_.skipCloudFiles && f.CloudOnly();
+        if (!stable) later(f.changedAt + kStableMs);
+        if (waiting) later(f.retryAt);
+        core::Want w;
+        w.key = {f.id, core::Variant::Thumb};
+        w.rank = rank;
+        w.sizeKnown = f.probed && SUCCEEDED(f.probeHr);
+        w.mayProbe = stable && !waiting && !cloudBlocked && !(f.probed && FAILED(f.probeHr));
+        w.mayLoad = stable && !waiting && !cloudBlocked;
+        if (w.sizeKnown) {
+            w.plan = PlanFor(f, core::Variant::Thumb, PerImageCap());
+            if (!w.plan.valid()) return;
+            w.transientBytes = TransientFor(f, w.plan);
+        }
+        out.push_back(w);
+    };
+    std::vector<bool> covered(size_t(n), false);  // has a screen-sized want already
+    int nextRank = 0;
+    if (grid_) {
+        // Grid: the cells on screen, the current image (so opening it is
+        // instant), then one screen of cells above and below.
+        const int first = std::clamp(gridFirst_, 0, n - 1), last = std::min(gridLast_, n - 1);
+        for (int i = first; i <= last; ++i) addThumb(i, nextRank++);
+        if (!trim) {
+            addWant(current_, nextRank++, false, 0);
+            covered[size_t(current_)] = true;
+            const int span = std::max(1, last - first + 1);
+            for (int k = 1; k <= span; ++k) {
+                if (last + k < n) addThumb(last + k, nextRank++);
+                if (first - k >= 0) addThumb(first - k, nextRank++);
+            }
+        }
+    } else {
+        for (size_t t = 0; t < visible.size(); ++t) {
+            addWant(visible[t], int(t), true, int(t));
+            covered[size_t(visible[t])] = true;
+        }
+        for (const core::WindowSlot& slot : core::ComputeWindow(p)) {
+            if (covered[size_t(slot.index)]) continue;
+            addWant(slot.index, 2 * tiles + slot.rank, false, 0);
+            covered[size_t(slot.index)] = true;
+        }
+        nextRank = 2 * tiles + p.ahead + p.behind + 1;
+        // Sidebar rows outside the prefetch window get small thumbnails, after everything else.
+        if (settings_.showSidebar && !trim)
+            for (int i = std::max(0, sidebarFirst_); i <= std::min(sidebarLast_, n - 1); ++i)
+                if (!covered[size_t(i)]) addThumb(i, nextRank++);
+    }
+    // Header-only reads: capture dates for the date sort, and the neighbours
+    // of the image Shift+C is waiting on. Lowest priority, never decoded.
+    scanLeft_ = 0;
+    const bool burstWait = burstWaitStart_ >= 0 && now < burstWaitUntil_;
+    for (int i = 0; i < n && !trim; ++i) {
+        FileEntry& f = FileAt(i);
+        if (f.probed || f.CloudOnly()) continue;
+        const bool forBurst = burstWait && std::abs(i - burstWaitStart_) <= 8;
+        if (!NeedsScan() && !forBurst) continue;
+        if (NeedsScan()) ++scanLeft_;
+        if (covered[size_t(i)]) continue;
+        core::Want w;
+        w.key = {f.id, core::Variant::Fit};
+        w.rank = (forBurst ? 50000 : 100000) + i;
+        w.mayProbe = f.retryAt <= now && (f.changedAt == 0 || now >= f.changedAt + kStableMs);
+        w.mayLoad = false;
+        out.push_back(w);
     }
     // Forget frozen full-size plans of images that are no longer on screen.
     for (auto it = fullPlans_.begin(); it != fullPlans_.end();) {
@@ -1233,6 +1376,7 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen
             f->canPrescale = r.canPrescale;
             f->progressive = r.progressive;
             f->photo = r.photo;
+            f->takenSec = core::ParseExifTime(r.photo.dateTaken);
             f->error.clear();
         } else if (IsTransientError(r.hr)) {
             f->retryAt = NowMs() + kRetryMs;
@@ -1247,8 +1391,18 @@ void App::OnProbeResult(uint64_t job, uint64_t item, ProbeResult r, uint64_t gen
             previewItem_ = item;
         }
         if (IsVisible(item)) RequestFrames();
+        UpdateBursts();
+        if (settings_.showSidebar || grid_) RequestFrames(1);
     }
-    UpdateCache();
+    UpdateCache();  // also counts what the date sort still has to read
+    if (sortPending_ && scanLeft_ == 0) {
+        sortPending_ = false;
+        SyncCurrentIndex();
+        scrollSidebarToCurrent_ = scrollGridToCurrent_ = true;
+        UpdateCache();
+        RequestFrames();
+    }
+    if (burstWaitStart_ >= 0) TryCompareBurst();
 }
 
 void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::DecodePlan& plan, int rank) {
@@ -1269,6 +1423,7 @@ void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::Decod
     req.orientation = f->orientation;
     req.canPrescale = f->canPrescale;
     req.plan = plan;
+    req.wantSharpness = key.variant == core::Variant::Fit;
     req.priority->store(rank);  // everything except the image on screen runs at background priority
     livePriority_[job] = req.priority;
     ComPtr<ID3D11Device> device = gpu_.Device();
@@ -1310,9 +1465,10 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
             preview_ = {};
             previewItem_ = 0;
         }
-        if (IsVisible(key.item)) RequestFrames();
+        if (IsVisible(key.item) || key.variant == core::Variant::Thumb) RequestFrames();
     }
     if (FileEntry* f = folder_.FindById(key.item)) {
+        if (keep && r.sharpness >= 0) f->sharpness = r.sharpness;
         if (outcome == core::Outcome::Failed) f->error = DescribeError(r.hr);
         if (outcome == core::Outcome::Retry) {
             f->retryAt = NowMs() + kRetryMs;
@@ -1347,6 +1503,14 @@ void App::ReleaseEntry(const core::EntryKey& key) {
     if (it == textures_.end()) return;
     if (inRender_) graveyard_.push_back(std::move(it->second.srv));
     textures_.erase(it);
+}
+
+const App::Texture* App::ThumbFor(uint64_t item) const {
+    for (core::Variant v : {core::Variant::Thumb, core::Variant::Fit, core::Variant::Full}) {
+        auto it = textures_.find({item, v});
+        if (it != textures_.end()) return &it->second;
+    }
+    return nullptr;
 }
 
 const App::Texture* App::TextureFor(uint64_t item) const {
@@ -1503,6 +1667,65 @@ void App::SetCompare(int count) {
     RequestFrames();
 }
 
+void App::ToggleGrid() {
+    grid_ = !grid_;
+    if (grid_) {
+        StopSlideshow();
+        if (compareCount_ > 1) SetCompare(1);
+        scrollGridToCurrent_ = true;
+        gridFirst_ = current_;
+        gridLast_ = current_;  // the real range is known after the first frame
+    } else {
+        ResetView();
+    }
+    UpdateTitle();
+    UpdateCache();
+    RequestFrames();
+}
+
+void App::CompareBurst() {
+    const int pos = ActiveIndex();
+    if (pos < 0) return;
+    if (grid_) ToggleGrid();
+    burstWaitStart_ = pos;
+    burstWaitUntil_ = NowMs() + 5000;
+    TryCompareBurst();
+    if (burstWaitStart_ >= 0) {
+        Toast("Reading capture times...");
+        UpdateCache();  // probes the neighbours
+    }
+}
+
+void App::TryCompareBurst() {
+    const int pos = burstWaitStart_;
+    const int n = ViewCount();
+    if (pos < 0 || pos >= n) {
+        burstWaitStart_ = -1;
+        return;
+    }
+    UpdateBursts();
+    auto known = [&](int i) { return i < 0 || i >= n || FileAt(i).probed || FileAt(i).CloudOnly(); };
+    const int id = burst_[size_t(pos)];
+    if (id < 0) {
+        if (!known(pos) || !known(pos - 1) || !known(pos + 1)) return;  // still reading
+        burstWaitStart_ = -1;
+        Toast("Not part of a burst (no other shot within " + std::to_string(settings_.burstGapSeconds) + " s)");
+        return;
+    }
+    int start = pos, end = pos;
+    while (start > 0 && burst_[size_t(start - 1)] == id) --start;
+    while (end + 1 < n && burst_[size_t(end + 1)] == id) ++end;
+    if (!known(start - 1) || (end - start + 1 < 4 && !known(end + 1))) return;  // it may go on
+    burstWaitStart_ = -1;
+    const int len = end - start + 1;
+    JumpTo(start, 1);
+    SetCompare(std::min(len, 4));
+    activeTile_ = std::clamp(pos - start, 0, std::min(len, 4) - 1);
+    UpdateTitle();
+    Toast("Burst of " + std::to_string(len) + (len > 4 ? "  \xC2\xB7  PgDn for the next shots" : "") +
+          "  \xC2\xB7  the sharpest is marked");
+}
+
 void App::ZoomAt(float factor, ImVec2 screen) {
     if (compareCount_ > 1) {
         const auto tiles = Tiles();
@@ -1654,6 +1877,10 @@ void App::Tick() {
         trimmed_ = true;
         UpdateCache();
     }
+    if (burstWaitStart_ >= 0 && now >= burstWaitUntil_) {
+        burstWaitStart_ = -1;
+        Toast("Could not read the capture times in time");
+    }
     if (slideshow_) {
         // Each slide gets its full time once it is on screen (a slow decode never shortens it).
         const FileEntry* f = Current();
@@ -1688,6 +1915,7 @@ void App::Tick() {
     if (!toasts_.empty()) consider(toasts_.front().until);
     if (settingsDirtyAt_) consider(settingsDirtyAt_ + kSaveDelayMs);
     if (slideshow_ && slideShownAt_) consider(slideShownAt_ + uint64_t(settings_.slideshowSeconds) * 1000);
+    if (burstWaitStart_ >= 0) consider(burstWaitUntil_);
     wakeAt_ = w;
 }
 
@@ -1698,7 +1926,10 @@ void App::RenderFrame() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    DrawImage();
+    if (grid_)
+        DrawGrid();
+    else
+        DrawImage();
     if (settings_.showSidebar) DrawSidebar();
     DrawOverlay();
     DrawToasts();
@@ -1768,6 +1999,7 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         if (showHelp_) showHelp_ = false;
         else if (showSettings_) showSettings_ = false;
         else if (showMarks_) showMarks_ = false;
+        else if (grid_) ToggleGrid();
         else if (slideshow_) StopSlideshow();
         else if (compareCount_ > 1) SetCompare(1);
         else if (filter_ != core::Filter::All) SetFilter(core::Filter::All);
@@ -1775,6 +2007,17 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         else PostMessageW(hwnd_, WM_CLOSE, 0, 0);
         RequestFrames();
         return true;
+    }
+    if (grid_ && plain) {  // the grid moves by rows; Enter opens the selected image
+        if (vk == VK_UP || vk == VK_DOWN) {
+            const int to = std::clamp(current_ + (vk == VK_DOWN ? gridCols_ : -gridCols_), 0, std::max(0, ViewCount() - 1));
+            if (to != current_) JumpTo(to, vk == VK_DOWN ? 1 : -1);
+            return true;
+        }
+        if (vk == VK_RETURN) {
+            if (!repeat) ToggleGrid();
+            return true;
+        }
     }
     const core::Action a = keymap_.Lookup(chord);
     if (a == core::Action::None) return false;  // unbound: Alt+F4, Alt+Space etc. reach Windows
@@ -1800,8 +2043,18 @@ void App::Execute(core::Action a, bool repeat) {
         case A::PrevSet: Navigate(-page); break;
         case A::First: JumpTo(0, 1); break;
         case A::Last: JumpTo(std::max(0, ViewCount() - page), -1); break;
-        case A::ZoomIn: ZoomAt(1.25f, vc); break;
-        case A::ZoomOut: ZoomAt(0.8f, vc); break;
+        case A::ZoomIn:
+        case A::ZoomOut:
+            if (grid_) {  // bigger or smaller cells
+                settings_.gridSize = std::clamp(settings_.gridSize + (a == A::ZoomIn ? 40 : -40), 96, 400);
+                MarkSettingsDirty();
+                scrollGridToCurrent_ = true;
+                UpdateCache();
+                RequestFrames();
+            } else {
+                ZoomAt(a == A::ZoomIn ? 1.25f : 0.8f, vc);
+            }
+            break;
         case A::Fit:
             zoomMode_ = ZoomMode::Fit;
             cmpZoomRel_ = 1.0f;
@@ -1812,7 +2065,21 @@ void App::Execute(core::Action a, bool repeat) {
         case A::Fullscreen: ToggleFullscreen(); break;
         case A::RotateCW: Rotate(1); break;
         case A::RotateCCW: Rotate(3); break;
-        case A::Compare: SetCompare(compareCount_ == 1 ? 2 : compareCount_ == 2 ? 4 : 1); break;
+        case A::Compare:
+            if (grid_) ToggleGrid();
+            SetCompare(compareCount_ == 1 ? 2 : compareCount_ == 2 ? 4 : 1);
+            break;
+        case A::CompareBurst: CompareBurst(); break;
+        case A::Grid: ToggleGrid(); break;
+        case A::Peaking:
+            if (!gpu_.PeakingShader()) {
+                Toast("Focus peaking is not available on this graphics device");
+                break;
+            }
+            peaking_ = !peaking_;
+            Toast(peaking_ ? "Focus peaking on: sharp edges are painted red" : "Focus peaking off");
+            RequestFrames();
+            break;
         case A::NextTile:
         case A::PrevTile:
             if (VisibleTiles() > 1) {

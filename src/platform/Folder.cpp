@@ -33,7 +33,12 @@ bool Listable(DWORD attrs) {
     return !(attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM));
 }
 
-bool NameLess(const FileEntry& a, const FileEntry& b) { return StrCmpLogicalW(a.name.c_str(), b.name.c_str()) < 0; }
+// Explorer order; subfolder files after the top level ones, folder by folder.
+bool NameLess(const FileEntry& a, const FileEntry& b) {
+    const bool subA = a.rel.size() != a.name.size(), subB = b.rel.size() != b.name.size();
+    if (subA != subB) return subB;
+    return StrCmpLogicalW(a.rel.c_str(), b.rel.c_str()) < 0;
+}
 
 bool SamePath(const std::wstring& a, const std::wstring& b) {
     return CompareStringOrdinal(a.c_str(), int(a.size()), b.c_str(), int(b.size()), TRUE) == CSTR_EQUAL;
@@ -59,7 +64,8 @@ void FolderModel::Clear() {
 }
 
 struct Scanned {
-    std::wstring name, ext, stem;  // stem lower-cased
+    std::wstring dir;              // relative folder ("" or "sub\\deeper")
+    std::wstring name, ext, stem;  // stem lower-cased, includes dir so pairs never span folders
     uint64_t size = 0, mtime = 0;
     uint32_t attrs = 0;
 };
@@ -71,17 +77,30 @@ std::wstring StemOf(const std::wstring& name) {
     return dot == std::wstring::npos ? name : name.substr(0, dot);
 }
 
-void Scan(const std::wstring& pattern, std::vector<Scanned>& out) {
+std::wstring ParentRel(const std::wstring& rel) {
+    const size_t slash = rel.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : rel.substr(0, slash);
+}
+
+void Scan(const std::wstring& pattern, const std::wstring& dir, std::vector<Scanned>& out,
+          std::vector<std::wstring>* subdirs = nullptr) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
                                 FIND_FIRST_EX_LARGE_FETCH);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
+        if (subdirs && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+            subdirs->push_back(dir.empty() ? std::wstring(fd.cFileName) : dir + L'\\' + fd.cFileName);
+            continue;
+        }
         if (!Listable(fd.dwFileAttributes)) continue;
         Scanned s;
+        s.dir = dir;
         s.name = fd.cFileName;
         s.ext = ExtOf(s.name);
-        s.stem = ToLower(StemOf(s.name));
+        s.stem = ToLower(dir.empty() ? StemOf(s.name) : dir + L'\\' + StemOf(s.name));
         s.size = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
         s.mtime = FileTimeToU64(fd.ftLastWriteTime);
         s.attrs = fd.dwFileAttributes;
@@ -103,7 +122,8 @@ std::vector<FileEntry> FolderModel::Build(const std::vector<Scanned>& scanned, c
         FileEntry e;
         e.name = s.name;
         e.ext = s.ext;
-        e.path = Join(folder_, s.name);
+        e.rel = s.dir.empty() ? s.name : s.dir + L'\\' + s.name;
+        e.path = Join(folder_, e.rel);
         e.size = s.size;
         e.mtime = s.mtime;
         e.attrs = s.attrs;
@@ -117,7 +137,8 @@ std::vector<FileEntry> FolderModel::Build(const std::vector<Scanned>& scanned, c
             e.changedAt = now;
         }
         e.companions.clear();
-        for (size_t c : g.companions) e.companions.push_back(Join(folder_, scanned[c].name));
+        for (size_t c : g.companions)
+            e.companions.push_back(Join(folder_, scanned[c].dir.empty() ? scanned[c].name : scanned[c].dir + L'\\' + scanned[c].name));
         out.push_back(std::move(e));
     }
     return out;
@@ -129,12 +150,45 @@ bool FolderModel::Load(const std::wstring& folder, const FormatRegistry& formats
         for (auto& e : files_) old.emplace(ToLower(e.path), std::move(e));
     folder_ = folder;
     files_.clear();
+    truncated_ = false;
     if (!IsDirectory(folder)) return false;
     std::vector<Scanned> scanned;
-    Scan(Join(folder, L"*"), scanned);
+    if (!recursive_) {
+        Scan(Join(folder, L"*"), L"", scanned);
+    } else {
+        // Breadth first, so a huge tree still shows its top levels.
+        std::vector<std::wstring> level{L""};
+        for (int depth = 0; depth <= kMaxDepth && !level.empty() && !truncated_; ++depth) {
+            std::vector<std::wstring> next;
+            for (const auto& dir : level) {
+                if (!dir.empty() && Excluded(dir)) continue;
+                Scan(Join(folder, dir.empty() ? L"*" : dir + L"\\*"), dir, scanned, depth < kMaxDepth ? &next : nullptr);
+                if (scanned.size() >= kMaxFiles) {
+                    truncated_ = true;
+                    break;
+                }
+            }
+            level.swap(next);
+        }
+    }
     files_ = Build(scanned, formats, old, 0);
     std::sort(files_.begin(), files_.end(), NameLess);
     return true;
+}
+
+void FolderModel::SetRecursive(bool on, std::vector<std::wstring> excluded) {
+    recursive_ = on;
+    excluded_.clear();
+    for (auto& e : excluded) excluded_.push_back(ToLower(e));
+}
+
+bool FolderModel::Excluded(const std::wstring& dirRel) const {
+    if (dirRel.empty()) return false;
+    const std::wstring full = ToLower(Join(folder_, dirRel));
+    for (const auto& e : excluded_)
+        if (full == e || (full.size() > e.size() && full.compare(0, e.size(), e) == 0 && full[e.size()] == L'\\'))
+            return true;
+    return false;
 }
 
 int FolderModel::IndexOfPath(const std::wstring& path) const {
@@ -156,14 +210,31 @@ bool FolderModel::RemovePath(const std::wstring& path) {
     return true;
 }
 
-bool FolderModel::Refresh(const std::wstring& name, const FormatRegistry& formats, uint64_t now) {
+bool FolderModel::Refresh(const std::wstring& name, const FormatRegistry& formats, uint64_t now, bool* needsReload) {
+    const std::wstring dir = ParentRel(name);
+    if (!dir.empty() && (!recursive_ || Excluded(dir))) return false;
+    if (recursive_) {
+        // A folder appeared, vanished or was renamed: rescan instead of guessing.
+        const DWORD attrs = GetFileAttributesW(Join(folder_, name).c_str());
+        bool knownDir = false;
+        const std::wstring prefix = ToLower(name) + L'\\';
+        for (const auto& e : files_)
+            if (ToLower(e.rel).compare(0, prefix.size(), prefix) == 0) {
+                knownDir = true;
+                break;
+            }
+        if ((attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) || knownDir) {
+            if (needsReload) *needsReload = true;
+            return false;
+        }
+    }
     // Everything sharing this name's stem is regrouped together, so a RAW
     // appearing or a JPEG disappearing updates the pairing correctly.
     const std::wstring stem = StemOf(name), stemLower = ToLower(stem);
     auto signature = [&] {
         std::wstring sig;
         for (const auto& e : files_) {
-            if (ToLower(StemOf(e.name)) != stemLower) continue;
+            if (ToLower(StemOf(e.rel)) != stemLower) continue;
             sig += e.path + L'|' + std::to_wstring(e.id) + L'|' + std::to_wstring(e.attrs) + L'|';
             for (const auto& c : e.companions) sig += c + L';';
             sig += L'\n';
@@ -174,7 +245,7 @@ bool FolderModel::Refresh(const std::wstring& name, const FormatRegistry& format
 
     std::unordered_map<std::wstring, FileEntry> old;
     for (auto it = files_.begin(); it != files_.end();) {
-        if (ToLower(StemOf(it->name)) == stemLower) {
+        if (ToLower(StemOf(it->rel)) == stemLower) {
             old.emplace(ToLower(it->path), std::move(*it));
             it = files_.erase(it);
         } else {
@@ -182,8 +253,8 @@ bool FolderModel::Refresh(const std::wstring& name, const FormatRegistry& format
         }
     }
     std::vector<Scanned> scanned;
-    Scan(Join(folder_, stem + L".*"), scanned);
-    if (stem == name) Scan(Join(folder_, name), scanned);  // extensionless name
+    Scan(Join(folder_, stem + L".*"), dir, scanned);
+    if (stem == name) Scan(Join(folder_, name), dir, scanned);  // extensionless name
     scanned.erase(std::remove_if(scanned.begin(), scanned.end(), [&](const Scanned& s) { return s.stem != stemLower; }),
                   scanned.end());
     for (auto& e : Build(scanned, formats, old, now))
@@ -193,7 +264,7 @@ bool FolderModel::Refresh(const std::wstring& name, const FormatRegistry& format
 
 // ---- DirWatcher -------------------------------------------------------------
 
-void DirWatcher::Start(const std::wstring& folder, HWND hwnd, UINT msg) {
+void DirWatcher::Start(const std::wstring& folder, HWND hwnd, UINT msg, bool subtree) {
     Stop();
     stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     {
@@ -201,7 +272,7 @@ void DirWatcher::Start(const std::wstring& folder, HWND hwnd, UINT msg) {
         names_.clear();
         overflow_ = false;
     }
-    thread_ = std::thread([this, folder, hwnd, msg] { Run(folder, hwnd, msg); });
+    thread_ = std::thread([this, folder, hwnd, msg, subtree] { Run(folder, hwnd, msg, subtree); });
 }
 
 void DirWatcher::Stop() {
@@ -220,7 +291,7 @@ std::vector<std::wstring> DirWatcher::Take(bool& overflow) {
     return out;
 }
 
-void DirWatcher::Run(std::wstring folder, HWND hwnd, UINT msg) {
+void DirWatcher::Run(std::wstring folder, HWND hwnd, UINT msg, bool subtree) {
     HANDLE dir = CreateFileW(folder.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
     if (dir == INVALID_HANDLE_VALUE) return;
@@ -228,10 +299,10 @@ void DirWatcher::Run(std::wstring folder, HWND hwnd, UINT msg) {
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::vector<DWORD> buf(16 * 1024);  // 64 KB, DWORD aligned (network shares cap at 64 KB)
     const DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
-                         FILE_NOTIFY_CHANGE_ATTRIBUTES;
+                         FILE_NOTIFY_CHANGE_ATTRIBUTES | (subtree ? FILE_NOTIFY_CHANGE_DIR_NAME : 0);
     auto issue = [&] {
         ResetEvent(ov.hEvent);
-        return ReadDirectoryChangesW(dir, buf.data(), DWORD(buf.size() * sizeof(DWORD)), FALSE, filter, nullptr,
+        return ReadDirectoryChangesW(dir, buf.data(), DWORD(buf.size() * sizeof(DWORD)), subtree, filter, nullptr,
                                      &ov, nullptr) != FALSE;
     };
 

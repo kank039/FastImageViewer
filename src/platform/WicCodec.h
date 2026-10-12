@@ -40,6 +40,7 @@ struct DecodeRequest {
     int orientation = 1;
     bool canPrescale = false;
     core::DecodePlan plan;
+    bool wantSharpness = false;  // compute the focus score (screen-sized decodes)
     // Live priority (rank), updated by the UI thread when the user navigates.
     // Rank <= 1 is the image on screen: normal I/O and CPU priority.
     std::shared_ptr<std::atomic<int>> priority = std::make_shared<std::atomic<int>>(0);
@@ -51,6 +52,7 @@ struct DecodeResult {
     bool retry = false;  // transient failure (memory, file changed): try again later
     ComPtr<ID3D11ShaderResourceView> srv;
     std::shared_ptr<const core::Histogram> histogram;  // from a small mip level (4 KB)
+    float sharpness = -1;  // core::Sharpness, if requested
     double ms = 0;
 };
 

@@ -39,6 +39,7 @@ public:
     ID3D11Device* Device() const { return device_.Get(); }
     ID3D11DeviceContext* Context() const { return context_.Get(); }
     ID3D11SamplerState* PointSampler() const { return pointSampler_.Get(); }
+    ID3D11PixelShader* PeakingShader() const { return peakingPS_.Get(); }  // null if it failed to compile
     bool Composited() const { return visual_ != nullptr; }
     uint32_t MaxTextureDim() const { return maxTextureDim_; }
     const AdapterInfo& Adapter() const { return adapter_; }
@@ -52,6 +53,7 @@ public:
 
 private:
     HRESULT CreateTarget();
+    void CreatePeakingShader();
 
     HWND hwnd_ = nullptr;
     ComPtr<ID3D11Device> device_;
@@ -60,6 +62,7 @@ private:
     ComPtr<IDXGISwapChain1> swap_;
     ComPtr<ID3D11RenderTargetView> rtv_;
     ComPtr<ID3D11SamplerState> pointSampler_;
+    ComPtr<ID3D11PixelShader> peakingPS_;
     ComPtr<IDCompositionDevice> dcomp_;
     ComPtr<IDCompositionTarget> target_;
     ComPtr<IDCompositionVisual> visual_;
