@@ -10,6 +10,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <optional>
@@ -399,7 +400,12 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         bg.Set(req.Priority() > 1);
         return !aborted();
     };
-    const Size want = core::OrientedSize(req.plan.size, req.orientation);  // size before rotation
+    // A detail decode reads just one rectangle of the stored image at 1:1.
+    const bool region = !req.plan.region.empty();
+    const core::Rect stored = region ? core::StoredRect(req.plan.region, req.stored, req.orientation)
+                                     : core::Rect{0, 0, req.stored.w, req.stored.h};
+    const Size want = region ? Size{stored.w, stored.h}
+                             : core::OrientedSize(req.plan.size, req.orientation);  // size before rotation
 
     std::optional<IoGateLock> io;
     io.emplace(gate, req.Priority(), cancel);
@@ -469,7 +475,7 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
     // 2. Let the codec decode at 1/2, 1/4 or 1/8 scale when it can (JPEG):
     //    several times faster and much less memory than a full decode.
     ComPtr<IWICBitmap> pre;
-    if (req.canPrescale) {
+    if (req.canPrescale && !region) {
         const uint32_t shift = core::PrescaleShift(req.stored, want);
         ComPtr<IWICBitmapSourceTransform> st;
         if (shift > 0 && SUCCEEDED(frame.As(&st))) {
@@ -528,7 +534,8 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
 
     UINT cw = 0, ch = 0;
     src->GetSize(&cw, &ch);
-    if (cw != want.w || ch != want.h) {
+    if (region && (stored.x + stored.w > cw || stored.y + stored.h > ch)) return fail(E_INVALIDARG);
+    if (!region && (cw != want.w || ch != want.h)) {
         ComPtr<IWICBitmapScaler> scaler;
         hr = ctx.wic->CreateBitmapScaler(&scaler);
         if (SUCCEEDED(hr)) {
@@ -565,13 +572,32 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         dst = scratch.get();
     }
     const UINT stride = want.w * 4;
-    for (UINT y = 0; y < want.h; y += kBandRows) {
-        const UINT rows = std::min(kBandRows, want.h - y);
-        WICRect r{0, INT(y), INT(want.w), INT(rows)};
-        hr = src->CopyPixels(&r, stride, stride * rows, dst + size_t(y) * stride);
+    // Some converters (sub-byte palette formats) refuse a rectangle that does
+    // not start at x = 0: then whole rows are read 16 at a time and cut.
+    bool wholeRows = false;
+    std::unique_ptr<uint8_t[]> rowBuf;
+    for (UINT y = 0; y < want.h;) {
+        const UINT rows = std::min(wholeRows ? 16u : kBandRows, want.h - y);
+        if (!wholeRows) {
+            WICRect r{INT(stored.x), INT(stored.y + y), INT(want.w), INT(rows)};
+            hr = src->CopyPixels(&r, stride, stride * rows, dst + size_t(y) * stride);
+            if (FAILED(hr) && region && stored.x != 0 && y == 0) {
+                wholeRows = true;
+                continue;
+            }
+        } else {
+            const UINT rowBytes = cw * 4;
+            if (!rowBuf && !(rowBuf = Alloc(uint64_t(rowBytes) * 16))) return fail(E_OUTOFMEMORY, true);
+            WICRect r{0, INT(stored.y + y), INT(cw), INT(rows)};
+            hr = src->CopyPixels(&r, rowBytes, rowBytes * rows, rowBuf.get());
+            for (UINT i = 0; SUCCEEDED(hr) && i < rows; ++i)
+                std::memcpy(dst + size_t(y + i) * stride, rowBuf.get() + size_t(i) * rowBytes + size_t(stored.x) * 4, stride);
+        }
         if (FAILED(hr)) return fail(hr);
         if (!checkpoint()) return fail(E_ABORT);
+        y += rows;
     }
+    rowBuf.reset();
     io.reset();
     src.Reset();
     conv.Reset();
@@ -587,7 +613,7 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         scratch.reset();
     }
     core::GenerateMips(chain.get(), req.plan.size, req.plan.mipLevels);
-    {  // Histogram from a <=512 px mip level: ~4 KB, no extra decoding.
+    if (!region) {  // Histogram from a <=512 px mip level: ~4 KB, no extra decoding.
         const uint32_t level = core::HistogramLevel(req.plan.size, req.plan.mipLevels);
         auto h = std::make_shared<core::Histogram>();
         core::ComputeHistogram(chain.get() + core::MipChainBytes(req.plan.size, level),

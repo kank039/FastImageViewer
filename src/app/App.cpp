@@ -1278,7 +1278,7 @@ uint64_t App::TransientFor(const FileEntry& f, const core::DecodePlan& plan) con
     t.fileBytes = f.size;
     t.readIntoMemory = f.size <= core::kMaxInMemoryFile;
     t.stored = f.stored;
-    t.canPrescale = f.canPrescale;
+    t.canPrescale = f.canPrescale && plan.region.empty();
     t.reorients = f.orientation != 1;
     t.progressive = f.progressive;
     t.plan = plan;
@@ -1398,6 +1398,42 @@ std::vector<core::Want> App::BuildWants() {
         if (settings_.showSidebar && !trim)
             for (int i = std::max(0, sidebarFirst_); i <= std::min(sidebarLast_, n - 1); ++i)
                 if (!covered[size_t(i)]) addThumb(i, nextRank++);
+    }
+    // Detail: zoomed past what the best texture can show on a huge image, the
+    // visible area (plus a margin for panning) is decoded at 1:1.
+    if (!grid_ && compareCount_ == 1 && !trim && current_ < n) {
+        FileEntry& f = FileAt(current_);
+        const Texture* best = TextureFor(f.id);
+        const ViewGeometry g = Geometry();
+        bool need = best && f.probed && SUCCEEDED(f.probeHr) && RotationOf(f) == 0 && !g.source.empty() &&
+                    g.zoom > float(best->size.w) / float(g.source.w) * 1.05f;
+        auto full = fullPlans_.find(f.id);
+        if (need && full != fullPlans_.end() && full->second.valid() && full->second.size.w >= g.source.w)
+            need = false;  // the full-resolution texture will cover it
+        if (!need) {
+            detailItem_ = 0;
+        } else if (now < viewChangedAt_ + 200 && detailItem_ != f.id) {
+            later(viewChangedAt_ + 200);  // still moving: wait until the view settles
+        } else {
+            const float vw = (g.viewMax.x - g.viewMin.x) / g.zoom, vh = (g.viewMax.y - g.viewMin.y) / g.zoom;
+            const float x0 = std::max(0.0f, g.center.x - vw * 0.5f), y0 = std::max(0.0f, g.center.y - vh * 0.5f);
+            const core::Rect vis{uint32_t(x0), uint32_t(y0), uint32_t(std::ceil(vw)) + 1, uint32_t(std::ceil(vh)) + 1};
+            const bool settled = now >= viewChangedAt_ + 200;
+            if (detailItem_ != f.id || (settled && !detailPlan_.region.Contains(vis))) {
+                const uint32_t side = std::min(gpu_.MaxTextureDim(), std::max(monitor_.w, monitor_.h) * 2);
+                detailPlan_ = core::PlanRegion(g.source, vis, 0.25f, side);
+                detailItem_ = detailPlan_.valid() && detailPlan_.gpuBytes <= LiveCapForCurrent() / 2 ? f.id : 0;
+            }
+            if (detailItem_ == f.id) {
+                core::Want w;
+                w.key = {f.id, core::Variant::Detail};
+                w.rank = tiles;  // with the full-resolution version, before any prefetch
+                w.sizeKnown = true;
+                w.plan = detailPlan_;
+                w.transientBytes = TransientFor(f, detailPlan_);
+                out.push_back(w);
+            }
+        }
     }
     // Header-only reads: capture dates for the date sort, and the neighbours
     // of the image Shift+C is waiting on. Lowest priority, never decoded.
@@ -1591,7 +1627,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
     const bool keep = sched_.OnDecodeDone(job, outcome);
     const uint64_t curId = Current() ? Current()->id : 0;
     if (keep) {
-        textures_[key] = {r.srv, plan.size, r.histogram, r.hdr, r.colorConverted};
+        textures_[key] = {r.srv, plan.size, r.histogram, r.hdr, r.colorConverted, plan.region};
         ++decodes_;
         lastDecodeMs_ = r.ms;
         if (bytesRead) {
@@ -1785,6 +1821,7 @@ App::ViewGeometry App::Geometry() const {
 }
 
 void App::ResetView() {
+    ViewChanged();
     zoomMode_ = ZoomMode::Fit;
     zoom_ = 1.0f;
     cmpZoomRel_ = 1.0f;
@@ -1864,6 +1901,7 @@ void App::TryCompareBurst() {
 }
 
 void App::ZoomAt(float factor, ImVec2 screen) {
+    ViewChanged();
     if (compareCount_ > 1) {
         const auto tiles = Tiles();
         int s = TileAt(screen);
@@ -1932,6 +1970,7 @@ void App::ToggleActualSize(ImVec2 screen) {
 }
 
 void App::PanBy(float dx, float dy) {
+    ViewChanged();
     if (compareCount_ > 1) {
         const auto tiles = Tiles();
         int s = TileAt(ImVec2(float(dragStart_.x), float(dragStart_.y)));
@@ -2014,6 +2053,10 @@ void App::Tick() {
         trimmed_ = true;
         UpdateCache();
     }
+    if (detailCheckAt_ && now >= detailCheckAt_) {
+        detailCheckAt_ = 0;
+        UpdateCache();  // the view settled: maybe a sharper detail is due
+    }
     UpdateAnimation();
     if (anim_.playing && !anim_.busy && !minimized_ && now >= anim_.nextAt) StepAnimation();
     if (burstWaitStart_ >= 0 && now >= burstWaitUntil_) {
@@ -2056,6 +2099,7 @@ void App::Tick() {
     if (slideshow_ && slideShownAt_) consider(slideShownAt_ + uint64_t(settings_.slideshowSeconds) * 1000);
     if (burstWaitStart_ >= 0) consider(burstWaitUntil_);
     if (anim_.playing && !anim_.busy && !minimized_) consider(anim_.nextAt);
+    if (detailCheckAt_) consider(detailCheckAt_);
     wakeAt_ = w;
 }
 

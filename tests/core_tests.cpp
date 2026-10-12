@@ -782,6 +782,43 @@ static void TestAnimation() {
     CHECK(ToDisposal(2) == Disposal::Background && ToDisposal(3) == Disposal::Previous && ToDisposal(7) == Disposal::Keep);
 }
 
+static void TestRegion() {
+    std::puts("region");
+    // Cropping the stored image with StoredRect and then orienting it equals
+    // cropping the oriented image, for every EXIF orientation.
+    const Size stored{7, 5};
+    std::vector<uint32_t> src(35);
+    for (uint32_t i = 0; i < 35; ++i) src[i] = i + 1;
+    for (int o = 1; o <= 8; ++o) {
+        const Size os = OrientedSize(stored, o);
+        std::vector<uint32_t> oriented(35);
+        ApplyOrientation(src.data(), stored, o, oriented.data());
+        const Rect r{1, 2, std::min(3u, os.w - 1), std::min(2u, os.h - 2)};
+        const Rect sr = StoredRect(r, stored, o);
+        CHECK(sr.x + sr.w <= stored.w && sr.y + sr.h <= stored.h);
+        std::vector<uint32_t> crop(size_t(sr.w) * sr.h), cropOriented(crop.size());
+        for (uint32_t y = 0; y < sr.h; ++y)
+            for (uint32_t x = 0; x < sr.w; ++x) crop[y * sr.w + x] = src[(sr.y + y) * stored.w + sr.x + x];
+        ApplyOrientation(crop.data(), {sr.w, sr.h}, o, cropOriented.data());
+        bool same = OrientedSize({sr.w, sr.h}, o) == Size{r.w, r.h};
+        for (uint32_t y = 0; same && y < r.h; ++y)
+            for (uint32_t x = 0; x < r.w; ++x) same &= cropOriented[y * r.w + x] == oriented[(r.y + y) * os.w + r.x + x];
+        CHECK(same);
+    }
+    // A region around the view, with margin, clamped to the image and the size cap.
+    DecodePlan p = PlanRegion({40000, 30000}, {10000, 10000, 2000, 1000}, 0.25f, 4096);
+    CHECK(p.valid() && p.mipLevels == 1 && p.region == (Rect{9500, 9750, 3000, 1500}));
+    CHECK(p.size == (Size{3000, 1500}) && p.gpuBytes == 3000ull * 1500 * 4);
+    p = PlanRegion({40000, 30000}, {0, 29500, 9000, 800}, 0.25f, 4096);  // capped, at the bottom edge
+    CHECK(p.region.w == 4096 && p.region.y + p.region.h == 30000 && p.region.x == 2452);
+    CHECK(!PlanRegion({100, 100}, {200, 0, 10, 10}, 0.25f, 4096).valid());
+    CHECK((Rect{0, 0, 10, 10}.Contains(Rect{2, 2, 8, 8})) && !(Rect{0, 0, 10, 10}.Contains(Rect{2, 2, 9, 8})));
+    // A region plan differs from the same size without a region.
+    DecodePlan q = p;
+    q.region = {};
+    CHECK(q != p);
+}
+
 static void TestKeys() {
     std::puts("keys");
     for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
@@ -835,6 +872,7 @@ int main() {
     TestGroups();
     TestExifInfo();
     TestHistogram();
+    TestRegion();
     TestAnimation();
     TestOrganize();
     TestMarks();

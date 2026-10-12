@@ -17,8 +17,9 @@
 
 namespace fiv::core {
 
-// Fit: screen-sized; Full: full resolution when zoomed in; Thumb: grid and sidebar thumbnails.
-enum class Variant : uint8_t { Fit = 0, Full = 1, Thumb = 2 };
+// Fit: screen-sized; Full: full resolution when zoomed in; Thumb: grid and
+// sidebar thumbnails; Detail: the visible part of a huge image at 1:1.
+enum class Variant : uint8_t { Fit = 0, Full = 1, Thumb = 2, Detail = 3 };
 
 struct EntryKey {
     uint64_t item = 0;  // file version id (changes when the file changes)

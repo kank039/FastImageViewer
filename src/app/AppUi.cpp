@@ -192,6 +192,18 @@ void App::DrawImage() {
             if (peaking && shown == tex) dl->AddCallback(SetPeakingShader, &gpu_);
             AddRotatedImage(dl, ToTex(shown->srv.Get()), pmin, pmax, rot);
             if (point || (peaking && shown == tex)) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+            // The 1:1 detail of a huge image, over the part it covers.
+            auto detail = textures_.find({f.id, core::Variant::Detail});
+            if (!compare && rot == 0 && detail != textures_.end() && !detail->second.region.empty()) {
+                const core::Rect& r = detail->second.region;
+                const ImVec2 d0(pmin.x + float(r.x) * g.zoom, pmin.y + float(r.y) * g.zoom);
+                const ImVec2 d1(d0.x + float(r.w) * g.zoom, d0.y + float(r.h) * g.zoom);
+                const bool dpoint = settings_.pixelatedZoom && g.zoom > 1.01f;
+                if (dpoint) dl->AddCallback(SetPointSampler, &gpu_);
+                if (peaking) dl->AddCallback(SetPeakingShader, &gpu_);
+                dl->AddImage(ToTex(detail->second.srv.Get()), d0, d1);
+                if (dpoint || peaking) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+            }
             dl->PopClipRect();
 
             // Zoomed past the screen-sized texture: fetch full-resolution versions of the visible images.
@@ -1082,6 +1094,13 @@ void App::DrawStats() {
     ImGui::Text("Process: %s in RAM, %s private", FormatBytes(pm.workingSet).c_str(), FormatBytes(pm.privateBytes).c_str());
     ImGui::Separator();
     ImGui::Text("Running: %d decode, %d probe", sched_.RunningDecodes(), sched_.RunningProbes());
+    if (detailItem_) {
+        const core::EntryKey dk{detailItem_, core::Variant::Detail};
+        const core::Rect& r = detailPlan_.region;
+        TextDim("Detail %u x %u at %u,%u: %s", r.w, r.h, r.x, r.y,
+                sched_.IsResident(dk) ? "shown" : sched_.IsDecoding(dk) ? "decoding" : sched_.IsFailed(dk) ? "failed" : "waiting");
+        if (sched_.IsFailed(dk) && Current() && !Current()->error.empty()) TextDim("  %s", Current()->error.c_str());
+    }
     ImGui::Text("Decoded %llu (last %.0f ms), headers read %llu", (unsigned long long)decodes_, lastDecodeMs_,
                 (unsigned long long)probes_);
     ImGui::Text("Disk: %llu files, %s read  |  %s, %d reader%s", (unsigned long long)filesRead_, FormatBytes(bytesRead_).c_str(),

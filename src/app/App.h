@@ -48,6 +48,7 @@ private:
         core::Size size;
         std::shared_ptr<const core::Histogram> histogram;
         bool hdr = false, colorConverted = false;
+        core::Rect region;  // Detail textures: the part of the image they hold
     };
     // Animated GIF of the image on screen: one job at a time composites the
     // next frame; its RAM and VRAM are reserved from the budget while it plays.
@@ -325,6 +326,15 @@ private:
     int sidebarFirst_ = 0, sidebarLast_ = -1;  // view positions drawn in the sidebar
     bool peaking_ = false;
     Animation anim_;
+    // Detail for huge images: requested once the view has been still briefly.
+    uint64_t viewChangedAt_ = 0;
+    uint64_t detailCheckAt_ = 0;
+    uint64_t detailItem_ = 0;
+    core::DecodePlan detailPlan_;
+    void ViewChanged() {
+        viewChangedAt_ = NowMs();
+        detailCheckAt_ = viewChangedAt_ + 200;
+    }
     Texture animTex_;  // the animation's current frame, drawn instead of the still image
     std::vector<int> burst_;                   // burst id per view position, -1 none
     int burstWaitStart_ = -1;                  // Shift+C is waiting for capture times around here

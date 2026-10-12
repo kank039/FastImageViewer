@@ -18,6 +18,14 @@ struct Size {
     bool operator!=(const Size& o) const { return !(*this == o); }
 };
 
+struct Rect {
+    uint32_t x = 0, y = 0, w = 0, h = 0;
+    bool empty() const { return w == 0 || h == 0; }
+    bool Contains(const Rect& o) const { return o.x >= x && o.y >= y && o.x + o.w <= x + w && o.y + o.h <= y + h; }
+    bool operator==(const Rect& o) const { return x == o.x && y == o.y && w == o.w && h == o.h; }
+    bool operator!=(const Rect& o) const { return !(*this == o); }
+};
+
 uint32_t FullMipLevels(Size s);
 uint64_t MipChainBytes(Size s, uint32_t levels);  // BGRA8, tightly packed
 Size MipLevelSize(Size s, uint32_t level);
@@ -35,13 +43,23 @@ struct DecodePlan {
     Size size;              // final oriented texture size (level 0)
     uint32_t mipLevels = 0;
     uint64_t gpuBytes = 0;  // texture memory including the mip chain
+    Rect region;            // detail decode: this part of the (oriented) image at 1:1; empty = all of it
     bool valid() const { return !size.empty() && mipLevels > 0; }
-    bool operator==(const DecodePlan& o) const { return size == o.size && mipLevels == o.mipLevels; }
+    bool operator==(const DecodePlan& o) const {
+        return size == o.size && mipLevels == o.mipLevels && region == o.region;
+    }
     bool operator!=(const DecodePlan& o) const { return !(*this == o); }
 };
 
 // Largest size <= target (aspect preserved), <= GPU limits and <= maxGpuBytes.
 DecodePlan PlanDecode(const PlanRequest& r);
+
+// Detail decode for huge images: the part of the image around `visible`
+// (oriented coordinates) at full resolution, with `margin` extra on each side
+// for panning, at most maxSide x maxSide pixels. Invalid if nothing is left.
+DecodePlan PlanRegion(Size source, Rect visible, float margin, uint32_t maxSide);
+// The stored-pixel rectangle that becomes `r` after applying EXIF orientation.
+Rect StoredRect(Rect r, Size stored, int orientation);
 
 // Power-of-two reduction the decoder itself can do (JPEG DCT scaling, up to 1/8),
 // chosen so the decoder output still covers `want` in both axes. Returns 0..3.

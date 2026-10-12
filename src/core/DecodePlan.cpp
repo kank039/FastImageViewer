@@ -67,6 +67,47 @@ DecodePlan PlanDecode(const PlanRequest& r) {
     return p;
 }
 
+DecodePlan PlanRegion(Size source, Rect visible, float margin, uint32_t maxSide) {
+    if (source.empty() || visible.empty() || maxSide == 0) return {};
+    const auto grow = [&](uint32_t start, uint32_t len, uint32_t limit, uint32_t& outStart, uint32_t& outLen) {
+        const double extra = double(len) * double(margin);
+        double a = std::max(0.0, double(start) - extra), b = std::min(double(limit), double(start) + len + extra);
+        if (b - a > maxSide) {  // too big: keep the middle
+            const double mid = (double(start) + double(start) + len) * 0.5;
+            a = std::clamp(mid - maxSide * 0.5, 0.0, double(limit) - std::min<double>(limit, maxSide));
+            b = std::min(double(limit), a + maxSide);
+        }
+        outStart = uint32_t(a);
+        outLen = uint32_t(b) > outStart ? uint32_t(b) - outStart : 0;
+    };
+    if (visible.x >= source.w || visible.y >= source.h) return {};
+    visible.w = std::min(visible.w, source.w - visible.x);
+    visible.h = std::min(visible.h, source.h - visible.y);
+    DecodePlan p;
+    grow(visible.x, visible.w, source.w, p.region.x, p.region.w);
+    grow(visible.y, visible.h, source.h, p.region.y, p.region.h);
+    if (p.region.empty()) return {};
+    p.size = {p.region.w, p.region.h};
+    p.mipLevels = 1;
+    p.gpuBytes = uint64_t(p.size.w) * p.size.h * kBytesPerPixel;
+    return p;
+}
+
+Rect StoredRect(Rect r, Size s, int o) {
+    const uint32_t W = s.w, H = s.h;
+    const uint32_t x0 = r.x, x1 = r.x + r.w, y0 = r.y, y1 = r.y + r.h;
+    switch (o) {
+        case 2: return {W - x1, y0, r.w, r.h};
+        case 3: return {W - x1, H - y1, r.w, r.h};
+        case 4: return {x0, H - y1, r.w, r.h};
+        case 5: return {y0, x0, r.h, r.w};
+        case 6: return {y0, H - x1, r.h, r.w};
+        case 7: return {W - y1, H - x1, r.h, r.w};
+        case 8: return {W - y1, x0, r.h, r.w};
+        default: return r;
+    }
+}
+
 Size PrescaledSize(Size stored, uint32_t shift) {
     const uint32_t d = 1u << shift;
     return {(stored.w + d - 1) / d, (stored.h + d - 1) / d};
