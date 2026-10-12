@@ -49,7 +49,7 @@ void Scheduler::Pump(const std::vector<Want>& wants, const Limits& limits, bool 
     // 2. Admission in priority order. Only higher-ranked wants are counted
     //    before a lower-ranked one, so a lower rank can never block a higher one.
     const uint64_t gpuLimit = limits.unified ? limits.ram : limits.gpu;
-    uint64_t admitted = 0;
+    uint64_t admitted = extraGpu_;
     for (const auto& [job, z] : zombies_) admitted += z.gpu;
 
     std::vector<const Want*> pending;
@@ -89,7 +89,7 @@ void Scheduler::Pump(const std::vector<Want>& wants, const Limits& limits, bool 
 
     // 3. Dispatch admitted work while decode slots and transient RAM allow.
     int running = int(zombies_.size());
-    uint64_t transient = extraTransient_, committed = 0;
+    uint64_t transient = extraTransient_, committed = extraGpu_;
     for (const auto& [job, z] : zombies_) {
         transient += z.transient;
         committed += z.gpu;
@@ -179,8 +179,15 @@ uint64_t Scheduler::ResidentGpu() const {
     return t;
 }
 
+uint64_t Scheduler::GpuRoom(const Limits& limits) const {
+    const uint64_t pool = limits.unified ? limits.ram : limits.gpu;
+    uint64_t used = CommittedGpu();
+    if (limits.unified) used += TransientInUse();
+    return pool > used ? pool - used : 0;
+}
+
 uint64_t Scheduler::CommittedGpu() const {
-    uint64_t t = 0;
+    uint64_t t = extraGpu_;
     for (const auto& [k, e] : entries_)
         if (e.state != EntryState::Failed) t += e.plan.gpuBytes;
     for (const auto& [j, z] : zombies_) t += z.gpu;

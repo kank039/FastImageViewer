@@ -90,6 +90,11 @@ public:
     uint64_t TransientRoom(const Limits& limits) const;  // what a reservation may take now
     void ReserveTransient(uint64_t bytes) { extraTransient_ += bytes; }
     void ReleaseTransient(uint64_t bytes) { extraTransient_ -= bytes < extraTransient_ ? bytes : extraTransient_; }
+    // Video memory held outside the cache (the animation texture), counted
+    // like a resident texture so the cache leaves room for it.
+    uint64_t GpuRoom(const Limits& limits) const;
+    void ReserveGpu(uint64_t bytes) { extraGpu_ += bytes; }
+    void ReleaseGpu(uint64_t bytes) { extraGpu_ -= bytes < extraGpu_ ? bytes : extraGpu_; }
     bool HasWork() const { return RunningDecodes() > 0 || !probes_.empty(); }
 
     struct EntryView {
@@ -128,6 +133,7 @@ private:
     std::unordered_map<uint64_t, uint64_t> probes_;   // job -> item
     std::unordered_map<uint64_t, uint64_t> probeItems_;  // item -> job
     uint64_t extraTransient_ = 0;
+    uint64_t extraGpu_ = 0;
 };
 
 }  // namespace fiv::core

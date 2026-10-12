@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/core/Animation.h"
 #include "../src/core/CacheWindow.h"
 #include "../src/core/DecodePlan.h"
 #include "../src/core/Exif.h"
@@ -449,6 +450,21 @@ static void TestScheduler() {
     CHECK(s8.TransientInUse() == 20 * kMiB);
     s8.Pump(w9, l8, true);
     CHECK(h.started.size() == 2);
+
+    // Video memory held outside the cache (animation) evicts lower ranks.
+    FakeHost h9;
+    Scheduler s9(h9);
+    const Limits l9{1000 * kMiB, 100 * kMiB, false};
+    std::vector<Want> w10{MakeWant(600, 0, 40), MakeWant(601, 1, 40)};
+    s9.Pump(w10, l9, true);
+    CompleteAll(s9, h9);
+    CHECK(s9.ResidentGpu() == 80 * kMiB && s9.GpuRoom(l9) == 20 * kMiB);
+    s9.ReserveGpu(30 * kMiB);
+    s9.Pump(w10, l9, true);
+    CHECK(h9.released.size() == 1 && s9.IsResident({600, Variant::Fit}));  // rank 1 made room
+    CHECK(s9.CommittedGpu() == 70 * kMiB);
+    s9.ReleaseGpu(30 * kMiB);
+    CHECK(s9.CommittedGpu() == 40 * kMiB);
 }
 
 static void TestSettings() {
@@ -746,6 +762,26 @@ static void TestOrganize() {
     CHECK(Sharpness(flat.data(), {4, 4}) == 0);
 }
 
+static void TestAnimation() {
+    std::puts("animation");
+    const Size cs{4, 3};
+    std::vector<uint32_t> canvas(12, 0xFF000001u);
+    const uint32_t frame[4] = {0xFF0000AAu, 0x00000000u, 0xFF0000BBu, 0xFF0000CCu};  // 2 x 2, one transparent
+    DrawFrame(canvas.data(), cs, frame, {1, 1, 2, 2});
+    CHECK(canvas[1 * 4 + 1] == 0xFF0000AAu && canvas[1 * 4 + 2] == 0xFF000001u);  // transparent keeps the canvas
+    CHECK(canvas[2 * 4 + 1] == 0xFF0000BBu && canvas[2 * 4 + 2] == 0xFF0000CCu);
+    CHECK(canvas[0] == 0xFF000001u);
+    DrawFrame(canvas.data(), cs, frame, {3, 2, 2, 2});  // clipped to the canvas corner
+    CHECK(canvas[2 * 4 + 3] == 0xFF0000AAu);
+    DrawFrame(canvas.data(), cs, frame, {-1, -1, 2, 2});  // only the bottom-right pixel lands
+    CHECK(canvas[0] == 0xFF0000CCu);
+    DrawFrame(canvas.data(), cs, frame, {10, 10, 2, 2});  // fully outside: nothing
+    ClearRect(canvas.data(), cs, {1, 1, 2, 5});
+    CHECK(canvas[1 * 4 + 1] == 0 && canvas[2 * 4 + 2] == 0 && canvas[2 * 4 + 3] == 0xFF0000AAu);
+    CHECK(FrameDelayMs(0) == 100 && FrameDelayMs(1) == 100 && FrameDelayMs(4) == 40);
+    CHECK(ToDisposal(2) == Disposal::Background && ToDisposal(3) == Disposal::Previous && ToDisposal(7) == Disposal::Keep);
+}
+
 static void TestKeys() {
     std::puts("keys");
     for (size_t i = 0; i < AllActions().size(); ++i) CHECK(int(AllActions()[i].action) == int(i));
@@ -799,6 +835,7 @@ int main() {
     TestGroups();
     TestExifInfo();
     TestHistogram();
+    TestAnimation();
     TestOrganize();
     TestMarks();
     TestKeys();

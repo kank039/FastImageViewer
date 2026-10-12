@@ -173,7 +173,7 @@ void App::DrawImage() {
         const ViewGeometry g = GeometryFor(tile.index, tile.min, tile.max);
         const ImVec2 vc((g.viewMin.x + g.viewMax.x) * 0.5f, (g.viewMin.y + g.viewMax.y) * 0.5f);
 
-        const Texture* tex = TextureFor(f.id);
+        const Texture* tex = anim_.item == f.id && animTex_.srv ? &animTex_ : TextureFor(f.id);
         auto thumbIt = textures_.find({f.id, core::Variant::Thumb});
         const Texture* shown = tex                                        ? tex
                                : previewItem_ == f.id && preview_.srv     ? &preview_
@@ -314,6 +314,7 @@ void App::DrawOverlay() {
     if (settings_.ovName && f->rel.size() > f->name.size())
         TextDim("in %s", ToUtf8(f->rel.substr(0, f->rel.size() - f->name.size() - 1)).c_str());
     if (peaking_) ImGui::TextColored(kRed, "Focus peaking");
+    if (anim_.playing && anim_.item == f->id) TextDim("Animated  \xC2\xB7  frame %u / %u", anim_.frame + 1, anim_.frames);
     if (const core::Mark mark = MarkOf(*f); !mark.empty()) {
         const float bs = ImGui::GetTextLineHeight();
         const float bw = DrawMarkBadge(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(), bs, mark);

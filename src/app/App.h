@@ -16,6 +16,7 @@
 #include "../core/Organize.h"
 #include "../core/Scheduler.h"
 #include "../core/Settings.h"
+#include "../platform/GifPlayer.h"
 #include "../platform/Folder.h"
 #include "../platform/Formats.h"
 #include "../platform/Gpu.h"
@@ -47,6 +48,23 @@ private:
         core::Size size;
         std::shared_ptr<const core::Histogram> histogram;
         bool hdr = false, colorConverted = false;
+    };
+    // Animated GIF of the image on screen: one job at a time composites the
+    // next frame; its RAM and VRAM are reserved from the budget while it plays.
+    struct AnimState {
+        GifAnimator gif;
+        bool opened = false;
+        bool released = false;
+        uint64_t ram = 0, gpu = 0;  // reserved
+    };
+    struct Animation {
+        uint64_t item = 0;  // file id this is for (also set when it turned out not to animate)
+        std::shared_ptr<AnimState> state;
+        ComPtr<ID3D11Texture2D> tex;
+        bool busy = false;
+        bool playing = false;
+        uint64_t nextAt = 0;
+        uint32_t frame = 0, frames = 0;
     };
     struct Tile {
         ImVec2 min, max;  // screen rectangle
@@ -97,6 +115,12 @@ private:
     void MarkSettingsDirty() { settingsDirtyAt_ = NowMs(); }
     void OnCacheSettingsChanged();
     void FlushCache();  // drop every decoded image (colour settings changed)
+    // Animation
+    void UpdateAnimation();
+    void StopAnimation();
+    void StepAnimation();
+    void ReleaseAnimation(AnimState& s);
+    void OnAnimationFrame(std::shared_ptr<AnimState> s, HRESULT hr, uint32_t delayMs, uint32_t index);
 
     // Folder & navigation
     void OpenPath(const std::wstring& path);
@@ -300,6 +324,8 @@ private:
     int gridFirst_ = 0, gridLast_ = -1;        // view positions drawn in the grid
     int sidebarFirst_ = 0, sidebarLast_ = -1;  // view positions drawn in the sidebar
     bool peaking_ = false;
+    Animation anim_;
+    Texture animTex_;  // the animation's current frame, drawn instead of the still image
     std::vector<int> burst_;                   // burst id per view position, -1 none
     int burstWaitStart_ = -1;                  // Shift+C is waiting for capture times around here
     uint64_t burstWaitUntil_ = 0;

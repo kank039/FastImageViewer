@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "../platform/FileOps.h"
 #include "../platform/Shell.h"
@@ -221,6 +222,7 @@ void App::ApplyBackdropSetting() {
 }
 
 void App::RecreateDevice() {
+    StopAnimation();
     suspended_ = true;
     ++deviceGen_;  // anything still running finishes on the old device and is discarded
     jobs_.CancelAll();
@@ -301,6 +303,124 @@ void App::FlushCache() {
     previewItem_ = 0;
     UpdateCache();
     RequestFrames();
+}
+
+// ---- Animation -------------------------------------------------------------------------
+
+void App::ReleaseAnimation(AnimState& st) {
+    if (st.released) return;
+    st.released = true;
+    sched_.ReleaseTransient(st.ram);
+    sched_.ReleaseGpu(st.gpu);
+    UpdateCache();
+}
+
+void App::StopAnimation() {
+    if (anim_.state && !anim_.busy) ReleaseAnimation(*anim_.state);  // a running job releases when it reports back
+    if (inRender_ && animTex_.srv) graveyard_.push_back(animTex_.srv);
+    animTex_ = {};
+    anim_ = {};
+}
+
+void App::UpdateAnimation() {
+    const FileEntry* f = Current();
+    uint64_t want = 0;
+    if (f && !grid_ && compareCount_ == 1 && f->ext == L".gif" && f->probed && SUCCEEDED(f->probeHr) &&
+        TextureFor(f->id))
+        want = f->id;
+    if (anim_.item == want) return;
+    StopAnimation();
+    if (!want) return;
+    anim_.item = want;
+    // Reserve what playing needs (file, canvas, saved canvas, frame; one texture)
+    // before reading anything. Too big for the budget: it stays a still image.
+    const uint64_t canvas = uint64_t(f->stored.w) * f->stored.h * 4;
+    auto st = std::make_shared<AnimState>();
+    st->ram = f->size + canvas * 3;
+    st->gpu = canvas;
+    if (st->ram + st->gpu > PerImageCap() || st->ram > sched_.TransientRoom(limits_)) return;
+    sched_.ReserveTransient(st->ram);
+    sched_.ReserveGpu(st->gpu);
+    UpdateCache();  // makes room: lower-ranked prefetch is evicted first
+    anim_.state = st;
+    StepAnimation();
+}
+
+void App::StepAnimation() {
+    if (!anim_.state || anim_.busy) return;
+    anim_.busy = true;
+    auto st = anim_.state;
+    const FileEntry* f = folder_.FindById(anim_.item);
+    const std::wstring path = f ? f->path : L"";
+    jobs_.Submit(nextOwnJob_++, 1, [this, st, path](WorkerContext& ctx, const CancelFlag& cancel) {
+        HRESULT hr = E_ABORT;
+        uint32_t delay = 100, index = 0;
+        if (!cancel) {
+            if (!st->opened) {
+                IoGateLock io(gate_, 1, cancel);
+                hr = io.held() ? st->gif.Open(ctx.wic, path, st->ram) : E_ABORT;
+                st->opened = true;
+                if (hr == S_OK && st->gif.WorkingBytes() > st->ram) hr = E_OUTOFMEMORY;  // larger canvas than the header said
+            } else {
+                hr = S_OK;
+            }
+            if (hr == S_OK) hr = st->gif.Next(ctx.wic, delay, index);
+        }
+        Post([this, st, hr, delay, index] { OnAnimationFrame(st, hr, delay, index); });
+    });
+}
+
+void App::OnAnimationFrame(std::shared_ptr<AnimState> st, HRESULT hr, uint32_t delayMs, uint32_t index) {
+    if (st != anim_.state) {  // stopped while the job ran
+        ReleaseAnimation(*st);
+        return;
+    }
+    anim_.busy = false;
+    if (hr != S_OK) {  // a single frame, too big, or broken: keep showing the still image
+        ReleaseAnimation(*st);
+        anim_.state.reset();
+        anim_.playing = false;
+        return;
+    }
+    const core::Size cs = st->gif.Canvas();
+    if (uint64_t(cs.w) * cs.h * 4 > st->gpu) {
+        StopAnimation();
+        anim_.item = Current() ? Current()->id : 0;  // do not retry this file
+        return;
+    }
+    if (!anim_.tex) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = cs.w;
+        d.Height = cs.h;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DYNAMIC;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        if (FAILED(gpu_.Device()->CreateTexture2D(&d, nullptr, &anim_.tex)) ||
+            FAILED(gpu_.Device()->CreateShaderResourceView(anim_.tex.Get(), nullptr, &srv))) {
+            anim_.tex.Reset();
+            ReleaseAnimation(*st);
+            anim_.state.reset();
+            return;
+        }
+        animTex_ = {srv, cs, nullptr};
+    }
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (SUCCEEDED(gpu_.Context()->Map(anim_.tex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        const uint32_t* src = st->gif.Pixels();
+        for (uint32_t y = 0; y < cs.h; ++y)
+            std::memcpy(static_cast<uint8_t*>(m.pData) + size_t(y) * m.RowPitch, src + size_t(y) * cs.w, size_t(cs.w) * 4);
+        gpu_.Context()->Unmap(anim_.tex.Get(), 0);
+    }
+    anim_.playing = true;
+    anim_.frame = index;
+    anim_.frames = st->gif.Frames();
+    anim_.nextAt = NowMs() + delayMs;
+    RequestFrames(1);
 }
 
 void App::OnCacheSettingsChanged() {
@@ -1894,6 +2014,8 @@ void App::Tick() {
         trimmed_ = true;
         UpdateCache();
     }
+    UpdateAnimation();
+    if (anim_.playing && !anim_.busy && !minimized_ && now >= anim_.nextAt) StepAnimation();
     if (burstWaitStart_ >= 0 && now >= burstWaitUntil_) {
         burstWaitStart_ = -1;
         Toast("Could not read the capture times in time");
@@ -1933,6 +2055,7 @@ void App::Tick() {
     if (settingsDirtyAt_) consider(settingsDirtyAt_ + kSaveDelayMs);
     if (slideshow_ && slideShownAt_) consider(slideShownAt_ + uint64_t(settings_.slideshowSeconds) * 1000);
     if (burstWaitStart_ >= 0) consider(burstWaitUntil_);
+    if (anim_.playing && !anim_.busy && !minimized_) consider(anim_.nextAt);
     wakeAt_ = w;
 }
 
