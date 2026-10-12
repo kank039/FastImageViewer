@@ -72,3 +72,6 @@ Testing/
 .cache/
 # Inno Setup output
 installer/
+
+# Local packaging output
+dist/
