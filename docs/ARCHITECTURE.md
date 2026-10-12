@@ -22,8 +22,16 @@ src/core/       portable C++20, unit-tested on Linux and Windows
   Scheduler     admission, eviction, dispatch, cancellation accounting
   Pixels        EXIF orientation parser, rotation, mip generation
   Settings      validation against caps, key=value serialization
-src/platform/   Windows: Gpu (D3D11/DXGI/DComp), WicCodec, Jobs (pool, IoGate,
-                background mode), Folder (model + watcher), System, FileStream
+  Keys          actions, default chords, rebinding, conflicts
+  Marks         session-only pick/reject/stars, filters, batch selections
+  Organize      sort order, burst grouping, focus score
+  Animation     GIF frame compositing and disposal
+  Bc1           BC1 encoder (compressed history) and sizing
+  Exif, Histogram, FileGroups
+src/platform/   Windows: Gpu (D3D11/DXGI/DComp, peaking shader), WicCodec (decode,
+                colour transform, HDR tone map, regions, BC1 upload), Jobs (pool,
+                IoGate, background mode), Folder (model + watcher, subfolders),
+                FileOps, Shell (clipboard, Explorer, editor), GifPlayer, System
 src/app/        App (window, loop, input, scheduler host), AppUi (ImGui)
 ```
 
@@ -107,8 +115,38 @@ Our own usage is added back into each limit, so the limits don't oscillate as th
 - EXIF is parsed from the first 256 KB of JPEG and TIFF-based RAW files (`core/Exif`, bounds-checked and fuzz-tested). Other formats use WIC's photo metadata. It's collected during the header probe, so it costs no extra disk read.
 - The histogram is computed in the decode job from a mip level of at most 512 px (`core/Histogram`). That's 4 KB per cached image, with no extra decoding.
 
+**Cache variants.** One file can have up to five budgeted entries, each with its own exact plan:
+- *Fit* (screen-sized, the workhorse).
+- *Full* (full resolution of the visible image when zoomed).
+- *Thumb* (grid and sidebar).
+- *Detail* (the visible rectangle of a huge image at 1:1, `core::PlanRegion` / `StoredRect`).
+- *Compact* (BC1 copy of an image behind you).
+
+`BuildWants` decides which ones are wanted and at what rank; the scheduler does the rest. Thumb and Compact wants are always below the visible image. Detail waits until the view has been still for 200 ms.
+
+**View list.** Navigation, tiles and the prefetch window run on `view_`: the folder's files after the filter (marks) and the sort order. A filtered-out image is never prefetched. Sorting by date taken adds header-only probe wants for every file at the lowest rank; they never decode.
+
+**Outside-the-cache memory.** A clipboard copy, the animation canvas and texture, and BC1 transcoding are reserved with `Scheduler::ReserveTransient` / `ReserveGpu` before anything is allocated. Admission counts those reservations, so prefetch makes room. A reservation is released only when the worker reports back.
+
+**Compressed history.** When an image moves behind you, the full texture is kept until its Compact copy exists. The copy is made from the texture itself:
+1. Level 0 is copied to a staging texture and mapped with `DO_NOT_WAIT`, so the UI thread never blocks on the GPU.
+2. A worker pads it to whole blocks, builds mips, and encodes BC1.
+
+Going back shows the compressed copy until the full one is decoded again. Images with transparency fail the Compact plan and stay in BGRA.
+
+**Colour and HDR.** Both run inside the banded decode:
+- The WIC colour transform is applied after scaling (cheapest).
+- Floating-point sources pass through a streaming tone-mapping source in 16-row chunks.
+
+Neither adds a full-size buffer.
+
+**Animation.** Only the image on screen animates (single view). The GIF is read once. One job at a time composites the next frame, and the UI uploads it to a single dynamic texture. Frames render only when they change.
+
 ## Known limitations
 
 - **Probes are not budgeted.** They read only a file's header, plus the embedded thumbnail for the current image. At most 3 run at once, which bounds them at roughly 36 MB.
 - **Exit can wait on a stalled read.** A header probe, or a streamed decode of a file over 64 MB, only checks for cancellation between steps, not during a read. If a network share stalls or a OneDrive download hangs, closing the app waits for that read to finish. A graphics device reset doesn't wait: jobs carry a device generation number and their results are discarded.
-- **Animated GIF/WebP** show their first frame only. **Colour management** (ICC profiles) is not applied.
+- **Animated WebP** shows its first frame (GIF animates). **HDR output**: HDR images are tone-mapped to SDR; there is no scRGB / HDR10 swap chain yet, because it can't be validated without HDR hardware.
+- **BC1 on alpha images**: images with transparency are never compressed (they stay full size in history).
+- **Rotated view + huge images**: the 1:1 detail decode is skipped while the view is rotated (R); the reduced full-resolution texture is shown instead.
+- **Marks are session only** by design: they are lost when the program closes. Apply them with the marks panel before quitting.

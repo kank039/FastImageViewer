@@ -1,3 +1,28 @@
+Fast Image Viewer – v3.2 "workflow"
+
+Culling
+    Picks, rejects and 0–5 stars (P / X / U, Ctrl+0–5). Session only, by choice: they live in memory and are never written to the images. Optional auto-advance after marking.
+    Filters (Ctrl+F): picks, rated, unmarked, rejects. Navigation, compare and prefetch follow the filtered list.
+    Marks panel (Shift+P): counts, and batch move / Recycle Bin / copy paths for a selection, as one Windows operation and one undo step. Pairs stay together, and incomplete pairs are rolled back.
+    Bursts: shots within N seconds from one camera are grouped (coloured bars). Shift+C compares the burst and marks the sharpest shot, using a focus score computed while decoding.
+    Focus peaking (K), as a pixel shader: no extra memory.
+    Grid view (G) with budgeted thumbnails. The sidebar now shows thumbnails for every visible row.
+    Sorting by name, date taken (headers read in the background, lowest priority), date modified, size or type, ascending or descending. Optional subfolders (8 levels / 50,000 images; move destinations excluded).
+
+Viewing
+    Colour management: embedded ICC / Adobe RGB profiles are converted to sRGB or to the monitor's profile. HDR (floating-point) images are tone-mapped with a highlight roll-off instead of clipping.
+    Animated GIFs play (all disposal modes), with their memory reserved from the budget.
+    Huge images: zooming past what fits in one texture decodes the visible area at full resolution.
+    Compressed history (optional): images behind you are kept as BC1 textures, 8x smaller, up to 48. They are transcoded from the GPU copy, with no second disk read.
+    View rotation (R / Shift+R), slideshow (L, keeps the screen awake).
+
+Controls & integration
+    Every shortcut can be rebound (Settings > Controls); help is generated from the key map. Wheel can zoom or change images; tilt wheel and two-finger sideways swipes change images; touch: pinch, pan, swipe, two-finger tap.
+    Ctrl+C copies the image (budgeted, on a worker), Ctrl+Shift+C the path, Ctrl+E shows it in Explorer, E opens it in your editor or the "Open with" dialog.
+
+Build & release
+    CI builds the Inno Setup installer (per-user, no admin) and a portable zip, signs both when a certificate secret is configured, and publishes a GitHub release for v* tags.
+
 Fast Image Viewer – v3.1 "culling"
 
     Compare mode: C shows 2 or 4 consecutive images side by side with synced zoom and pan; Tab or a click picks the active one; PgUp/PgDn move by a whole set.

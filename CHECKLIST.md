@@ -40,7 +40,15 @@ Culling (v3.1)
     [x] Configurable destinations for 1-9, rename on conflict
     [x] Info panel: EXIF + histogram
 
+Workflow (v3.2)
+    [x] Rebindable keys, wheel modes, touchpad and touch gestures
+    [x] View rotation, slideshow, clipboard (image / path), Show in Explorer, open in editor
+    [x] Session-only picks / rejects / stars, filters, batch apply with one-step undo
+    [x] Sort orders, subfolders, bursts with sharpest-shot marking, focus peaking, grid view
+    [x] Colour management (ICC to sRGB or display), HDR tone mapping
+    [x] Animated GIF, 1:1 detail for huge images, BC1 compressed history
+    [x] CI installer, optional code signing, releases on tags
+
 Ideas for later
-    [ ] Animated GIF / WebP playback
-    [ ] ICC colour management
-    [ ] Rotate / flip view commands
+    [ ] Animated WebP playback
+    [ ] True HDR output (scRGB swap chain) on HDR monitors
