@@ -463,11 +463,13 @@ static void TestSettings() {
 
     s.destinations[0] = "D:\\Keepers";
     s.destinations[8] = "Rejects";
+    s.destinations[2] = "C:\\a = b #c";
     s.renameOnConflict = false;
     Settings back2;
     Deserialize(Serialize(s), back2);
     CHECK(back2.destinations[0] == "D:\\Keepers" && back2.destinations[8] == "Rejects" && back2.destinations[3].empty());
     CHECK(!back2.renameOnConflict && back2.pairRawJpeg);
+    CHECK(back2.destinations[2] == "C:\\a = b #c");
 
     Settings junk;
     Deserialize("ahead=abc\n=5\nnope\nbehind=7\n", junk);
@@ -498,6 +500,11 @@ static void TestGroups() {
     // No pairing, RAW off.
     CHECK((Groups(in, {false, false}) == G{{0, {}}, {4, {}}, {7, {}}}));
     CHECK(GroupFiles({}, {}).empty());
+    CHECK((SuffixedNames({L"IMG_1.jpg", L"IMG_1.CR2", L"IMG_1.xmp"}, 1) ==
+           std::vector<std::wstring>{L"IMG_1.jpg", L"IMG_1.CR2", L"IMG_1.xmp"}));
+    CHECK((SuffixedNames({L"IMG_1.jpg", L"IMG_1.CR2"}, 3) == std::vector<std::wstring>{L"IMG_1 (3).jpg", L"IMG_1 (3).CR2"}));
+    CHECK((SuffixedNames({L"a.b.jpg", L"noext", L".hidden"}, 2) ==
+           std::vector<std::wstring>{L"a.b (2).jpg", L"noext (2)", L".hidden (2)"}));
 }
 
 // ---- EXIF ------------------------------------------------------------------

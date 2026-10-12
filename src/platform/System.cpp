@@ -156,6 +156,16 @@ std::wstring FullPath(const std::wstring& path) {
     const DWORD got = GetFullPathNameW(path.c_str(), n, out.data(), nullptr);
     out.resize(got);
     while (out.size() > 3 && (out.back() == L'\\' || out.back() == L'/')) out.pop_back();
+    // Long form (no 8.3 "JOHNDO~1" components) so every path the app compares is canonical.
+    const DWORD longLen = GetLongPathNameW(out.c_str(), nullptr, 0);
+    if (longLen > 0) {
+        std::wstring longPath(longLen, L'\0');
+        const DWORD n = GetLongPathNameW(out.c_str(), longPath.data(), longLen);
+        if (n > 0 && n < longLen) {
+            longPath.resize(n);
+            out = longPath;
+        }
+    }
     return out;
 }
 

@@ -121,6 +121,8 @@ void Deserialize(const std::string& text, Settings& s) {
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
+        std::string raw = line;  // destination paths keep their exact characters
+        while (!raw.empty() && (raw.back() == '\r' || raw.back() == '\n')) raw.pop_back();
         line = Trim(line);
         if (line.empty() || line[0] == '#') continue;
         const size_t eq = line.find('=');
@@ -138,7 +140,7 @@ void Deserialize(const std::string& text, Settings& s) {
         for (const Field& f : fields) {
             if (key != f.key) continue;
             if (f.kind == Field::Str) {
-                *static_cast<std::string*>(f.ptr) = val.substr(0, 1024);
+                *static_cast<std::string*>(f.ptr) = raw.substr(raw.find('=') + 1).substr(0, 1024);
                 break;
             }
             char* end = nullptr;

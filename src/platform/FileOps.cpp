@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 
+#include "../core/FileGroups.h"
 #include "System.h"
 
 namespace fiv {
@@ -31,10 +32,12 @@ std::wstring LeafName(const std::wstring& path) {
     return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
 
-// Records, per source file, the outcome and where it ended up.
+// Records, per source file, the outcome and where it ended up. Files are
+// matched by shell identity (not by string), so 8.3 or differently cased
+// paths still match.
 class Sink final : public IFileOperationProgressSink {
 public:
-    explicit Sink(std::vector<OpFile>& files) : files_(files) {}
+    Sink(std::vector<OpFile>& files, const std::vector<ComPtr<IShellItem>>& items) : files_(files), items_(items) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
@@ -81,15 +84,21 @@ public:
 
 private:
     void Record(IShellItem* item, HRESULT hr, IShellItem* created, SIGDN kind) {
-        const std::wstring from = ItemName(item, SIGDN_FILESYSPATH);
-        for (auto& f : files_) {
-            if (!SamePath(f.from, from)) continue;
-            f.hr = hr;
-            if (SUCCEEDED(hr) && created) f.to = ItemName(created, kind);
+        const std::wstring path = ItemName(item, SIGDN_FILESYSPATH);
+        for (size_t i = 0; i < files_.size(); ++i) {
+            int order = 1;
+            const bool same = (items_[i] && item &&
+                               item->Compare(items_[i].Get(), SICHINT_CANONICAL | SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL,
+                                             &order) == S_OK && order == 0) ||
+                              SamePath(files_[i].from, path);
+            if (!same) continue;
+            files_[i].hr = hr;
+            if (SUCCEEDED(hr) && created) files_[i].to = ItemName(created, kind);
             return;
         }
     }
     std::vector<OpFile>& files_;
+    const std::vector<ComPtr<IShellItem>>& items_;
     std::atomic<ULONG> refs_{1};
 };
 
@@ -101,10 +110,13 @@ ComPtr<IFileOperation> NewOperation(HWND owner, DWORD flags) {
     return op;
 }
 
-// Runs the queued operation and fills in files the sink did not report.
-void Perform(IFileOperation* op, FileOpResult& r, int queued) {
+// Runs the queued operation, then decides each file by what is actually on
+// disk: a file counts as done only if it left its original place (the shell
+// reports "skipped by the user" as a success code).
+void Perform(IFileOperation* op, FileOpResult& r, int queued, const std::vector<ComPtr<IShellItem>>& items,
+             const std::vector<std::wstring>& expected, bool recycle) {
     if (queued == 0) return;
-    Sink sink(r.files);
+    Sink sink(r.files, items);
     DWORD cookie = 0;
     const bool advised = SUCCEEDED(op->Advise(&sink, &cookie));
     const HRESULT hr = op->PerformOperations();
@@ -112,9 +124,19 @@ void Perform(IFileOperation* op, FileOpResult& r, int queued) {
     op->GetAnyOperationsAborted(&aborted);
     if (advised) op->Unadvise(cookie);
     r.aborted = aborted != FALSE || hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) || hr == COPYENGINE_E_USER_CANCELLED;
-    for (auto& f : r.files) {
-        if (f.hr != E_PENDING) continue;  // already decided (skipped) or reported by the sink
-        f.hr = PathExists(f.from) ? (r.aborted ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : (FAILED(hr) ? hr : E_FAIL)) : S_OK;
+    for (size_t i = 0; i < r.files.size(); ++i) {
+        OpFile& f = r.files[i];
+        const bool queuedFile = f.hr == E_PENDING || SUCCEEDED(f.hr);
+        if (!queuedFile) continue;  // refused before the operation started
+        if (PathExists(f.from)) {
+            f.hr = r.aborted || SUCCEEDED(f.hr) ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : (FAILED(hr) ? hr : E_FAIL);
+            f.to.clear();
+            continue;
+        }
+        f.hr = S_OK;
+        if (!recycle && i < expected.size() && (f.to.empty() || !PathExists(f.to)) && PathExists(expected[i]))
+            f.to = expected[i];
+        if (recycle && f.to.empty()) f.untracked = true;  // gone, but the sink did not say where
     }
 }
 
@@ -137,16 +159,6 @@ std::wstring JoinPath(const std::wstring& dir, const std::wstring& leaf) {
     return dir + (dir.empty() || dir.back() == L'\\' ? L"" : L"\\") + leaf;
 }
 
-// "name.jpg", then "name (2).jpg", "name (3).jpg", ... (like Explorer).
-std::wstring UniqueTarget(const std::wstring& dir, const std::wstring& leaf) {
-    std::wstring target = JoinPath(dir, leaf);
-    const size_t dot = leaf.find_last_of(L'.');
-    const std::wstring stem = dot == std::wstring::npos ? leaf : leaf.substr(0, dot);
-    const std::wstring ext = dot == std::wstring::npos ? L"" : leaf.substr(dot);
-    for (int n = 2; PathExists(target) && n < 10000; ++n) target = JoinPath(dir, stem + L" (" + std::to_wstring(n) + L")" + ext);
-    return target;
-}
-
 // Fallbacks for systems where the shell's IFileOperation is unavailable.
 HRESULT LegacyMove(const std::wstring& from, const std::wstring& to) {
     return MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)
@@ -163,47 +175,61 @@ bool PathExists(const std::wstring& path) { return GetFileAttributesW(path.c_str
 FileOpResult MoveFiles(HWND owner, const std::vector<std::wstring>& paths, const std::wstring& destDir,
                        bool renameOnCollision) {
     FileOpResult r;
+    for (const auto& p : paths) r.files.push_back({p, L"", E_FAIL, false});
+    if (paths.empty()) return r;
     const int mk = SHCreateDirectoryExW(nullptr, destDir.c_str(), nullptr);
-    const bool destOk = mk == ERROR_SUCCESS || mk == ERROR_ALREADY_EXISTS || mk == ERROR_FILE_EXISTS;
-    ComPtr<IShellItem> dest;
-    HRESULT hr = destOk ? SHCreateItemFromParsingName(destDir.c_str(), nullptr, IID_PPV_ARGS(&dest)) : HRESULT_FROM_WIN32(mk);
-    ComPtr<IFileOperation> op;
-    if (SUCCEEDED(hr)) {
-        op = NewOperation(owner, FOF_NOCONFIRMMKDIR | (renameOnCollision ? FOF_RENAMEONCOLLISION : 0));
-        if (!op) hr = E_FAIL;
+    if (mk != ERROR_SUCCESS && mk != ERROR_ALREADY_EXISTS && mk != ERROR_FILE_EXISTS) {
+        for (auto& f : r.files) f.hr = HRESULT_FROM_WIN32(mk);
+        return r;
     }
-    int queued = 0;
-    for (const auto& p : paths) {
-        OpFile f;
-        f.from = p;
-        f.hr = hr;
-        if (SUCCEEDED(hr)) {
-            const std::wstring target = destDir + (destDir.back() == L'\\' ? L"" : L"\\") + LeafName(p);
-            ComPtr<IShellItem> src;
-            if (!renameOnCollision && PathExists(target)) {
-                f.hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
-            } else if (FAILED(f.hr = SHCreateItemFromParsingName(p.c_str(), nullptr, IID_PPV_ARGS(&src)))) {
-            } else if (SUCCEEDED(f.hr = op->MoveItem(src.Get(), dest.Get(), nullptr, nullptr))) {
-                f.hr = E_PENDING;
-                ++queued;
-            }
-        }
-        r.files.push_back(std::move(f));
-    }
-    if (op) Perform(op.Get(), r, queued);
 
-    // The shell could not do it at all: plain Win32 moves (no progress UI).
+    // One set of names for the whole group, so pairs stay paired: either the
+    // original names, or the same "(n)" suffix on every file.
+    std::vector<std::wstring> leaves, names, targets;
+    for (const auto& p : paths) leaves.push_back(LeafName(p));
+    auto anyExists = [&](const std::vector<std::wstring>& candidate) {
+        for (const auto& n : candidate)
+            if (PathExists(JoinPath(destDir, n))) return true;
+        return false;
+    };
+    names = leaves;
+    if (anyExists(names)) {
+        if (!renameOnCollision) {
+            for (auto& f : r.files) f.hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
+            return r;
+        }
+        for (int n = 2; n < 10000 && anyExists(names = core::SuffixedNames(leaves, n)); ++n) {
+        }
+        if (anyExists(names)) {
+            for (auto& f : r.files) f.hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
+            return r;
+        }
+    }
+    for (const auto& n : names) targets.push_back(JoinPath(destDir, n));
+
+    ComPtr<IShellItem> dest;
+    HRESULT hr = SHCreateItemFromParsingName(destDir.c_str(), nullptr, IID_PPV_ARGS(&dest));
+    // No FOF_NOCONFIRMATION: if a name appears in the meantime, Windows asks instead of replacing.
+    ComPtr<IFileOperation> op = SUCCEEDED(hr) ? NewOperation(owner, FOF_NOCONFIRMMKDIR) : nullptr;
+    std::vector<ComPtr<IShellItem>> items(paths.size());
+    int queued = 0;
+    for (size_t i = 0; op && i < paths.size(); ++i) {
+        OpFile& f = r.files[i];
+        if (SUCCEEDED(f.hr = SHCreateItemFromParsingName(paths[i].c_str(), nullptr, IID_PPV_ARGS(&items[i]))) &&
+            SUCCEEDED(f.hr = op->MoveItem(items[i].Get(), dest.Get(), names[i].c_str(), nullptr))) {
+            f.hr = E_PENDING;
+            ++queued;
+        }
+    }
+    if (op) Perform(op.Get(), r, queued, items, targets, false);
+
+    // The shell could not do it at all: plain Win32 moves (never replacing).
     const bool fallback = !op || std::all_of(r.files.begin(), r.files.end(), [](const OpFile& f) { return Unsupported(f.hr); });
-    if (fallback && destOk) {
-        for (auto& f : r.files) {
-            const std::wstring leaf = LeafName(f.from);
-            const std::wstring target = renameOnCollision ? UniqueTarget(destDir, leaf) : JoinPath(destDir, leaf);
-            if (!renameOnCollision && PathExists(target)) {
-                f.hr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
-                continue;
-            }
-            f.hr = LegacyMove(f.from, target);
-            if (SUCCEEDED(f.hr)) f.to = target;
+    if (fallback) {
+        for (size_t i = 0; i < r.files.size(); ++i) {
+            OpFile& f = r.files[i];
+            f.hr = LegacyMove(f.from, targets[i]);
+            if (SUCCEEDED(f.hr)) f.to = targets[i];
         }
     }
     return r;
@@ -215,20 +241,20 @@ FileOpResult RecycleFiles(HWND owner, const std::vector<std::wstring>& paths) {
     // bin disabled or full) Windows asks before deleting it permanently.
     ComPtr<IFileOperation> op =
         NewOperation(owner, FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT);
+    std::vector<ComPtr<IShellItem>> items(paths.size());
     int queued = 0;
-    for (const auto& p : paths) {
+    for (size_t i = 0; i < paths.size(); ++i) {
         OpFile f;
-        f.from = p;
+        f.from = paths[i];
         f.hr = op ? S_OK : E_FAIL;
-        ComPtr<IShellItem> src;
-        if (op && SUCCEEDED(f.hr = SHCreateItemFromParsingName(p.c_str(), nullptr, IID_PPV_ARGS(&src))) &&
-            SUCCEEDED(f.hr = op->DeleteItem(src.Get(), nullptr))) {
+        if (op && SUCCEEDED(f.hr = SHCreateItemFromParsingName(paths[i].c_str(), nullptr, IID_PPV_ARGS(&items[i]))) &&
+            SUCCEEDED(f.hr = op->DeleteItem(items[i].Get(), nullptr))) {
             f.hr = E_PENDING;
             ++queued;
         }
         r.files.push_back(std::move(f));
     }
-    if (op) Perform(op.Get(), r, queued);
+    if (op) Perform(op.Get(), r, queued, items, {}, true);
 
     // The shell could not do it at all: legacy API (still the Recycle Bin, but
     // without knowing the bin item, so these deletes cannot be undone by us).

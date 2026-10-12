@@ -384,7 +384,7 @@ void App::SyncCurrentIndex() {
         currentPath_ = n ? folder_.Files()[size_t(current_)].path : L"";
         if (compareCount_ == 1) ResetView();
     }
-    activeTile_ = std::clamp(activeTile_, 0, std::max(0, TileCount() - 1));
+    activeTile_ = std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1));
     UpdateTitle();
 }
 
@@ -407,6 +407,7 @@ void App::JumpTo(int index, int direction) {
     lastNavMs_ = NowMs();
     settleArmed_ = true;
     scrollSidebarToCurrent_ = true;
+    activeTile_ = std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1));
     if (compareCount_ == 1)
         ResetView();
     else
@@ -444,6 +445,27 @@ void App::PushUndo(UndoOp op) {
     while (undo_.size() > 50) undo_.pop_front();
 }
 
+namespace {
+
+bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& mtime) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
+    size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+    mtime = (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
+}  // namespace
+
+std::vector<App::UndoFile> App::RollBack(const std::vector<UndoFile>& done) {
+    std::vector<UndoFile> stuck;
+    for (const auto& f : done) {
+        const HRESULT hr = f.recycled ? RestoreRecycled(hwnd_, f.location, f.original) : MoveBack(hwnd_, f.location, f.original);
+        if (FAILED(hr)) stuck.push_back(f);
+    }
+    return stuck;
+}
+
 void App::RecycleActive() {
     const FileEntry* f = Active();
     if (!f) return;
@@ -452,40 +474,60 @@ void App::RecycleActive() {
     const std::string label = NameWithCompanions(*f);
     const FileOpResult r = RecycleFiles(hwnd_, paths);
 
+    std::vector<UndoFile> done;
+    bool permanent = false, untracked = false, allOk = !r.files.empty();
+    HRESULT firstError = S_OK;
+    for (const auto& file : r.files) {
+        if (FAILED(file.hr)) {
+            allOk = false;
+            if (SUCCEEDED(firstError)) firstError = file.hr;
+            continue;
+        }
+        if (file.untracked)
+            untracked = true;  // in the Recycle Bin, but we do not know which item
+        else if (file.to.empty())
+            permanent = true;  // the shell deleted it outright (after asking)
+        else
+            done.push_back({file.from, file.to, true});
+    }
+    if (!allOk) {
+        // Keep pairs together: whatever did go to the bin comes back.
+        UndoOp op;
+        op.label = "delete " + label;
+        op.files = RollBack(done);
+        const bool split = !op.files.empty() || untracked || permanent;
+        PushUndo(std::move(op));
+        if (split) ReloadFolder();
+        Toast(r.aborted ? "Delete cancelled"
+                        : "Could not delete " + label + ": " + DescribeError(firstError) +
+                              (split ? "  (some files of the pair were deleted)" : "  (nothing was deleted)"));
+        RequestFrames();
+        return;
+    }
     UndoOp op;
     op.label = "delete " + label;
-    bool permanent = false, untracked = false;
-    for (const auto& file : r.files) {
-        if (FAILED(file.hr)) continue;
-        if (file.untracked)
-            untracked = true;  // in the Recycle Bin via the legacy API: restore it from there
-        else if (file.to.empty())
-            permanent = true;  // the shell deleted it outright (after asking): nothing to restore
-        else
-            op.files.push_back({file.from, file.to, true});
-    }
-    const bool primaryGone = !r.files.empty() && SUCCEEDED(r.files[0].hr);
+    op.files = std::move(done);
     PushUndo(std::move(op));
-    if (primaryGone) {
-        folder_.RemovePath(paths[0]);
-        SyncCurrentIndex();
-        UpdateCache();
-        Toast("Deleted " + label +
-              (permanent ? "  (permanently)" : untracked ? "  (restore it from the Recycle Bin)" : "  \xC2\xB7  Ctrl+Z to undo"));
-        CheckEmpty();
-    } else if (r.aborted) {
-        Toast("Delete cancelled");
-    } else {
-        Toast("Could not delete " + label + ": " + DescribeError(r.files.empty() ? E_FAIL : r.files[0].hr));
-    }
+    folder_.RemovePath(paths[0]);
+    SyncCurrentIndex();
+    UpdateCache();
+    Toast("Deleted " + label +
+          (permanent ? "  (permanently)" : untracked ? "  (restore it from the Recycle Bin)" : "  \xC2\xB7  Ctrl+Z to undo"));
+    CheckEmpty();
     RequestFrames();
 }
 
 std::wstring App::DestinationFor(int key) const {
     const std::string& s = settings_.destinations[size_t(key - 1)];
     std::wstring d = s.empty() ? std::to_wstring(key) : FromUtf8(s);
-    wchar_t expanded[MAX_PATH * 2] = {};
-    if (ExpandEnvironmentStringsW(d.c_str(), expanded, DWORD(std::size(expanded))) > 0) d = expanded;
+    const DWORD need = ExpandEnvironmentStringsW(d.c_str(), nullptr, 0);
+    if (need > 0) {
+        std::wstring expanded(need, L'\0');
+        const DWORD got = ExpandEnvironmentStringsW(d.c_str(), expanded.data(), need);
+        if (got == 0 || got > need) return {};  // never act on a truncated path
+        expanded.resize(got - 1);
+        d = expanded;
+    }
     if (PathIsRelativeW(d.c_str())) {
         const std::wstring& folder = folder_.Folder();
         d = folder + (folder.empty() || folder.back() == L'\\' ? L"" : L"\\") + d;
@@ -504,6 +546,10 @@ void App::MoveActive(int key) {
     if (!f) return;
     const std::wstring dest = DestinationFor(key);
     const std::string where = DestinationLabel(key);
+    if (dest.empty()) {
+        Toast("The folder for key " + std::to_string(key) + " is not a valid path");
+        return;
+    }
     if (CompareStringOrdinal(dest.c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
         Toast("Key " + std::to_string(key) + " points at this folder");
         return;
@@ -511,30 +557,52 @@ void App::MoveActive(int key) {
     std::vector<std::wstring> paths{f->path};
     paths.insert(paths.end(), f->companions.begin(), f->companions.end());
     const std::string label = NameWithCompanions(*f);
+    const std::wstring name = f->name;
     const FileOpResult r = MoveFiles(hwnd_, paths, dest, settings_.renameOnConflict);
 
+    std::vector<UndoFile> done;
+    bool allOk = !r.files.empty();
+    HRESULT firstError = S_OK;
+    for (const auto& file : r.files) {
+        if (FAILED(file.hr)) {
+            allOk = false;
+            if (SUCCEEDED(firstError)) firstError = file.hr;
+            continue;
+        }
+        UndoFile u{file.from, file.to, false};
+        StatFile(file.to, u.size, u.mtime);
+        done.push_back(u);
+    }
+    if (!allOk) {
+        // Keep pairs together: whatever did move goes back.
+        UndoOp op;
+        op.label = "move " + label + " to " + where;
+        op.files = RollBack(done);
+        const bool split = !op.files.empty();
+        PushUndo(std::move(op));
+        if (split) ReloadFolder();
+        if (r.aborted)
+            Toast("Move cancelled");
+        else if (firstError == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS))
+            Toast(where + " already has a file named " + ToUtf8(name) + (split ? "  (part of the pair was moved)" : ""));
+        else
+            Toast("Could not move " + label + ": " + DescribeError(firstError) +
+                  (split ? "  (part of the pair was moved; Ctrl+Z puts it back)" : "  (nothing was moved)"));
+        RequestFrames();
+        return;
+    }
+    std::string renamed;
+    if (!r.files[0].to.empty() && CompareStringOrdinal(LeafOf(r.files[0].to).c_str(), -1, name.c_str(), -1, TRUE) != CSTR_EQUAL)
+        renamed = " as " + ToUtf8(LeafOf(r.files[0].to));
     UndoOp op;
     op.label = "move " + label + " to " + where;
-    for (const auto& file : r.files)
-        if (SUCCEEDED(file.hr) && !file.to.empty()) op.files.push_back({file.from, file.to, false});
-    const bool moved = !r.files.empty() && SUCCEEDED(r.files[0].hr);
-    std::string renamed;
-    if (moved && !r.files[0].to.empty() && CompareStringOrdinal(LeafOf(r.files[0].to).c_str(), -1, f->name.c_str(), -1, TRUE) != CSTR_EQUAL)
-        renamed = " as " + ToUtf8(LeafOf(r.files[0].to));
+    op.files = std::move(done);
     PushUndo(std::move(op));
-    if (moved) {
-        folder_.RemovePath(paths[0]);
-        SyncCurrentIndex();
-        UpdateCache();
-        Toast("Moved " + label + " to " + where + renamed);
-        CheckEmpty();
-    } else if (!r.files.empty() && r.files[0].hr == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)) {
-        Toast(where + " already has a file named " + ToUtf8(f->name));
-    } else if (r.aborted) {
-        Toast("Move cancelled");
-    } else {
-        Toast("Could not move " + label + ": " + DescribeError(r.files.empty() ? E_FAIL : r.files[0].hr));
-    }
+    folder_.RemovePath(paths[0]);
+    SyncCurrentIndex();
+    UpdateCache();
+    Toast("Moved " + label + " to " + where + renamed);
+    CheckEmpty();
     RequestFrames();
 }
 
@@ -547,13 +615,25 @@ void App::Undo() {
     undo_.pop_back();
     int restored = 0;
     HRESULT firstError = S_OK;
+    bool changed = false;
+    std::vector<UndoFile> retry;  // blocked only because the name is taken again: worth another try
     for (const auto& f : op.files) {
-        const HRESULT hr = f.recycled ? RestoreRecycled(hwnd_, f.location, f.original) : MoveBack(hwnd_, f.location, f.original);
-        if (SUCCEEDED(hr))
+        HRESULT hr;
+        uint64_t size = 0, mtime = 0;
+        if (!f.recycled && (!StatFile(f.location, size, mtime) || size != f.size || mtime != f.mtime)) {
+            changed = true;  // never move back a file that is not the one we moved
+            hr = HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        } else {
+            hr = f.recycled ? RestoreRecycled(hwnd_, f.location, f.original) : MoveBack(hwnd_, f.location, f.original);
+        }
+        if (SUCCEEDED(hr)) {
             ++restored;
-        else if (SUCCEEDED(firstError))
-            firstError = hr;
+            continue;
+        }
+        if (SUCCEEDED(firstError)) firstError = hr;
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)) retry.push_back(f);
     }
+    if (restored == 0 && !retry.empty()) undo_.push_back({retry, op.label});
     // Show the restored image right away (the folder watcher would also catch it).
     const std::wstring& primary = op.files.front().original;
     if (CompareStringOrdinal(ParentFolder(primary).c_str(), -1, folder_.Folder().c_str(), -1, TRUE) == CSTR_EQUAL) {
@@ -573,8 +653,10 @@ void App::Undo() {
         Toast("Partly undone: " + op.label + " (" + DescribeError(firstError) + ")");
     else
         Toast("Could not undo " + op.label + ": " +
-              (firstError == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) ? std::string("a file with that name is back in place")
-                                                                    : DescribeError(firstError)));
+              (changed ? std::string("the moved file was changed or moved again since")
+               : firstError == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)
+                   ? std::string("a file with that name is back in place (still undoable once it is gone)")
+                   : DescribeError(firstError)));
     RequestFrames();
 }
 
@@ -1001,6 +1083,12 @@ void App::ViewArea(ImVec2& mn, ImVec2& mx) const {
 
 int App::TileCount() const { return std::max(0, std::min(compareCount_, folder_.Count())); }
 
+int App::VisibleTiles() const {
+    int n = 0;
+    while (n < TileCount() && TileIndex(n) >= 0) ++n;  // tiles fill from the first one
+    return n;
+}
+
 int App::TileIndex(int slot) const {
     const int n = folder_.Count();
     if (n == 0 || slot < 0 || slot >= TileCount()) return -1;
@@ -1043,7 +1131,7 @@ int App::TileAt(ImVec2 p) const {
 int App::ActiveIndex() const {
     if (folder_.Count() == 0) return -1;
     if (compareCount_ <= 1) return current_;
-    return TileIndex(std::clamp(activeTile_, 0, std::max(0, TileCount() - 1)));
+    return TileIndex(std::clamp(activeTile_, 0, std::max(0, VisibleTiles() - 1)));
 }
 
 const FileEntry* App::Active() const {
@@ -1344,8 +1432,8 @@ bool App::HandleKey(WPARAM vk, LPARAM lp, bool sys) {
         case VK_END: JumpTo(std::max(0, folder_.Count() - page), -1); return true;
         case VK_DELETE: if (!repeat) RecycleActive(); return true;
         case VK_TAB:
-            if (TileCount() > 1) {
-                activeTile_ = (activeTile_ + (shift ? TileCount() - 1 : 1)) % TileCount();
+            if (VisibleTiles() > 1) {
+                activeTile_ = (activeTile_ + (shift ? VisibleTiles() - 1 : 1)) % VisibleTiles();
                 UpdateTitle();
                 RequestFrames();
             }
@@ -1462,7 +1550,7 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ReleaseCapture();
                 if (!dragMoved_ && TileCount() > 1) {  // a click (not a drag) picks the active tile
                     const int s = TileAt(ImVec2(float(dragStart_.x), float(dragStart_.y)));
-                    if (s >= 0 && s != activeTile_) {
+                    if (s >= 0 && s != activeTile_ && TileIndex(s) >= 0) {
                         activeTile_ = s;
                         UpdateTitle();
                     }

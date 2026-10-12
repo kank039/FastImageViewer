@@ -45,4 +45,16 @@ std::vector<FileGroup> GroupFiles(const std::vector<GroupInput>& in, const Group
     return out;
 }
 
+std::vector<std::wstring> SuffixedNames(const std::vector<std::wstring>& leaves, int n) {
+    if (n <= 1) return leaves;
+    std::vector<std::wstring> out;
+    out.reserve(leaves.size());
+    const std::wstring tag = L" (" + std::to_wstring(n) + L")";
+    for (const auto& leaf : leaves) {
+        const size_t dot = leaf.find_last_of(L'.');
+        out.push_back(dot == std::wstring::npos || dot == 0 ? leaf + tag : leaf.substr(0, dot) + tag + leaf.substr(dot));
+    }
+    return out;
+}
+
 }  // namespace fiv::core

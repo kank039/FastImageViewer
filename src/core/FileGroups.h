@@ -37,4 +37,8 @@ struct FileGroup {
 // Result is ordered by primary index.
 std::vector<FileGroup> GroupFiles(const std::vector<GroupInput>& in, const GroupOptions& opt);
 
+// Names for moving a group under one shared suffix, so a JPEG and its RAW stay
+// paired: n == 1 keeps the names, n >= 2 gives "IMG_1 (n).jpg", "IMG_1 (n).CR2".
+std::vector<std::wstring> SuffixedNames(const std::vector<std::wstring>& leaves, int n);
+
 }  // namespace fiv::core

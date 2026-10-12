@@ -478,7 +478,7 @@ void App::DrawSortingTab() {
             ImGui::Text("%d", i + 1);
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(-FLT_MIN);
-            char buf[520];
+            char buf[1025];
             std::snprintf(buf, sizeof buf, "%s", settings_.destinations[size_t(i)].c_str());
             char hint[32];
             std::snprintf(hint, sizeof hint, "subfolder %d", i + 1);

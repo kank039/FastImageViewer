@@ -54,6 +54,7 @@ private:
         std::wstring original;
         std::wstring location;
         bool recycled = false;
+        uint64_t size = 0, mtime = 0;  // moved file as we left it: undo refuses if it changed
     };
     struct UndoOp {
         std::vector<UndoFile> files;  // primary first
@@ -100,6 +101,9 @@ private:
     void MoveActive(int key);
     void Undo();
     void PushUndo(UndoOp op);
+    // All files of a pair move together: if only some succeeded, put those back.
+    // Returns the files that could not be put back (they become an undo entry).
+    std::vector<UndoFile> RollBack(const std::vector<UndoFile>& done);
     std::wstring DestinationFor(int key) const;
     std::string DestinationLabel(int key) const;
     std::wstring PickFolder();
@@ -128,6 +132,7 @@ private:
     void ViewArea(ImVec2& mn, ImVec2& mx) const;
     std::vector<Tile> Tiles() const;
     int TileCount() const;
+    int VisibleTiles() const;  // tiles that actually show an image (fewer near the end without wrap-around)
     int TileIndex(int slot) const;  // folder index shown in a tile, -1 if none
     int TileAt(ImVec2 screen) const;
     int ActiveIndex() const;
