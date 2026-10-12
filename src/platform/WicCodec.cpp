@@ -7,6 +7,8 @@
 #include "WicCompat.h"
 
 #include <cmath>
+#include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <new>
@@ -117,6 +119,140 @@ void MakeThumbnail(IWICImagingFactory* wic, ID3D11Device* device, IWICBitmapFram
     }
     if (SUCCEEDED(CreateTexture(device, reinterpret_cast<const uint8_t*>(data), s, 1, r.thumb))) r.thumbSize = s;
 }
+
+
+// ---- Colour management -------------------------------------------------------
+
+ComPtr<IWICColorContext> ExifColorSpace(IWICImagingFactory* wic, UINT value) {
+    ComPtr<IWICColorContext> c;
+    if (FAILED(wic->CreateColorContext(&c)) || FAILED(c->InitializeFromExifColorSpace(value))) return nullptr;
+    return c;
+}
+
+// The frame's own profile; null when it has none or says sRGB (nothing to convert).
+ComPtr<IWICColorContext> EmbeddedProfile(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame) {
+    UINT count = 0;
+    if (FAILED(frame->GetColorContexts(0, nullptr, &count)) || count == 0 || count > 8) return nullptr;
+    std::vector<ComPtr<IWICColorContext>> owned(count);
+    std::vector<IWICColorContext*> raw(count);
+    for (UINT i = 0; i < count; ++i) {
+        if (FAILED(wic->CreateColorContext(&owned[i]))) return nullptr;
+        raw[i] = owned[i].Get();
+    }
+    if (FAILED(frame->GetColorContexts(count, raw.data(), &count))) return nullptr;
+    for (UINT i = 0; i < count; ++i) {
+        WICColorContextType type{};
+        if (FAILED(owned[i]->GetType(&type))) continue;
+        if (type == WICColorContextProfile) return owned[i];
+        UINT exif = 0;
+        if (type == WICColorContextExifColorSpace && SUCCEEDED(owned[i]->GetExifColorSpace(&exif)) && exif == 2)
+            return owned[i];  // Adobe RGB (1 = sRGB needs nothing)
+    }
+    return nullptr;
+}
+
+ComPtr<IWICColorContext> DestinationProfile(WorkerContext& ctx, const DecodeRequest& req) {
+    const std::wstring key = req.colorMode == 2 ? req.displayProfile : L"";
+    if (ctx.colorDst && ctx.colorDstKey == key) {
+        ComPtr<IWICColorContext> c;
+        ctx.colorDst.As(&c);
+        return c;
+    }
+    ComPtr<IWICColorContext> c;
+    if (!key.empty() && SUCCEEDED(ctx.wic->CreateColorContext(&c)) && FAILED(c->InitializeFromFilename(key.c_str())))
+        c.Reset();
+    if (!c) c = ExifColorSpace(ctx.wic, 1);  // sRGB
+    ctx.colorDst = c;
+    ctx.colorDstKey = key;
+    return c;
+}
+
+// ---- HDR ------------------------------------------------------------------------
+
+bool IsHdrFormat(IWICImagingFactory* wic, REFWICPixelFormatGUID fmt) {
+    ComPtr<IWICComponentInfo> info;
+    ComPtr<IWICPixelFormatInfo2> pf;
+    WICPixelFormatNumericRepresentation rep{};
+    if (FAILED(wic->CreateComponentInfo(fmt, &info)) || FAILED(info.As(&pf)) || FAILED(pf->GetNumericRepresentation(&rep)))
+        return false;
+    return rep == WICPixelFormatNumericRepresentationFloat || rep == WICPixelFormatNumericRepresentationFixed;
+}
+
+// Linear scRGB (1.0 = SDR white) to sRGB-encoded BGRA8. Everything up to 80%
+// of SDR white is kept as is; brighter values roll off smoothly towards white,
+// so HDR highlights keep detail instead of clipping.
+class ToneMapSource final : public IWICBitmapSource {
+public:
+    explicit ToneMapSource(ComPtr<IWICBitmapSource> floatSource) : src_(std::move(floatSource)) {
+        for (int i = 0; i < kLut; ++i) {
+            const float c = float(i) / float(kLut - 1);
+            lut_[i] = uint8_t(std::lround(255.0f * (c <= 0.0031308f ? 12.92f * c : 1.055f * std::pow(c, 1 / 2.4f) - 0.055f)));
+        }
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IWICBitmapSource)) {
+            *ppv = static_cast<IWICBitmapSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE GetSize(UINT* w, UINT* h) override { return src_->GetSize(w, h); }
+    HRESULT STDMETHODCALLTYPE GetPixelFormat(WICPixelFormatGUID* f) override {
+        if (!f) return E_INVALIDARG;
+        *f = GUID_WICPixelFormat32bppBGRA;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetResolution(double* x, double* y) override { return src_->GetResolution(x, y); }
+    HRESULT STDMETHODCALLTYPE CopyPalette(IWICPalette*) override { return WINCODEC_ERR_PALETTEUNAVAILABLE; }
+    HRESULT STDMETHODCALLTYPE CopyPixels(const WICRect* rc, UINT stride, UINT size, BYTE* out) override {
+        UINT w = 0, h = 0;
+        HRESULT hr = src_->GetSize(&w, &h);
+        if (FAILED(hr)) return hr;
+        const WICRect r = rc ? *rc : WICRect{0, 0, INT(w), INT(h)};
+        if (r.Width <= 0 || r.Height <= 0) return S_OK;
+        if (uint64_t(stride) * (r.Height - 1) + uint64_t(r.Width) * 4 > size) return E_INVALIDARG;
+        constexpr INT kChunk = 16;  // rows per request: a small float buffer, macroblock aligned for JPEG XR
+        std::vector<float> buf(size_t(r.Width) * 4 * kChunk);
+        for (INT y = 0; y < r.Height; y += kChunk) {
+            const INT rows = std::min(kChunk, r.Height - y);
+            const WICRect part{r.X, r.Y + y, r.Width, rows};
+            const UINT fstride = UINT(r.Width) * 16;
+            hr = src_->CopyPixels(&part, fstride, fstride * UINT(rows), reinterpret_cast<BYTE*>(buf.data()));
+            if (FAILED(hr)) return hr;
+            for (INT row = 0; row < rows; ++row) {
+                const float* in = buf.data() + size_t(row) * r.Width * 4;
+                BYTE* o = out + size_t(y + row) * stride;
+                for (INT x = 0; x < r.Width; ++x, in += 4, o += 4) {
+                    float rgb[3] = {std::max(0.0f, in[0]), std::max(0.0f, in[1]), std::max(0.0f, in[2])};
+                    const float l = 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2];
+                    constexpr float k = 0.8f;
+                    if (l > k) {
+                        const float mapped = k + (1 - k) * (1 - std::exp(-(l - k) / (1 - k)));
+                        for (float& c : rgb) c *= mapped / l;
+                    }
+                    for (int c = 0; c < 3; ++c) o[2 - c] = lut_[std::min(kLut - 1, int(std::min(rgb[c], 1.0f) * (kLut - 1) + 0.5f))];
+                    o[3] = uint8_t(std::clamp(in[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            }
+        }
+        return S_OK;
+    }
+
+private:
+    static constexpr int kLut = 4096;
+    ComPtr<IWICBitmapSource> src_;
+    std::atomic<ULONG> refs_{1};
+    uint8_t lut_[kLut];
+};
 
 }  // namespace
 
@@ -364,6 +500,23 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
     }
     if (aborted()) return fail(E_ABORT);
 
+    // 3a. HDR sources (floating or fixed point) are tone-mapped to SDR while
+    //     streaming, in 16-row chunks.
+    WICPixelFormatGUID srcFormat{};
+    if (!pre && SUCCEEDED(frame->GetPixelFormat(&srcFormat)) && IsHdrFormat(ctx.wic, srcFormat)) {
+        ComPtr<IWICFormatConverter> toFloat;
+        if (SUCCEEDED(ctx.wic->CreateFormatConverter(&toFloat)) &&
+            SUCCEEDED(toFloat->Initialize(frame.Get(), GUID_WICPixelFormat128bppRGBAFloat, WICBitmapDitherTypeNone,
+                                          nullptr, 0, WICBitmapPaletteTypeCustom))) {
+            ComPtr<IWICBitmapSource> mapped;
+            mapped.Attach(new (std::nothrow) ToneMapSource(toFloat));
+            if (mapped) {
+                src = mapped;
+                res.hdr = true;
+            }
+        }
+    }
+
     // 3. Convert to BGRA and scale to exactly the planned size.
     ComPtr<IWICFormatConverter> conv;
     hr = ctx.wic->CreateFormatConverter(&conv);
@@ -384,6 +537,21 @@ DecodeResult DecodeImage(WorkerContext& ctx, ID3D11Device* device, IoGate& gate,
         }
         if (FAILED(hr)) return fail(hr);
         src = scaler;
+    }
+
+    // 3b. Colour management, on the scaled pixels (cheapest): the embedded
+    //     profile (or sRGB) to sRGB or to the display's profile.
+    if (req.colorMode != 0 && !res.hdr) {
+        ComPtr<IWICColorContext> from = EmbeddedProfile(ctx.wic, frame.Get());
+        const bool toDisplay = req.colorMode == 2 && !req.displayProfile.empty();
+        if (!from && toDisplay) from = ExifColorSpace(ctx.wic, 1);
+        ComPtr<IWICColorContext> to = from ? DestinationProfile(ctx, req) : nullptr;
+        ComPtr<IWICColorTransform> xf;
+        if (from && to && SUCCEEDED(ctx.wic->CreateColorTransformer(&xf)) &&
+            SUCCEEDED(xf->Initialize(src.Get(), from.Get(), to.Get(), GUID_WICPixelFormat32bppBGRA))) {
+            src = xf;  // if anything fails the pixels are shown as stored
+            res.colorConverted = true;
+        }
     }
 
     // 4. Pull pixels in bands so a cancelled job stops within milliseconds.

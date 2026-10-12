@@ -20,6 +20,7 @@ void Validate(Settings& s, const MemoryCaps& caps) {
     s.backdrop = std::clamp(s.backdrop, 0, 2);
     s.slideshowSeconds = std::clamp(s.slideshowSeconds, 1, 120);
     s.sortMode = std::clamp(s.sortMode, 0, 4);
+    s.colorMode = std::clamp(s.colorMode, 0, 2);
     s.burstGapSeconds = std::clamp(s.burstGapSeconds, 1, 30);
     s.gridSize = std::clamp(s.gridSize, 96, 400);
 
@@ -66,6 +67,7 @@ std::vector<Field> Fields(Settings& s) {
         {"backdrop", Field::Int, &s.backdrop},
         {"upscaleSmall", Field::Bool, &s.upscaleSmall},
         {"pixelatedZoom", Field::Bool, &s.pixelatedZoom},
+        {"colorMode", Field::Int, &s.colorMode},
         {"showOverlay", Field::Bool, &s.showOverlay},
         {"overlayCorner", Field::Int, &s.overlayCorner},
         {"ovName", Field::Bool, &s.ovName},

@@ -33,6 +33,7 @@ struct Settings {
     int backdrop = int(Backdrop::Mica);
     bool upscaleSmall = false;
     bool pixelatedZoom = true;
+    int colorMode = 1;             // 0 off, 1 embedded profiles -> sRGB, 2 -> the display's profile
 
     // Overlay
     bool showOverlay = true;

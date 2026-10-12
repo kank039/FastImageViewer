@@ -169,4 +169,17 @@ std::wstring FullPath(const std::wstring& path) {
     return out;
 }
 
+std::wstring DisplayProfilePath(HWND hwnd) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return {};
+    HDC dc = CreateDCW(L"DISPLAY", mi.szDevice, nullptr, nullptr);
+    if (!dc) return {};
+    wchar_t path[MAX_PATH] = {};
+    DWORD len = MAX_PATH;
+    const BOOL ok = GetICMProfileW(dc, &len, path);
+    DeleteDC(dc);
+    return ok ? std::wstring(path) : std::wstring();
+}
+
 }  // namespace fiv

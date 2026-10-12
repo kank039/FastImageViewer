@@ -46,6 +46,7 @@ private:
         ComPtr<ID3D11ShaderResourceView> srv;
         core::Size size;
         std::shared_ptr<const core::Histogram> histogram;
+        bool hdr = false, colorConverted = false;
     };
     struct Tile {
         ImVec2 min, max;  // screen rectangle
@@ -95,6 +96,7 @@ private:
     void SaveSettingsNow();
     void MarkSettingsDirty() { settingsDirtyAt_ = NowMs(); }
     void OnCacheSettingsChanged();
+    void FlushCache();  // drop every decoded image (colour settings changed)
 
     // Folder & navigation
     void OpenPath(const std::wstring& path);
@@ -236,6 +238,7 @@ private:
     float dpiScale_ = 1.0f;
     ImGuiStyle baseStyle_;
     core::Size monitor_{1920, 1080};
+    std::wstring displayProfile_;  // ICC profile of the current monitor
 
     JobSystem jobs_;
     IoGate gate_;

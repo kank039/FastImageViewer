@@ -41,6 +41,9 @@ struct DecodeRequest {
     bool canPrescale = false;
     core::DecodePlan plan;
     bool wantSharpness = false;  // compute the focus score (screen-sized decodes)
+    // 0 off, 1 embedded profiles -> sRGB, 2 -> the display profile (displayProfile, or sRGB if empty)
+    int colorMode = 1;
+    std::wstring displayProfile;
     // Live priority (rank), updated by the UI thread when the user navigates.
     // Rank <= 1 is the image on screen: normal I/O and CPU priority.
     std::shared_ptr<std::atomic<int>> priority = std::make_shared<std::atomic<int>>(0);
@@ -53,6 +56,8 @@ struct DecodeResult {
     ComPtr<ID3D11ShaderResourceView> srv;
     std::shared_ptr<const core::Histogram> histogram;  // from a small mip level (4 KB)
     float sharpness = -1;  // core::Sharpness, if requested
+    bool hdr = false;      // high dynamic range source, tone-mapped to SDR
+    bool colorConverted = false;
     double ms = 0;
 };
 

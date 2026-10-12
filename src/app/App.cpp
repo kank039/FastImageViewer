@@ -293,6 +293,16 @@ void App::SaveSettingsNow() {
     if (WriteTextFileAtomic(settingsPath_, text)) lastSavedSettings_ = text;
 }
 
+void App::FlushCache() {
+    sched_.Clear();
+    fullPlans_.clear();
+    if (inRender_ && preview_.srv) graveyard_.push_back(preview_.srv);  // may be in this frame's draw list
+    preview_ = {};
+    previewItem_ = 0;
+    UpdateCache();
+    RequestFrames();
+}
+
 void App::OnCacheSettingsChanged() {
     core::Validate(settings_, caps_);
     MarkSettingsDirty();
@@ -1102,6 +1112,11 @@ void App::UpdateMonitor() {
         fullPlans_.clear();
         UpdateCache();
     }
+    const std::wstring profile = DisplayProfilePath(hwnd_);
+    if (profile != displayProfile_) {
+        displayProfile_ = profile;
+        if (settings_.colorMode == 2) FlushCache();  // colours were converted for the other screen
+    }
 }
 
 // ---- Cache --------------------------------------------------------------------------
@@ -1424,6 +1439,8 @@ void App::StartDecode(uint64_t job, const core::EntryKey& key, const core::Decod
     req.canPrescale = f->canPrescale;
     req.plan = plan;
     req.wantSharpness = key.variant == core::Variant::Fit;
+    req.colorMode = settings_.colorMode;
+    req.displayProfile = displayProfile_;
     req.priority->store(rank);  // everything except the image on screen runs at background priority
     livePriority_[job] = req.priority;
     ComPtr<ID3D11Device> device = gpu_.Device();
@@ -1454,7 +1471,7 @@ void App::OnDecodeResult(uint64_t job, core::EntryKey key, core::DecodePlan plan
     const bool keep = sched_.OnDecodeDone(job, outcome);
     const uint64_t curId = Current() ? Current()->id : 0;
     if (keep) {
-        textures_[key] = {r.srv, plan.size, r.histogram};
+        textures_[key] = {r.srv, plan.size, r.histogram, r.hdr, r.colorConverted};
         ++decodes_;
         lastDecodeMs_ = r.ms;
         if (bytesRead) {

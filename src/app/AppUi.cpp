@@ -634,6 +634,19 @@ void App::DrawSettings() {
                 TextDim("Mica is not available on this system; using Dark.");
             changed |= ImGui::Checkbox("Enlarge small images to fit the window", &settings_.upscaleSmall);
             changed |= ImGui::Checkbox("Sharp pixels when zoomed in", &settings_.pixelatedZoom);
+            const char* colorModes[] = {"Off (show pixels as stored)", "Convert embedded profiles to sRGB (recommended)",
+                                        "Convert to this display's profile"};
+            if (ImGui::Combo("Colour management", &settings_.colorMode, colorModes, 3)) {
+                changed = true;
+                FlushCache();
+            }
+            HelpMarker("Photos with an embedded colour profile (Adobe RGB, Display P3, ProPhoto) look washed out or "
+                       "oversaturated unless converted. \"This display's profile\" also corrects for a calibrated or "
+                       "wide-gamut monitor (Windows colour management > device profile). HDR images are tone-mapped "
+                       "so bright highlights keep their detail.");
+            if (settings_.colorMode == 2)
+                TextDim("Display profile: %s", displayProfile_.empty() ? "none assigned (sRGB is used)"
+                                                                       : ToUtf8(displayProfile_).c_str());
             changed |= ImGui::Checkbox("Wrap around at the end of the folder", &settings_.wrapAround);
             if (ImGui::IsItemEdited()) UpdateCache();
             changed |= ImGui::Checkbox("Close when the folder becomes empty", &settings_.closeWhenEmpty);
@@ -869,6 +882,8 @@ void App::DrawInfo() {
     auto fit = textures_.find({f->id, core::Variant::Fit});
     if (fit != textures_.end()) tex = &fit->second;
     if (!tex) tex = TextureFor(f->id);
+    if (tex && (tex->hdr || tex->colorConverted))
+        TextDim("%s", tex->hdr ? "HDR image, tone-mapped for this screen" : "Colours converted from the embedded profile");
     if (tex && tex->histogram) {
         const core::Histogram& h = *tex->histogram;
         DrawHistogram(h, ImVec2(std::round(256 * dpiScale_), std::round(90 * dpiScale_)));

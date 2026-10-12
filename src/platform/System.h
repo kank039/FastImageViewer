@@ -25,6 +25,8 @@ int ReadersFor(StorageKind k);  // concurrent disk reads that will not make the 
 int LogicalCores();
 
 std::wstring SettingsFilePath();
+// ICC profile file of the monitor the window is on ("" if none is assigned).
+std::wstring DisplayProfilePath(HWND hwnd);
 bool ReadTextFile(const std::wstring& path, std::string& out);
 bool WriteTextFileAtomic(const std::wstring& path, const std::string& text);
 

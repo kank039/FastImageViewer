@@ -23,6 +23,10 @@ namespace fiv {
 
 struct WorkerContext {
     IWICImagingFactory* wic = nullptr;  // owned by the worker thread
+    // Colour management: the destination profile, created once per worker
+    // (an IWICColorContext; kept as IUnknown so this header needs no WIC).
+    ComPtr<IUnknown> colorDst;
+    std::wstring colorDstKey;
 };
 
 using CancelFlag = std::atomic<bool>;
